@@ -4,6 +4,11 @@
 *.exe
 *.test
 *.out
+# Go leaves binaries matching the package's last-path element in CWD when
+# `go build ./path/to/pkg` is run without -o. Catch common root-level cases:
+/ebind
+/cmd-*
+/[0-9][0-9]-*
 
 # Test + coverage
 coverage.out

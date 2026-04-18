@@ -15,18 +15,33 @@ import (
 //   - ErrStepFailed if the step ended in status=failed
 //   - ErrStepSkipped if the step was skipped (upstream cascade)
 //   - context error if ctx expires before resolution
+//
+// Await is a thin wrapper over AwaitByID; prefer AwaitByID when the caller
+// does not own the *Step handle (e.g., a different process resuming a DAG).
 func Await[T any](ctx context.Context, wf *Workflow, dagID string, step *Step) (T, error) {
+	return AwaitByID[T](ctx, wf, dagID, step.id)
+}
+
+// AwaitByID is the stateless variant of Await: it takes the step ID as a string
+// so a process that did not build the DAG can still wait on a specific step's
+// result. Use this to resume from a different instance — persist the
+// (dagID, stepID) pair from the submitter and call AwaitByID from the resumer.
+//
+// Semantics are identical to Await.
+func AwaitByID[T any](ctx context.Context, wf *Workflow, dagID, stepID string) (T, error) {
 	var zero T
 
 	// Subscribe to the result BEFORE checking status to avoid a race where the
-	// step transitions to Done between our read and our watch.
-	ch, err := wf.Store.WatchResult(ctx, dagID, step.id)
+	// step transitions to Done between our read and our watch. NatsStore's
+	// WatchResult uses IncludeHistory(), so if the result was written before we
+	// subscribed, we still receive it as the initial value.
+	ch, err := wf.Store.WatchResult(ctx, dagID, stepID)
 	if err != nil {
 		return zero, err
 	}
 
 	// Check current status — maybe it's already terminal failed/skipped.
-	rec, _, err := wf.Store.GetStep(ctx, dagID, step.id)
+	rec, _, err := wf.Store.GetStep(ctx, dagID, stepID)
 	if err == nil {
 		switch rec.Status {
 		case StatusFailed:
@@ -55,7 +70,7 @@ func Await[T any](ctx context.Context, wf *Workflow, dagID string, step *Step) (
 			}
 			return out, nil
 		case <-statusTicker.C:
-			rec, _, err := wf.Store.GetStep(ctx, dagID, step.id)
+			rec, _, err := wf.Store.GetStep(ctx, dagID, stepID)
 			if err != nil {
 				continue
 			}

@@ -130,6 +130,24 @@ Key behaviors:
 - `workflow.WithRetry(policy)` — per-DAG default retry; `workflow.WithStepRetry(policy)` overrides per-step.
 - From inside a handler, `workflow.FromContext(ctx).Step(...)` adds more steps dynamically.
 
+### Resuming `Await` from another instance
+
+DAG state + step results live in NATS KV. Workers keep running independently of whoever called `Await`. If the waiting process dies, the DAG continues; results land in KV and stay there. A different process (same NATS cluster) can resume the wait with only the DAG and step IDs:
+
+```go
+// Instance A — submitter. Persist these two strings somewhere (DB, Redis, file).
+dagID  := dag.ID()
+stepID := c.ID()            // the *Step you'd pass to Await
+_ = dag.Submit(ctx, wf)
+// ... instance A may exit now ...
+
+// Instance B — resumer. No *Step handle needed.
+wfB, _  := workflow.NewFromNATS(ctx, nc, 1)
+result, err := workflow.AwaitByID[Profile](ctx, wfB, dagID, stepID)
+```
+
+`AwaitByID` uses NATS KV `IncludeHistory()` under the hood, so late subscribers still receive results that were written before they started watching. See [`examples/11-workflow-resume`](./examples/11-workflow-resume) for a runnable two-invocation demo.
+
 ## Architecture
 
 ```

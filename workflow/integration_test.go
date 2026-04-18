@@ -180,6 +180,40 @@ func hNonRetryable(_ context.Context) (int, error) {
 
 // --- Tests ---
 
+func TestIntegration_AwaitByID_DifferentInstance(t *testing.T) {
+	h := setup(t)
+	task.MustRegister(h.reg, hAdd)
+	task.MustRegister(h.reg, hDouble)
+
+	// Instance A: build + submit a DAG, capture (dagID, stepID) as strings,
+	// then discard the workflow handle as if the process died.
+	dag := workflow.New()
+	_ = dag.Step("a", hAdd, 5, 7)
+	b := dag.Step("b", hDouble, workflow.Ref{StepID: "a", Mode: workflow.RefModeRequired})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+	dagID, stepID := dag.ID(), b.ID()
+
+	// Instance B: construct a fresh Workflow against the same NATS. Only the
+	// string IDs are shared — no *Step handle, no DAG builder state.
+	wfB, err := workflow.NewFromNATS(ctx, h.nc, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := workflow.AwaitByID[int](ctx, wfB, dagID, stepID)
+	if err != nil {
+		t.Fatalf("AwaitByID: %v", err)
+	}
+	if result != 24 { // (5+7)*2
+		t.Errorf("got %d, want 24", result)
+	}
+}
+
 func TestIntegration_Linear(t *testing.T) {
 	h := setup(t)
 	task.MustRegister(h.reg, hAdd)

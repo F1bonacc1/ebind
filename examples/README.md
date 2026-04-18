@@ -29,6 +29,7 @@ go run ./examples/07-workflow-fanout
 | 08 | [`08-workflow-optional`](./08-workflow-optional) | `Optional()` step whose failure doesn't fail DAG; downstream uses `RefOrDefault(v)` |
 | 09 | [`09-workflow-dynamic`](./09-workflow-dynamic) | Handler adds per-page step dynamically via `workflow.FromContext(ctx).Step(...)` |
 | 10 | [`10-workflow-temporal-deps`](./10-workflow-temporal-deps) | Time-only deps via `After()` (cascade on fail) and `AfterAny()` (always run) |
+| 11 | [`11-workflow-resume`](./11-workflow-resume) | Resume `Await` from a different process using `AwaitByID[T]` with `(dagID, stepID)` |
 
 ## Reading order
 
