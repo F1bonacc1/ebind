@@ -1,0 +1,63 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errcheck
+    - errorlint
+    - gocritic
+    - gofmt
+    - goimports
+    - govet
+    - ineffassign
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: false
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment
+      - shadow
+  revive:
+    rules:
+      - name: var-naming
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: if-return
+      - name: range
+      - name: receiver-naming
+      - name: indent-error-flow
+      - name: superfluous-else
+  gocritic:
+    disabled-checks:
+      - ifElseChain
+      - singleCaseSwitch
+      - commentedOutCode
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - unparam
+        - bodyclose
+    - path: cmd/demo/
+      linters:
+        - errcheck
