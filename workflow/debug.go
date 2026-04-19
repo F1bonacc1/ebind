@@ -13,10 +13,10 @@ import (
 // dashboards, or debug endpoints. See Debug() for how to obtain one.
 type DAGDebug struct {
 	Meta          DAGMeta
-	Steps         []StepDebug            // ordered by AddedAt (tie-breaker: StepID)
-	Counts        map[StepStatus]int     // count of steps in each status
-	TotalDuration time.Duration          // max(FinishedAt) - Meta.CreatedAt; 0 while running
-	Blockers      []StepBlocker          // Pending steps still waiting on non-terminal deps
+	Steps         []StepDebug        // ordered by AddedAt (tie-breaker: StepID)
+	Counts        map[StepStatus]int // count of steps in each status
+	TotalDuration time.Duration      // max(FinishedAt) - Meta.CreatedAt; 0 while running
+	Blockers      []StepBlocker      // Pending steps still waiting on non-terminal deps
 }
 
 // StepDebug enriches StepRecord with computed per-step durations.
@@ -46,7 +46,6 @@ func Debug(ctx context.Context, wf *Workflow, dagID string) (DAGDebug, error) {
 		return DAGDebug{}, err
 	}
 
-	// Ordering: by AddedAt, tie-break by StepID for determinism.
 	sort.Slice(steps, func(i, j int) bool {
 		if !steps[i].AddedAt.Equal(steps[j].AddedAt) {
 			return steps[i].AddedAt.Before(steps[j].AddedAt)
@@ -90,7 +89,6 @@ func Debug(ctx context.Context, wf *Workflow, dagID string) (DAGDebug, error) {
 		dbg.TotalDuration = maxFinished.Sub(meta.CreatedAt)
 	}
 
-	// Blockers: Pending steps whose deps (required + optional) are not all terminal.
 	for _, s := range steps {
 		if s.Status != StatusPending {
 			continue
@@ -139,8 +137,8 @@ func WriteDebug(w io.Writer, dbg DAGDebug) error {
 		dbg.Meta.ID, statusHeaderLabel(dbg.Meta.Status), ageStr, totalStr); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(w, "  steps: %d done, %d failed, %d skipped, %d pending, %d running\n\n",
-		dbg.Counts[StatusDone], dbg.Counts[StatusFailed], dbg.Counts[StatusSkipped],
+	if _, err := fmt.Fprintf(w, "  steps: %d done, %d failed, %d skipped, %d canceled, %d pending, %d running\n\n",
+		dbg.Counts[StatusDone], dbg.Counts[StatusFailed], dbg.Counts[StatusSkipped], dbg.Counts[StatusCanceled],
 		dbg.Counts[StatusPending], dbg.Counts[StatusRunning]); err != nil {
 		return err
 	}
@@ -173,8 +171,6 @@ func WriteDebug(w io.Writer, dbg DAGDebug) error {
 	return nil
 }
 
-// --- rendering helpers ---
-
 func statusGlyph(s StepStatus) string {
 	switch s {
 	case StatusDone:
@@ -183,6 +179,8 @@ func statusGlyph(s StepStatus) string {
 		return "✗"
 	case StatusSkipped:
 		return "⊘"
+	case StatusCanceled:
+		return "■"
 	case StatusRunning:
 		return "▶"
 	case StatusPending:
@@ -197,13 +195,14 @@ func statusHeaderLabel(s DAGStatus) string {
 		return "DONE"
 	case DAGStatusFailed:
 		return "FAILED"
+	case DAGStatusCanceled:
+		return "CANCELED"
 	case DAGStatusRunning:
 		return "RUNNING"
 	}
 	return string(s)
 }
 
-// durationCol formats a duration column; returns "—" when not applicable.
 func durationCol(d time.Duration, unknown bool) string {
 	if unknown && d == 0 {
 		return "—"
@@ -211,7 +210,6 @@ func durationCol(d time.Duration, unknown bool) string {
 	return humanDuration(d)
 }
 
-// humanDuration formats durations compactly: µs, ms, s, m.
 func humanDuration(d time.Duration) string {
 	if d == 0 {
 		return "0s"
@@ -238,6 +236,9 @@ func stepAnnotation(s StepDebug) string {
 	if s.Attempt > 1 {
 		parts = append(parts, fmt.Sprintf("attempts=%d", s.Attempt))
 	}
+	if s.WorkerID != "" {
+		parts = append(parts, "worker="+s.WorkerID)
+	}
 	if s.ErrorKind != "" {
 		parts = append(parts, "kind="+s.ErrorKind)
 	}
@@ -246,8 +247,8 @@ func stepAnnotation(s StepDebug) string {
 		if s.ErrorKind == "" {
 			parts = append(parts, "(cascade)")
 		}
-	case StatusPending:
-		// Intentionally leave empty — blockers section carries detail.
+	case StatusCanceled:
+		parts = append(parts, "(canceled)")
 	}
 	if len(parts) == 0 {
 		return ""

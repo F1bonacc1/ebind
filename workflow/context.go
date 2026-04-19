@@ -19,6 +19,22 @@ func FromContext(ctx context.Context) *ContextDAG {
 	return v
 }
 
+// CurrentTarget returns the current task target from workflow handler context.
+func CurrentTarget(ctx context.Context) string {
+	if d := FromContext(ctx); d != nil {
+		return d.target
+	}
+	return ""
+}
+
+// CurrentWorkerID returns the concrete worker handling the current workflow step.
+func CurrentWorkerID(ctx context.Context) string {
+	if d := FromContext(ctx); d != nil {
+		return d.workerID
+	}
+	return ""
+}
+
 // ContextDAG is the in-handler handle for dynamically adding steps to the
 // currently-running DAG. The newly added step depends on the current step
 // (implicitly) plus any explicit Refs passed as args.
@@ -26,6 +42,8 @@ type ContextDAG struct {
 	wf         *Workflow
 	dagID      string
 	parentStep string
+	target     string
+	workerID   string
 }
 
 // Step adds a new step to the current DAG. The new step implicitly depends on
@@ -39,6 +57,14 @@ func (c *ContextDAG) Step(id string, fn any, args ...any) (*Step, error) {
 // The new step implicitly depends on the currently-running step, plus any explicit
 // Refs in args and any explicit After()/AfterAny() upstream steps.
 func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any) (*Step, error) {
+	meta, _, err := c.wf.Store.GetMeta(context.Background(), c.dagID)
+	if err != nil {
+		return nil, err
+	}
+	if meta.Status == DAGStatusCanceled {
+		return nil, ErrDAGCanceled
+	}
+
 	desc, err := task.Describe(fn)
 	if err != nil {
 		return nil, fmt.Errorf("workflow: dynamic step %q: %w", id, err)
@@ -52,9 +78,17 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 	if c.parentStep != "" {
 		s.afterDeps = append(s.afterDeps, c.parentStep)
 	}
+	if s.placement != nil && s.placement.Mode == PlacementHere {
+		s.placement = &PlacementSpec{Mode: PlacementDirect, Target: worker.ConcreteTarget(c.workerID)}
+	}
 	argsJSON, err := marshalArgs(args)
 	if err != nil {
 		return nil, fmt.Errorf("workflow: dynamic step %q: %w", id, err)
+	}
+	var placement *PlacementSpec
+	if s.placement != nil {
+		copy := *s.placement
+		placement = &copy
 	}
 	rec := StepRecord{
 		DAGID:        c.dagID,
@@ -66,6 +100,7 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 		Status:       StatusPending,
 		Optional:     s.optional,
 		Policy:       s.policy,
+		Placement:    placement,
 		AddedAt:      time.Now().UTC(),
 	}
 	// CAS-create (rev=0 means "must not exist").
@@ -86,7 +121,7 @@ func (wf *Workflow) ContextMiddleware() worker.Middleware {
 	return func(next worker.Handler) worker.Handler {
 		return func(ctx context.Context, t *task.Task) ([]byte, error) {
 			if t.DAGID != "" {
-				cd := &ContextDAG{wf: wf, dagID: t.DAGID, parentStep: t.StepID}
+				cd := &ContextDAG{wf: wf, dagID: t.DAGID, parentStep: t.StepID, target: t.Target, workerID: t.WorkerID}
 				ctx = context.WithValue(ctx, ctxKey{}, cd)
 			}
 			return next(ctx, t)

@@ -35,8 +35,9 @@ func TestDebug_Counts(t *testing.T) {
 		StepRecord{StepID: "a", Status: StatusDone, AddedAt: baseTime, StartedAt: baseTime.Add(10 * time.Millisecond), FinishedAt: baseTime.Add(110 * time.Millisecond)},
 		StepRecord{StepID: "b", Status: StatusFailed, AddedAt: baseTime, StartedAt: baseTime.Add(5 * time.Millisecond), FinishedAt: baseTime.Add(25 * time.Millisecond), ErrorKind: "boom", Attempt: 3},
 		StepRecord{StepID: "c", Status: StatusSkipped, AddedAt: baseTime, FinishedAt: baseTime.Add(30 * time.Millisecond)},
-		StepRecord{StepID: "d", Status: StatusPending, AddedAt: baseTime},
-		StepRecord{StepID: "e", Status: StatusRunning, AddedAt: baseTime, StartedAt: baseTime.Add(40 * time.Millisecond)},
+		StepRecord{StepID: "d", Status: StatusCanceled, AddedAt: baseTime, FinishedAt: baseTime.Add(35 * time.Millisecond)},
+		StepRecord{StepID: "e", Status: StatusPending, AddedAt: baseTime},
+		StepRecord{StepID: "f", Status: StatusRunning, AddedAt: baseTime, StartedAt: baseTime.Add(40 * time.Millisecond)},
 	)
 
 	dbg, err := Debug(context.Background(), wf, id)
@@ -45,15 +46,15 @@ func TestDebug_Counts(t *testing.T) {
 	}
 
 	want := map[StepStatus]int{
-		StatusDone: 1, StatusFailed: 1, StatusSkipped: 1, StatusPending: 1, StatusRunning: 1,
+		StatusDone: 1, StatusFailed: 1, StatusSkipped: 1, StatusCanceled: 1, StatusPending: 1, StatusRunning: 1,
 	}
 	for k, v := range want {
 		if dbg.Counts[k] != v {
 			t.Errorf("Counts[%s] = %d, want %d", k, dbg.Counts[k], v)
 		}
 	}
-	if len(dbg.Steps) != 5 {
-		t.Errorf("want 5 steps, got %d", len(dbg.Steps))
+	if len(dbg.Steps) != 6 {
+		t.Errorf("want 6 steps, got %d", len(dbg.Steps))
 	}
 }
 

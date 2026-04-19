@@ -14,8 +14,8 @@ import (
 // The magic key "__ebind_ref__" makes Refs distinguishable from ordinary JSON values.
 // The Mode controls what happens when the upstream step failed/skipped.
 type Ref struct {
-	StepID  string     `json:"step_id"`
-	Mode    RefMode    `json:"mode"`
+	StepID  string          `json:"step_id"`
+	Mode    RefMode         `json:"mode"`
 	Default json.RawMessage `json:"default,omitempty"` // used when Mode == RefOrDefault
 }
 
@@ -82,11 +82,12 @@ func DecodeRef(raw json.RawMessage) (*Ref, bool) {
 type StepStatus string
 
 const (
-	StatusPending StepStatus = "pending"
-	StatusRunning StepStatus = "running"
-	StatusDone    StepStatus = "done"
-	StatusFailed  StepStatus = "failed"
-	StatusSkipped StepStatus = "skipped"
+	StatusPending  StepStatus = "pending"
+	StatusRunning  StepStatus = "running"
+	StatusDone     StepStatus = "done"
+	StatusFailed   StepStatus = "failed"
+	StatusSkipped  StepStatus = "skipped"
+	StatusCanceled StepStatus = "canceled"
 )
 
 // ResolveArgs substitutes each Ref in rawArgs with the actual upstream result bytes
@@ -117,7 +118,7 @@ func ResolveArgs(
 				return nil, false, fmt.Errorf("ResolveArgs: upstream %q is done but no result", ref.StepID)
 			}
 			out[i] = upstream
-		case StatusFailed, StatusSkipped:
+		case StatusFailed, StatusSkipped, StatusCanceled:
 			switch ref.Mode {
 			case RefModeRequired:
 				return nil, true, nil // cascade skip

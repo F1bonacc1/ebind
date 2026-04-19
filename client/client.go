@@ -57,10 +57,10 @@ func New(ctx context.Context, nc *nats.Conn, opts Options) (*Client, error) {
 	}
 	// Ephemeral consumer: responses are per-client-process; on restart we'd start fresh.
 	cons, err := respStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Name:          "ebind-resp-" + c.id,
-		FilterSubject: stream.ResponseSubjectPrefix + c.id + ".>",
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		DeliverPolicy: jetstream.DeliverNewPolicy,
+		Name:              "ebind-resp-" + c.id,
+		FilterSubject:     stream.ResponseSubjectPrefix + c.id + ".>",
+		AckPolicy:         jetstream.AckExplicitPolicy,
+		DeliverPolicy:     jetstream.DeliverNewPolicy,
 		InactiveThreshold: 10 * time.Minute,
 	})
 	if err != nil {
@@ -99,11 +99,12 @@ func (c *Client) handleResponse(msg jetstream.Msg) {
 }
 
 type EnqueueOptions struct {
-	Deadline     time.Time         // absolute deadline for handler execution
-	TraceCtx     map[string]string
-	RetryPolicy  *task.RetryPolicy // per-task override; worker falls back to its Options defaults when nil
-	DAGID        string            // workflow-level: identifies the parent DAG
-	StepID       string            // workflow-level: identifies this step within the DAG
+	Deadline    time.Time         // absolute deadline for handler execution
+	TraceCtx    map[string]string
+	RetryPolicy *task.RetryPolicy // per-task override; worker falls back to its Options defaults when nil
+	DAGID       string            // workflow-level: identifies the parent DAG
+	StepID      string            // workflow-level: identifies this step within the DAG
+	Target      string            // logical or concrete placement claim for targeted execution
 	// SkipResponse: don't register a waiter, return nil Future (fire-and-forget).
 	SkipResponse bool
 }
@@ -142,6 +143,7 @@ func EnqueueOpts(c *Client, fn any, opts EnqueueOptions, args ...any) (*Future, 
 		RetryPolicy: opts.RetryPolicy,
 		DAGID:       opts.DAGID,
 		StepID:      opts.StepID,
+		Target:      opts.Target,
 	}
 	if !opts.SkipResponse {
 		t.ReplyTo = stream.ResponseSubjectPrefix + c.id + "." + id
@@ -162,7 +164,7 @@ func EnqueueOpts(c *Client, fn any, opts EnqueueOptions, args ...any) (*Future, 
 	}
 
 	ctx := context.Background()
-	subject := stream.TaskSubjectPrefix + d.Name
+	subject := stream.TaskPublishSubject(d.Name, t.Target)
 	if _, err := c.js.Publish(ctx, subject, body, jetstream.WithMsgID(id)); err != nil {
 		if !opts.SkipResponse {
 			c.waiters.Delete(id)
@@ -204,12 +206,14 @@ func enqueueAsync(c *Client, fn any, opts EnqueueOptions, args ...any) (string, 
 		RetryPolicy: opts.RetryPolicy,
 		DAGID:       opts.DAGID,
 		StepID:      opts.StepID,
+		Target:      opts.Target,
 	}
 	body, err := json.Marshal(t)
 	if err != nil {
 		return "", err
 	}
-	if _, err := c.js.Publish(context.Background(), stream.TaskSubjectPrefix+d.Name, body, jetstream.WithMsgID(id)); err != nil {
+	subject := stream.TaskPublishSubject(d.Name, t.Target)
+	if _, err := c.js.Publish(context.Background(), subject, body, jetstream.WithMsgID(id)); err != nil {
 		return "", fmt.Errorf("ebind: EnqueueAsync %s: publish: %w", d.Name, err)
 	}
 	return id, nil

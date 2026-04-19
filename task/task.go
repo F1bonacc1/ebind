@@ -17,6 +17,8 @@ type Task struct {
 	DAGID       string            `json:"dag_id,omitempty"`
 	StepID      string            `json:"step_id,omitempty"`
 	RetryPolicy *RetryPolicy      `json:"retry_policy,omitempty"`
+	Target      string            `json:"target,omitempty"`
+	WorkerID    string            `json:"worker_id,omitempty"`
 }
 
 type Response struct {

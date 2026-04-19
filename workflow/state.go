@@ -11,18 +11,19 @@ import (
 type DAGStatus string
 
 const (
-	DAGStatusRunning DAGStatus = "running"
-	DAGStatusDone    DAGStatus = "done"
-	DAGStatusFailed  DAGStatus = "failed"
+	DAGStatusRunning  DAGStatus = "running"
+	DAGStatusDone     DAGStatus = "done"
+	DAGStatusFailed   DAGStatus = "failed"
+	DAGStatusCanceled DAGStatus = "canceled"
 )
 
 // DAGMeta is the meta record stored in the state store (key: <dag_id>/meta).
 type DAGMeta struct {
-	ID             string            `json:"id"`
-	Status         DAGStatus         `json:"status"`
-	CreatedAt      time.Time         `json:"created_at"`
-	DefaultPolicy  *task.RetryPolicy `json:"default_policy,omitempty"`
-	TerminalSteps  []string          `json:"terminal_steps,omitempty"`
+	ID            string            `json:"id"`
+	Status        DAGStatus         `json:"status"`
+	CreatedAt     time.Time         `json:"created_at"`
+	DefaultPolicy *task.RetryPolicy `json:"default_policy,omitempty"`
+	TerminalSteps []string          `json:"terminal_steps,omitempty"`
 }
 
 // StepRecord is stored per-step (key: <dag_id>/step/<step_id>).
@@ -46,6 +47,8 @@ type StepRecord struct {
 	ErrorKind    string            `json:"error_kind,omitempty"`
 	Optional     bool              `json:"optional,omitempty"`
 	Policy       *task.RetryPolicy `json:"policy,omitempty"` // per-step override
+	Placement    *PlacementSpec    `json:"placement,omitempty"`
+	WorkerID     string            `json:"worker_id,omitempty"`
 	AddedAt      time.Time         `json:"added_at"`
 	StartedAt    time.Time         `json:"started_at,omitempty"`
 	FinishedAt   time.Time         `json:"finished_at,omitempty"`
@@ -53,7 +56,7 @@ type StepRecord struct {
 
 // IsTerminal returns true if this step's status cannot change anymore.
 func (s StepRecord) IsTerminal() bool {
-	return s.Status == StatusDone || s.Status == StatusFailed || s.Status == StatusSkipped
+	return s.Status == StatusDone || s.Status == StatusFailed || s.Status == StatusSkipped || s.Status == StatusCanceled
 }
 
 // DAGState is the in-memory view of a DAG — loaded from the store at scheduler
@@ -115,11 +118,6 @@ func (s *DAGState) MarkDone(stepID string) ([]string, error) {
 
 // MarkFailed transitions to `failed` (idempotent) and cascade-skips all downstream
 // steps whose required deps are unsatisfied by the failure. Returns (newlyReady, newlySkipped).
-//
-// The cascade runs unconditionally even when the step is already Failed — the
-// hook may have written the Failed status to the store before this event was
-// delivered, so the transition looks idempotent but the cascade still needs to
-// happen to propagate the skip downstream.
 func (s *DAGState) MarkFailed(stepID, errorKind string) (newlyReady, newlySkipped []string, err error) {
 	step, ok := s.Steps[stepID]
 	if !ok {
@@ -136,7 +134,6 @@ func (s *DAGState) MarkFailed(stepID, errorKind string) (newlyReady, newlySkippe
 }
 
 // MarkSkipped transitions to `skipped` (idempotent) and cascade-skips downstream.
-// Cascade runs unconditionally — see MarkFailed for rationale.
 func (s *DAGState) MarkSkipped(stepID string) ([]string, error) {
 	step, ok := s.Steps[stepID]
 	if !ok {
@@ -153,13 +150,6 @@ func (s *DAGState) MarkSkipped(stepID string) ([]string, error) {
 
 // cascadeSkipFrom walks down from a failed/skipped step and cascade-skips every
 // dependent that was waiting on it in a required way. Transitive.
-//
-// A dependent D is cascade-skipped when `target` failed/skipped if:
-//   - target ∈ D.Deps (required), AND
-//   - D's args DO NOT contain a RefOrDefault on target (if they do, D will run
-//     with the default substituted and should not be skipped).
-//
-// Steps that declared target only via AfterAny (in OptionalDeps) never cascade.
 func (s *DAGState) cascadeSkipFrom(rootID string) []string {
 	var skipped []string
 	queue := []string{rootID}
@@ -223,10 +213,6 @@ func (s *DAGState) AddStep(rec StepRecord) error {
 }
 
 // Terminal returns (status, done). done is true if all steps are in terminal states.
-// status is:
-//   - DAGStatusDone: all mandatory steps reached done (optional may have failed/skipped)
-//   - DAGStatusFailed: at least one mandatory step ended in failed or skipped
-//   - DAGStatusRunning: at least one step is non-terminal
 func (s *DAGState) Terminal() (DAGStatus, bool) {
 	allTerminal := true
 	hasFailure := false
@@ -240,6 +226,9 @@ func (s *DAGState) Terminal() (DAGStatus, bool) {
 	}
 	if !allTerminal {
 		return DAGStatusRunning, false
+	}
+	if s.Meta.Status == DAGStatusCanceled {
+		return DAGStatusCanceled, true
 	}
 	if hasFailure {
 		return DAGStatusFailed, true

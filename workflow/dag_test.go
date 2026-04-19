@@ -107,6 +107,54 @@ func TestDAG_Submit_EnqueuesRoots_Only(t *testing.T) {
 	}
 }
 
+func TestDAG_Submit_PersistsPlacement(t *testing.T) {
+	store := NewMemStore()
+	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
+	dag := New()
+	a := dag.StepOpts("a", noopA, []StepOption{OnTarget("primary")}, 1)
+	dag.StepOpts("b", noopB, []StepOption{ColocateWith(a)})
+	dag.StepOpts("c", noopB, []StepOption{FollowTargetOf(a)})
+
+	if err := dag.Submit(context.Background(), wf); err != nil {
+		t.Fatal(err)
+	}
+
+	aRec, _, err := store.GetStep(context.Background(), dag.ID(), "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aRec.Placement == nil || aRec.Placement.Mode != PlacementDirect || aRec.Placement.Target != "primary" {
+		t.Fatalf("a placement = %+v, want direct primary", aRec.Placement)
+	}
+
+	bRec, _, err := store.GetStep(context.Background(), dag.ID(), "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bRec.Placement == nil || bRec.Placement.Mode != PlacementColocate || bRec.Placement.StepID != "a" {
+		t.Fatalf("b placement = %+v, want colocate_with a", bRec.Placement)
+	}
+
+	cRec, _, err := store.GetStep(context.Background(), dag.ID(), "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cRec.Placement == nil || cRec.Placement.Mode != PlacementFollow || cRec.Placement.StepID != "a" {
+		t.Fatalf("c placement = %+v, want follow_target_of a", cRec.Placement)
+	}
+}
+
+func TestDAG_Submit_ColocateHereOutsideHandler_Errors(t *testing.T) {
+	dag := New()
+	dag.StepOpts("a", noopB, []StepOption{ColocateHere()})
+
+	wf := NewWorkflow(NewMemStore(), NewMemBus(), &captureEnq{})
+	err := dag.Submit(context.Background(), wf)
+	if err == nil || !strings.Contains(err.Error(), "ColocateHere") {
+		t.Errorf("want ColocateHere error, got %v", err)
+	}
+}
+
 func TestDAG_Submit_Idempotent_BlocksResubmit(t *testing.T) {
 	wf := NewWorkflow(NewMemStore(), NewMemBus(), &captureEnq{})
 	dag := New()

@@ -64,6 +64,27 @@ func publishCompletion(t *testing.T, wf *Workflow, dagID, stepID string, status 
 	_ = wf.Bus.Publish(context.Background(), EventSubject(ev), data)
 }
 
+func startScheduler(t *testing.T, wf *Workflow, ctx context.Context) {
+	t.Helper()
+	go func() { _ = wf.RunScheduler(ctx) }()
+
+	bus, ok := wf.Bus.(*MemBus)
+	if !ok {
+		return
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		bus.mu.Lock()
+		count := len(bus.subs)
+		bus.mu.Unlock()
+		if count > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("scheduler did not subscribe in time")
+}
+
 // emulateHook does what worker.StepHook would: update status in store + publish event.
 // Lets us drive the scheduler without a real worker.
 func emulateHook(t *testing.T, wf *Workflow, dagID, stepID string, result []byte, te *task.TaskError) {
@@ -111,7 +132,7 @@ func TestScheduler_Linear_AllStepsEnqueued(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = wf.RunScheduler(ctx) }()
+	startScheduler(t, wf, ctx)
 	if err := dag.Submit(ctx, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +154,7 @@ func TestScheduler_FanOutFanIn(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = wf.RunScheduler(ctx) }()
+	startScheduler(t, wf, ctx)
 	if err := dag.Submit(ctx, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +175,7 @@ func TestScheduler_Mandatory_FailureCascades(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = wf.RunScheduler(ctx) }()
+	startScheduler(t, wf, ctx)
 	if err := dag.Submit(ctx, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +206,7 @@ func TestScheduler_OptionalFailure_RefOrDefault_Runs(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = wf.RunScheduler(ctx) }()
+	startScheduler(t, wf, ctx)
 	if err := dag.Submit(ctx, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +277,7 @@ func TestScheduler_Sweep_OnLeaderAcquire_EnqueuesStranded(t *testing.T) {
 	bArgs, _ := json.Marshal([]json.RawMessage{refA})
 	_ = store.PutStep(ctx, dagID, "b", StepRecord{DAGID: dagID, StepID: "b", FnName: "noopA", Status: StatusPending, Deps: []string{"a"}, ArgsJSON: bArgs}, 0)
 
-	go func() { _ = wf.RunScheduler(ctx) }()
+	startScheduler(t, wf, ctx)
 
 	// While non-leader: no sweep runs, no enqueues.
 	time.Sleep(300 * time.Millisecond)
@@ -298,7 +319,7 @@ func TestScheduler_Sweep_EdgeTriggered_NoDuplicateRuns(t *testing.T) {
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0)
 	_ = store.PutStep(ctx, dagID, "a", StepRecord{DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`)}, 0)
 
-	go func() { _ = wf.RunScheduler(ctx) }()
+	startScheduler(t, wf, ctx)
 	elector.set(true)
 	time.Sleep(300 * time.Millisecond) // many ticks pass, all see leader=true
 
@@ -324,7 +345,7 @@ func TestScheduler_Sweep_TriggersAgainAfterReAcquire(t *testing.T) {
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0)
 	_ = store.PutStep(ctx, dagID, "a", StepRecord{DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`)}, 0)
 
-	go func() { _ = wf.RunScheduler(ctx) }()
+	startScheduler(t, wf, ctx)
 
 	elector.set(true)
 	time.Sleep(150 * time.Millisecond)
@@ -359,7 +380,7 @@ func TestScheduler_Finalizes_DAG_Status(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = wf.RunScheduler(ctx) }()
+	startScheduler(t, wf, ctx)
 	if err := dag.Submit(ctx, wf); err != nil {
 		t.Fatal(err)
 	}
