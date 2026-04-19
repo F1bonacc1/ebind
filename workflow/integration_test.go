@@ -178,6 +178,150 @@ func hNonRetryable(_ context.Context) (int, error) {
 	return 0, &task.TaskError{Kind: "validation", Message: "bad", Retryable: false}
 }
 
+func hWhere(ctx context.Context) (string, error) {
+	return workflow.CurrentWorkerID(ctx), nil
+}
+
+func isWorkerID(id string) bool {
+	return id == "w1" || id == "w2"
+}
+
+type mutableClaims struct {
+	mu     sync.Mutex
+	claims []string
+}
+
+func (m *mutableClaims) Claims(context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.claims))
+	copy(out, m.claims)
+	return out, nil
+}
+
+func (m *mutableClaims) Set(claims ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.claims = append([]string(nil), claims...)
+}
+
+type multiWorkerHarness struct {
+	nc     *nats.Conn
+	js     jetstream.JetStream
+	wf     *workflow.Workflow
+	regs   []*task.Registry
+	cancel context.CancelFunc
+}
+
+type workerSpec struct {
+	id     string
+	claims *mutableClaims
+}
+
+func setupMultiWorker(t *testing.T, specs ...workerSpec) *multiWorkerHarness {
+	t.Helper()
+	storeDir, err := os.MkdirTemp("", "ebind-wf-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(storeDir) })
+
+	node, err := embed.StartNode(embed.NodeConfig{
+		ServerName: "wf-" + t.Name(),
+		Port:       -1,
+		StoreDir:   storeDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(node.Shutdown)
+
+	nc, err := nats.Connect(node.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+
+	js, _ := jetstream.New(nc)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := stream.EnsureStreams(ctx, js, stream.Config{Replicas: 1}); err != nil {
+		t.Fatal(err)
+	}
+	wf, err := workflow.NewFromNATS(ctx, nc, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	t.Cleanup(runCancel)
+
+	regs := make([]*task.Registry, 0, len(specs))
+	for _, spec := range specs {
+		reg := task.NewRegistry()
+		w, err := worker.New(nc, reg, worker.Options{
+			Concurrency:          4,
+			AckWait:              2 * time.Second,
+			MaxDeliver:           5,
+			Backoff:              []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond},
+			StepHook:             wf.Hook(),
+			Middleware:           []worker.Middleware{wf.ContextMiddleware()},
+			WorkerID:             spec.id,
+			Claims:               spec.claims,
+			ClaimRefreshInterval: 50 * time.Millisecond,
+			ClaimRetryDelay:      25 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		regs = append(regs, reg)
+		go func(workerInstance *worker.Worker) { _ = workerInstance.Run(runCtx) }(w)
+	}
+
+	go func() { _ = wf.RunScheduler(runCtx) }()
+	time.Sleep(300 * time.Millisecond)
+
+	return &multiWorkerHarness{nc: nc, js: js, wf: wf, regs: regs, cancel: runCancel}
+}
+
+func (h *multiWorkerHarness) register(t *testing.T, fn any) {
+	t.Helper()
+	for _, reg := range h.regs {
+		task.MustRegister(reg, fn)
+	}
+}
+
+func newBlockedWhereHandler() (func(context.Context) (string, error), <-chan struct{}, chan<- struct{}) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	fn := func(ctx context.Context) (string, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return workflow.CurrentWorkerID(ctx), nil
+	}
+	return fn, started, release
+}
+
+func newAddColocatedHereHandler() (func(context.Context) (string, error), <-chan struct{}, chan<- struct{}) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	fn := func(ctx context.Context) (string, error) {
+		d := workflow.FromContext(ctx)
+		if d == nil {
+			return "", errors.New("missing workflow context")
+		}
+		if _, err := d.StepOpts("child", hWhere, []workflow.StepOption{workflow.ColocateHere()}); err != nil {
+			return "", err
+		}
+		once.Do(func() { close(started) })
+		<-release
+		return workflow.CurrentWorkerID(ctx), nil
+	}
+	return fn, started, release
+}
+
 // --- Tests ---
 
 func TestIntegration_AwaitByID_DifferentInstance(t *testing.T) {
@@ -636,4 +780,212 @@ func TestIntegration_Dynamic_StepAdded(t *testing.T) {
 	}
 	meta, steps, _ := workflow.DAGInfo(ctx, h.wf, dag.ID())
 	t.Fatalf("dynamic step did not complete; meta=%+v steps=%+v", meta, steps)
+}
+
+func TestIntegration_OnTarget_RunsOnClaimOwner(t *testing.T) {
+	primary := &mutableClaims{claims: []string{"primary"}}
+	secondary := &mutableClaims{claims: []string{"secondary"}}
+	h := setupMultiWorker(t,
+		workerSpec{id: "w1", claims: primary},
+		workerSpec{id: "w2", claims: secondary},
+	)
+	h.register(t, hWhere)
+
+	dag := workflow.New()
+	a := dag.StepOpts("a", hWhere, []workflow.StepOption{workflow.OnTarget("primary")})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := workflow.Await[string](ctx, h.wf, dag.ID(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "w1" {
+		t.Errorf("targeted step ran on %q, want w1", result)
+	}
+}
+
+func TestIntegration_ColocateWith_UsesConcreteWorker(t *testing.T) {
+	blockWhere, started, release := newBlockedWhereHandler()
+	primary := &mutableClaims{claims: []string{"primary"}}
+	secondary := &mutableClaims{claims: []string{"secondary"}}
+	h := setupMultiWorker(t,
+		workerSpec{id: "w1", claims: primary},
+		workerSpec{id: "w2", claims: secondary},
+	)
+	h.register(t, blockWhere)
+	h.register(t, hWhere)
+
+	dag := workflow.New()
+	a := dag.StepOpts("a", blockWhere, []workflow.StepOption{workflow.OnTarget("primary")})
+	b := dag.StepOpts("b", hWhere, []workflow.StepOption{workflow.ColocateWith(a)})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+
+	<-started
+	primary.Set("secondary")
+	secondary.Set("primary")
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	aResult, err := workflow.Await[string](ctx, h.wf, dag.ID(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bResult, err := workflow.Await[string](ctx, h.wf, dag.ID(), b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isWorkerID(aResult) {
+		t.Fatalf("a ran on %q, want one of w1/w2", aResult)
+	}
+	if bResult != aResult {
+		t.Errorf("colocated step ran on %q, want %q", bResult, aResult)
+	}
+}
+
+func TestIntegration_FollowTargetOf_ReResolvesLogicalTarget(t *testing.T) {
+	blockWhere, started, release := newBlockedWhereHandler()
+	primary := &mutableClaims{claims: []string{"primary"}}
+	secondary := &mutableClaims{claims: []string{"secondary"}}
+	h := setupMultiWorker(t,
+		workerSpec{id: "w1", claims: primary},
+		workerSpec{id: "w2", claims: secondary},
+	)
+	h.register(t, blockWhere)
+	h.register(t, hWhere)
+
+	dag := workflow.New()
+	a := dag.StepOpts("a", blockWhere, []workflow.StepOption{workflow.OnTarget("primary")})
+	b := dag.StepOpts("b", hWhere, []workflow.StepOption{workflow.FollowTargetOf(a)})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+
+	<-started
+	primary.Set("secondary")
+	secondary.Set("primary")
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	aResult, err := workflow.Await[string](ctx, h.wf, dag.ID(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bResult, err := workflow.Await[string](ctx, h.wf, dag.ID(), b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isWorkerID(aResult) {
+		t.Fatalf("a ran on %q, want one of w1/w2", aResult)
+	}
+	if bResult != "w2" {
+		t.Errorf("follow-target step ran on %q, want w2", bResult)
+	}
+}
+
+func TestIntegration_ColocateHere_BindsDynamicStepToCurrentWorker(t *testing.T) {
+	addColocatedHere, started, release := newAddColocatedHereHandler()
+	primary := &mutableClaims{claims: []string{"primary"}}
+	secondary := &mutableClaims{claims: []string{"secondary"}}
+	h := setupMultiWorker(t,
+		workerSpec{id: "w1", claims: primary},
+		workerSpec{id: "w2", claims: secondary},
+	)
+	h.register(t, addColocatedHere)
+	h.register(t, hWhere)
+
+	dag := workflow.New()
+	parent := dag.StepOpts("parent", addColocatedHere, []workflow.StepOption{workflow.OnTarget("primary")})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+
+	<-started
+	primary.Set("secondary")
+	secondary.Set("primary")
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	parentResult, err := workflow.Await[string](ctx, h.wf, dag.ID(), parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childResult, err := workflow.AwaitByID[string](ctx, h.wf, dag.ID(), "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isWorkerID(parentResult) {
+		t.Fatalf("parent ran on %q, want one of w1/w2", parentResult)
+	}
+	if childResult != parentResult {
+		t.Errorf("ColocateHere child ran on %q, want %q", childResult, parentResult)
+	}
+}
+
+func TestIntegration_Cancel_StopsNewWorkButLetsRunningFinish(t *testing.T) {
+	blockWhere, started, release := newBlockedWhereHandler()
+	h := setup(t)
+	task.MustRegister(h.reg, blockWhere)
+	task.MustRegister(h.reg, hWhere)
+
+	dag := workflow.New()
+	a := dag.Step("a", blockWhere)
+	b := dag.StepOpts("b", hWhere, []workflow.StepOption{workflow.After(a)})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+
+	<-started
+	if err := workflow.Cancel(ctx, h.wf, dag.ID()); err != nil {
+		t.Fatal(err)
+	}
+
+	metaDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(metaDeadline) {
+		meta, _, err := workflow.DAGInfo(ctx, h.wf, dag.ID())
+		if err == nil && meta.Status == workflow.DAGStatusCanceled {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	close(release)
+
+	if _, err := workflow.Await[string](ctx, h.wf, dag.ID(), a); err != nil {
+		t.Fatalf("running step should still finish: %v", err)
+	}
+	if _, err := workflow.Await[string](ctx, h.wf, dag.ID(), b); !errors.Is(err, workflow.ErrStepCanceled) {
+		t.Fatalf("downstream step should be canceled, got %v", err)
+	}
+
+	meta, steps, err := workflow.DAGInfo(ctx, h.wf, dag.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Status != workflow.DAGStatusCanceled {
+		t.Fatalf("meta status = %s, want canceled", meta.Status)
+	}
+	for _, step := range steps {
+		if step.StepID == "b" && step.Status != workflow.StatusCanceled {
+			t.Fatalf("b status = %s, want canceled", step.Status)
+		}
+	}
 }

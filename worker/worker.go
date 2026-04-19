@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -19,14 +22,18 @@ import (
 )
 
 type Options struct {
-	Durable       string        // consumer durable name; default "ebind-worker"
-	Concurrency   int           // max in-flight handlers; default 16
-	AckWait       time.Duration // default 30s
-	MaxDeliver    int           // default 5 — upper bound from NATS consumer; task-level RetryPolicy can tighten but not exceed.
-	Backoff       []time.Duration
-	ShutdownGrace time.Duration // default 30s
-	Middleware    []Middleware
-	StepHook      StepHook // optional; called on terminal success/failure (workflow integration)
+	Durable              string        // consumer durable name; default "ebind-worker"
+	Concurrency          int           // max in-flight handlers; default 16
+	AckWait              time.Duration // default 30s
+	MaxDeliver           int           // default 5 — upper bound from NATS consumer; task-level RetryPolicy can tighten but not exceed.
+	Backoff              []time.Duration
+	ShutdownGrace        time.Duration // default 30s
+	Middleware           []Middleware
+	StepHook             StepHook // optional; called on terminal success/failure (workflow integration)
+	WorkerID             string
+	Claims               ClaimProvider
+	ClaimRefreshInterval time.Duration
+	ClaimRetryDelay      time.Duration
 }
 
 func (o *Options) setDefaults() {
@@ -51,6 +58,15 @@ func (o *Options) setDefaults() {
 	}
 	if o.ShutdownGrace == 0 {
 		o.ShutdownGrace = 30 * time.Second
+	}
+	if o.WorkerID == "" {
+		o.WorkerID = uuid.NewString()
+	}
+	if o.ClaimRefreshInterval == 0 {
+		o.ClaimRefreshInterval = 2 * time.Second
+	}
+	if o.ClaimRetryDelay == 0 {
+		o.ClaimRetryDelay = time.Second
 	}
 }
 
@@ -90,7 +106,11 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("worker: tasks stream: %w", err)
 	}
-	cons, err := tasksStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+
+	sem := make(chan struct{}, w.opts.Concurrency)
+	var wg sync.WaitGroup
+
+	generalCons, err := tasksStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Durable:       w.opts.Durable,
 		FilterSubject: stream.TaskSubjectPrefix + ">",
 		AckPolicy:     jetstream.AckExplicitPolicy,
@@ -101,24 +121,32 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("worker: consumer: %w", err)
 	}
-
-	sem := make(chan struct{}, w.opts.Concurrency)
-	var wg sync.WaitGroup
-
-	consumeCtx, err := cons.Consume(func(msg jetstream.Msg) {
-		sem <- struct{}{}
-		wg.Add(1)
-		go func() {
-			defer func() { <-sem; wg.Done() }()
-			w.handle(ctx, msg)
-		}()
-	})
+	generalCC, err := w.startConsumer(ctx, generalCons, sem, &wg)
 	if err != nil {
 		return fmt.Errorf("worker: consume: %w", err)
 	}
 
+	targetedCons, err := tasksStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable:       w.targetedDurable(),
+		FilterSubject: stream.TargetedTaskSubjectPrefix + ">",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       w.opts.AckWait,
+		MaxDeliver:    w.opts.MaxDeliver,
+		BackOff:       w.opts.Backoff,
+	})
+	if err != nil {
+		generalCC.Stop()
+		return fmt.Errorf("worker: targeted consumer: %w", err)
+	}
+	targetedCC, err := w.startConsumer(ctx, targetedCons, sem, &wg)
+	if err != nil {
+		generalCC.Stop()
+		return fmt.Errorf("worker: targeted consume: %w", err)
+	}
+
 	<-ctx.Done()
-	consumeCtx.Stop()
+	generalCC.Stop()
+	targetedCC.Stop()
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
@@ -129,6 +157,60 @@ func (w *Worker) Run(ctx context.Context) error {
 			w.opts.ShutdownGrace, len(sem))
 	}
 	return nil
+}
+
+func (w *Worker) startConsumer(ctx context.Context, cons jetstream.Consumer, sem chan struct{}, wg *sync.WaitGroup) (jetstream.ConsumeContext, error) {
+	return cons.Consume(func(msg jetstream.Msg) {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			w.handle(ctx, msg)
+		}()
+	})
+}
+
+func (w *Worker) targetedDurable() string {
+	return w.opts.Durable + "-targets"
+}
+
+func (w *Worker) currentClaims(ctx context.Context) ([]string, error) {
+	seen := map[string]struct{}{}
+	claims := []string{ConcreteTarget(w.opts.WorkerID)}
+	seen[claims[0]] = struct{}{}
+	if w.opts.Claims == nil {
+		return claims, nil
+	}
+	provided, err := w.opts.Claims.Claims(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, claim := range provided {
+		claim = strings.TrimSpace(claim)
+		if claim == "" {
+			continue
+		}
+		if _, ok := seen[claim]; ok {
+			continue
+		}
+		seen[claim] = struct{}{}
+		claims = append(claims, claim)
+	}
+	sort.Strings(claims)
+	return claims, nil
+}
+
+func (w *Worker) ownsTarget(ctx context.Context, target string) bool {
+	claims, err := w.currentClaims(ctx)
+	if err != nil {
+		return false
+	}
+	for _, claim := range claims {
+		if claim == target {
+			return true
+		}
+	}
+	return false
 }
 
 // baseHandler is the terminal Handler that decodes the task payload and calls the
@@ -153,12 +235,16 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 		_ = msg.Term()
 		return
 	}
-	// Use JetStream delivery metadata — the envelope itself is immutable across redeliveries.
 	if md, err := msg.Metadata(); err == nil {
 		t.Attempt = int(md.NumDelivered)
 	} else {
 		t.Attempt = 1
 	}
+	if t.Target != "" && !w.ownsTarget(ctx, t.Target) {
+		_ = msg.NakWithDelay(w.opts.ClaimRetryDelay)
+		return
+	}
+	t.WorkerID = w.opts.WorkerID
 
 	resp := task.Response{TaskID: t.ID, Attempts: t.Attempt}
 
@@ -190,11 +276,9 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 			te = &task.TaskError{Kind: task.ErrKindHandler, Message: callErr.Error(), Retryable: true}
 		}
 		if w.shouldRetry(&t, te) {
-			// Intermediate failure — don't publish a response yet; task may still succeed.
 			_ = msg.NakWithDelay(w.delayFor(&t))
 			return
 		}
-		// Final failure: publish response to caller, dead-letter, notify hook, terminate.
 		resp.Error = te
 		w.publishResponse(ctx, &t, &resp)
 		w.publishDLQ(ctx, &t, te)

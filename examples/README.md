@@ -30,6 +30,8 @@ go run ./examples/07-workflow-fanout
 | 09 | [`09-workflow-dynamic`](./09-workflow-dynamic) | Handler adds per-page step dynamically via `workflow.FromContext(ctx).Step(...)` |
 | 10 | [`10-workflow-temporal-deps`](./10-workflow-temporal-deps) | Time-only deps via `After()` (cascade on fail) and `AfterAny()` (always run) |
 | 11 | [`11-workflow-resume`](./11-workflow-resume) | Resume `Await` from a different process using `AwaitByID[T]` with `(dagID, stepID)` |
+| 12 | [`12-workflow-placement`](./12-workflow-placement) | `OnTarget`, `ColocateWith`, `FollowTargetOf`, and dynamic `ColocateHere()` across two workers |
+| 13 | [`13-workflow-cancel`](./13-workflow-cancel) | Cancel a DAG durably: running work may finish, pending downstream work is canceled |
 
 ## Reading order
 
@@ -38,7 +40,7 @@ If you're new to ebind, walk the examples in order — each adds one concept on 
 1. **01 → 03**: basic task queue mechanics
 2. **04**: HA deployment topology
 3. **05**: extending the worker pipeline
-4. **06 → 09**: workflow layer, from simple linear to fully dynamic
+4. **06 → 13**: workflow layer, from simple linear to dynamic placement and cancellation
 
 ## Common shape
 

@@ -24,6 +24,7 @@ func (e *NatsEnqueuer) Enqueue(ctx context.Context, t task.Task) error {
 	if err != nil {
 		return fmt.Errorf("workflow: marshal task: %w", err)
 	}
-	_, err = e.js.Publish(ctx, stream.TaskSubjectPrefix+t.Name, body, jetstream.WithMsgID(t.ID))
+	subject := stream.TaskPublishSubject(t.Name, t.Target)
+	_, err = e.js.Publish(ctx, subject, body, jetstream.WithMsgID(t.ID))
 	return err
 }

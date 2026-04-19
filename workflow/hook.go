@@ -19,10 +19,9 @@ type StepHook struct {
 // `completed` event with Status=done.
 func (h *StepHook) OnStepDone(ctx context.Context, t *task.Task, result []byte) error {
 	if t.DAGID == "" || t.StepID == "" {
-		return nil // ad-hoc task, not part of a DAG
+		return nil
 	}
-	// CAS-update the step record to Done.
-	if err := h.casUpdateStatus(ctx, t.DAGID, t.StepID, StatusDone, ""); err != nil {
+	if err := h.casUpdateStatus(ctx, t, StatusDone, ""); err != nil {
 		return err
 	}
 	if err := h.store.PutResult(ctx, t.DAGID, t.StepID, result); err != nil {
@@ -39,7 +38,7 @@ func (h *StepHook) OnStepFailed(ctx context.Context, t *task.Task, taskErr *task
 	if t.DAGID == "" || t.StepID == "" {
 		return nil
 	}
-	if err := h.casUpdateStatus(ctx, t.DAGID, t.StepID, StatusFailed, taskErr.Kind); err != nil {
+	if err := h.casUpdateStatus(ctx, t, StatusFailed, taskErr.Kind); err != nil {
 		return err
 	}
 	ev := Event{Kind: EventCompleted, DAGID: t.DAGID, StepID: t.StepID, Status: StatusFailed, ErrorKind: taskErr.Kind}
@@ -48,26 +47,26 @@ func (h *StepHook) OnStepFailed(ctx context.Context, t *task.Task, taskErr *task
 }
 
 // casUpdateStatus retries on stale revision (another writer won the race).
-func (h *StepHook) casUpdateStatus(ctx context.Context, dagID, stepID string, status StepStatus, errKind string) error {
+func (h *StepHook) casUpdateStatus(ctx context.Context, t *task.Task, status StepStatus, errKind string) error {
 	for attempt := 0; attempt < 5; attempt++ {
-		rec, rev, err := h.store.GetStep(ctx, dagID, stepID)
+		rec, rev, err := h.store.GetStep(ctx, t.DAGID, t.StepID)
 		if err != nil {
 			return err
 		}
 		if rec.IsTerminal() {
-			return nil // already finalized
+			return nil
 		}
 		rec.Status = status
 		rec.ErrorKind = errKind
+		rec.WorkerID = t.WorkerID
 		rec.FinishedAt = time.Now().UTC()
-		err = h.store.PutStep(ctx, dagID, stepID, rec, rev)
+		err = h.store.PutStep(ctx, t.DAGID, t.StepID, rec, rev)
 		if err == nil {
 			return nil
 		}
 		if err != ErrStaleRevision {
 			return err
 		}
-		// loop and retry
 	}
 	return ErrStaleRevision
 }

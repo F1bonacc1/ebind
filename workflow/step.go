@@ -5,11 +5,12 @@ import "github.com/f1bonacc1/ebind/task"
 // Step represents a single node in a DAG. Returned by DAG.Step for the caller
 // to chain into dependent steps via Ref() or RefOrDefault().
 type Step struct {
-	id       string
-	fn       any
-	args     []any // may contain Ref values from upstream steps
-	optional bool
-	policy   *task.RetryPolicy
+	id        string
+	fn        any
+	args      []any // may contain Ref values from upstream steps
+	optional  bool
+	policy    *task.RetryPolicy
+	placement *PlacementSpec
 
 	// afterDeps: explicit required temporal deps (from After()). Step won't start
 	// until each is terminal; if any failed/skipped, this step cascade-skips.

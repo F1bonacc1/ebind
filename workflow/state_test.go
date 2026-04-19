@@ -160,6 +160,18 @@ func TestState_Terminal_StillRunning(t *testing.T) {
 	}
 }
 
+func TestState_Terminal_Canceled(t *testing.T) {
+	s := makeState(
+		StepRecord{StepID: "a", Status: StatusDone},
+		StepRecord{StepID: "b", Status: StatusCanceled},
+	)
+	s.Meta.Status = DAGStatusCanceled
+	status, done := s.Terminal()
+	if !done || status != DAGStatusCanceled {
+		t.Errorf("status=%s done=%v, want canceled/true", status, done)
+	}
+}
+
 func TestState_ReadyToRun_SkipsWithUnfinishedDep(t *testing.T) {
 	s := makeState(
 		StepRecord{StepID: "a", Status: StatusRunning},

@@ -133,11 +133,11 @@ func (s *Scheduler) onEvent(ctx context.Context, ev Event) {
 }
 
 // handleEvent is the glue between the pure state machine and IO. It:
-//   1. Loads the DAG state from the store
-//   2. Applies the event (MarkDone / MarkFailed on the state)
-//   3. For each newly-ready step, resolves args and enqueues
-//   4. Writes back updated step records
-//   5. Finalizes the DAG meta status if terminal
+//  1. Loads the DAG state from the store
+//  2. Applies the event (MarkDone / MarkFailed on the state)
+//  3. For each newly-ready step, resolves args and enqueues
+//  4. Writes back updated step records
+//  5. Finalizes the DAG meta status if terminal
 //
 // The state-machine transitions themselves (MarkDone/MarkFailed/cascadeSkipFrom)
 // are exercised in state_test.go against an in-memory DAGState — this function
@@ -146,6 +146,9 @@ func (s *Scheduler) handleEvent(ctx context.Context, ev Event) error {
 	state, err := s.loadState(ctx, ev.DAGID)
 	if err != nil {
 		return err
+	}
+	if state.Meta.Status == DAGStatusCanceled {
+		return nil
 	}
 	switch ev.Kind {
 	case EventCompleted:
@@ -198,7 +201,7 @@ func (s *Scheduler) onStepAdded(ctx context.Context, state *DAGState) error {
 // enqueueReady resolves args and publishes task envelopes for each ready step.
 // If arg resolution returns cascade-skip, we mark the step skipped instead.
 func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []string) error {
-	if len(ready) == 0 {
+	if len(ready) == 0 || state.Meta.Status == DAGStatusCanceled {
 		return nil
 	}
 	results, statuses, err := s.snapshotUpstream(ctx, state)
@@ -228,7 +231,7 @@ func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []s
 			_ = s.wf.Bus.Publish(ctx, EventSubject(ev), data)
 			continue
 		}
-		if err := enqueueStep(ctx, s.wf.Enq, rec, results, statuses); err != nil {
+		if err := enqueueStep(ctx, s.wf.Enq, rec, state.Steps, results, statuses); err != nil {
 			return err
 		}
 	}
@@ -292,6 +295,9 @@ func (s *Scheduler) maybeFinalize(ctx context.Context, state *DAGState) error {
 	meta, rev, err := s.wf.Store.GetMeta(ctx, state.Meta.ID)
 	if err != nil {
 		return err
+	}
+	if meta.Status == DAGStatusCanceled {
+		return nil
 	}
 	if meta.Status == status {
 		return nil

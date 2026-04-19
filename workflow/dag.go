@@ -238,6 +238,12 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 		d.mu.Unlock()
 		return err
 	}
+	for _, s := range d.steps {
+		if s.placement != nil && s.placement.Mode == PlacementHere {
+			d.mu.Unlock()
+			return fmt.Errorf("workflow: step %q uses ColocateHere outside a running handler", s.id)
+		}
+	}
 	d.submitted = true
 	d.mu.Unlock()
 
@@ -269,6 +275,11 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 		if err != nil {
 			return fmt.Errorf("workflow: step %q: %w", s.id, err)
 		}
+		var placement *PlacementSpec
+		if s.placement != nil {
+			copy := *s.placement
+			placement = &copy
+		}
 		rec := StepRecord{
 			DAGID:        d.id,
 			StepID:       s.id,
@@ -279,6 +290,7 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 			Status:       StatusPending,
 			Optional:     s.optional,
 			Policy:       s.policy,
+			Placement:    placement,
 			AddedAt:      time.Now().UTC(),
 		}
 		if err := wf.Store.PutStep(ctx, d.id, s.id, rec, 0); err != nil {
@@ -309,7 +321,7 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 			return fmt.Errorf("workflow: mark root running %q: %w", s.id, err)
 		}
 		recs[s.id] = cur
-		if err := enqueueStep(ctx, wf.Enq, cur, nil, nil); err != nil {
+		if err := enqueueStep(ctx, wf.Enq, cur, recs, nil, nil); err != nil {
 			return fmt.Errorf("workflow: enqueue root %q: %w", s.id, err)
 		}
 	}
@@ -324,6 +336,7 @@ func enqueueStep(
 	ctx context.Context,
 	enq Enqueuer,
 	rec StepRecord,
+	steps map[string]StepRecord,
 	results map[string]json.RawMessage,
 	statuses map[string]StepStatus,
 ) error {
@@ -342,6 +355,10 @@ func enqueueStep(
 	if err != nil {
 		return err
 	}
+	target, err := resolvePlacementTarget(rec, steps, nil)
+	if err != nil {
+		return err
+	}
 	envelope := task.Task{
 		ID:          rec.DAGID + ":" + rec.StepID,
 		Name:        rec.FnName,
@@ -350,6 +367,7 @@ func enqueueStep(
 		DAGID:       rec.DAGID,
 		StepID:      rec.StepID,
 		RetryPolicy: rec.Policy,
+		Target:      target,
 	}
 	return enq.Enqueue(ctx, envelope)
 }

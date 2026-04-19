@@ -83,6 +83,21 @@ func TestAwaitByID_Skipped(t *testing.T) {
 	}
 }
 
+func TestAwaitByID_Canceled(t *testing.T) {
+	store := NewMemStore()
+	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
+	ctx := context.Background()
+	_ = store.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusCanceled}, 0)
+	_ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusCanceled}, 0)
+
+	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, err := AwaitByID[string](ctx2, wf, "d", "a")
+	if !errors.Is(err, ErrStepCanceled) {
+		t.Errorf("want ErrStepCanceled, got %v", err)
+	}
+}
+
 func TestAwaitByID_ContextCancel(t *testing.T) {
 	store := NewMemStore()
 	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})

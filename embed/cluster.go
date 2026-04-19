@@ -39,7 +39,7 @@ func StartCluster(cfg ClusterConfig) (*Cluster, error) {
 		cfg.Name = "ebind"
 	}
 	if cfg.ReadyWait == 0 {
-		cfg.ReadyWait = 15 * time.Second
+		cfg.ReadyWait = 30 * time.Second
 	}
 
 	dir := cfg.BaseDir

@@ -3,6 +3,7 @@ package stream
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
@@ -15,9 +16,10 @@ const (
 	ResponseStream = "EBIND_RESP"
 	DLQStream      = "EBIND_DLQ"
 
-	TaskSubjectPrefix     = "TASKS."
-	ResponseSubjectPrefix = "RESP."
-	DLQSubjectPrefix      = "DLQ."
+	TaskSubjectPrefix         = "TASKS."
+	TargetedTaskSubjectPrefix = "TASKS_TARGET."
+	ResponseSubjectPrefix     = "RESP."
+	DLQSubjectPrefix          = "DLQ."
 )
 
 type Config struct {
@@ -52,7 +54,7 @@ func EnsureStreams(ctx context.Context, js jetstream.JetStream, cfg Config) erro
 
 	tasksCfg := jetstream.StreamConfig{
 		Name:       TaskStream,
-		Subjects:   []string{TaskSubjectPrefix + ">"},
+		Subjects:   []string{TaskSubjectPrefix + ">", TargetedTaskSubjectPrefix + ">"},
 		Retention:  jetstream.WorkQueuePolicy,
 		Storage:    jetstream.FileStorage,
 		Replicas:   cfg.Replicas,
@@ -88,6 +90,29 @@ func EnsureStreams(ctx context.Context, js jetstream.JetStream, cfg Config) erro
 	}
 
 	return nil
+}
+
+func TaskSubject(name string) string {
+	return TaskSubjectPrefix + name
+}
+
+func TargetedTaskSubject(target, name string) string {
+	return TargetedTaskSubjectPrefix + TargetToken(target) + "." + name
+}
+
+func TargetedTaskFilter(target string) string {
+	return TargetedTaskSubjectPrefix + TargetToken(target) + ".>"
+}
+
+func TaskPublishSubject(name, target string) string {
+	if target == "" {
+		return TaskSubject(name)
+	}
+	return TargetedTaskSubject(target, name)
+}
+
+func TargetToken(target string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(target))
 }
 
 // WaitMetaLeader polls until the JetStream meta-leader is elected or ctx expires.

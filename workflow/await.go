@@ -9,6 +9,7 @@ import (
 
 // Await blocks until the target step's result is available in the store (or the
 // step has terminally failed/been skipped). Decodes the result into out.
+//
 // Usage: result, err := workflow.Await[Profile](ctx, wf, dagID, stepRef)
 //
 // Returns:
@@ -48,6 +49,8 @@ func AwaitByID[T any](ctx context.Context, wf *Workflow, dagID, stepID string) (
 			return zero, fmt.Errorf("%w: %s", ErrStepFailed, rec.ErrorKind)
 		case StatusSkipped:
 			return zero, ErrStepSkipped
+		case StatusCanceled:
+			return zero, ErrStepCanceled
 		}
 	}
 
@@ -79,6 +82,8 @@ func AwaitByID[T any](ctx context.Context, wf *Workflow, dagID, stepID string) (
 				return zero, fmt.Errorf("%w: %s", ErrStepFailed, rec.ErrorKind)
 			case StatusSkipped:
 				return zero, ErrStepSkipped
+			case StatusCanceled:
+				return zero, ErrStepCanceled
 			}
 		}
 	}
