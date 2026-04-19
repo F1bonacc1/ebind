@@ -134,7 +134,9 @@ func TestCluster_SurvivesOneNodeLoss(t *testing.T) {
 	deadline := time.Now().Add(15 * time.Second)
 	var publishErr error
 	for time.Now().Before(deadline) {
-		_, publishErr = js.Publish(ctx, "ft.post", []byte("after"))
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, time.Second)
+		_, publishErr = js.Publish(attemptCtx, "ft.post", []byte("after"))
+		attemptCancel()
 		if publishErr == nil {
 			break
 		}
