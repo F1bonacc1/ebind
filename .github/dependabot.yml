@@ -1,0 +1,48 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
+      cobra:
+        patterns:
+          - "github.com/spf13/*"
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+      other-minor:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "github.com/nats-io/*"
+          - "github.com/spf13/*"
+          - "golang.org/x/*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"

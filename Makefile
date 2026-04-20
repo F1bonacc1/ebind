@@ -19,8 +19,8 @@ build: ## Compile every package
 	$(GO) build $(PKGS)
 
 .PHONY: test
-test: ## Run all tests with race detector
-	$(GO) test -race -timeout 180s $(PKGS)
+test: ## Run all tests with race detector + coverage profile
+	$(GO) test -race -timeout 180s -coverprofile=coverage.out -covermode=atomic $(PKGS)
 
 .PHONY: test-short
 test-short: ## Run only short/unit tests (no embedded NATS spin-up)

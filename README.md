@@ -1,5 +1,12 @@
 # ebind
 
+[![CI](https://github.com/F1bonacc1/ebind/actions/workflows/ci.yml/badge.svg)](https://github.com/F1bonacc1/ebind/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/F1bonacc1/ebind/actions/workflows/codeql.yml/badge.svg)](https://github.com/F1bonacc1/ebind/actions/workflows/codeql.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/f1bonacc1/ebind.svg)](https://pkg.go.dev/github.com/f1bonacc1/ebind)
+[![Go Report Card](https://goreportcard.com/badge/github.com/f1bonacc1/ebind)](https://goreportcard.com/report/github.com/f1bonacc1/ebind)
+[![Latest release](https://img.shields.io/github/v/release/F1bonacc1/ebind?include_prereleases&sort=semver)](https://github.com/F1bonacc1/ebind/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A Go task queue + DAG workflow engine built on NATS JetStream.
 
 Function-first ergonomics (`Register(reg, MyFunc)`, `Enqueue(c, MyFunc, args...)`, `Await[T](ctx, fut)`) on top of a persistent queue with retries, dead-lettering, and optional DAG orchestration — all driven by a single NATS dependency that can run as an embedded in-process server (including 3-node HA cluster) or against an external JetStream deployment.
