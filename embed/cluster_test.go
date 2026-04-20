@@ -35,6 +35,27 @@ func waitClusterReady(t *testing.T, c *Cluster, timeout time.Duration) {
 	t.Fatalf("cluster not ready within %s", timeout)
 }
 
+// publishWithRetry retries js.Publish until it succeeds or the timeout expires.
+// CreateStream returns once accepted by the meta-leader, but the stream's Raft
+// group and subject subscription can lag — publishes in that window return
+// "no response from stream". Same pattern is needed after node loss while the
+// stream leader re-elects, so the retry is shared.
+func publishWithRetry(t *testing.T, ctx context.Context, js jetstream.JetStream, subj string, data []byte, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		attemptCtx, cancel := context.WithTimeout(ctx, time.Second)
+		_, lastErr = js.Publish(attemptCtx, subj, data)
+		cancel()
+		if lastErr == nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("publish %q did not succeed within %s: %v", subj, timeout, lastErr)
+}
+
 func TestCluster_FormsQuorum(t *testing.T) {
 	c, err := StartCluster(ClusterConfig{Size: 3, Name: "test-quorum"})
 	if err != nil {
@@ -100,7 +121,7 @@ func TestCluster_SurvivesOneNodeLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
@@ -112,9 +133,7 @@ func TestCluster_SurvivesOneNodeLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := js.Publish(ctx, "ft.pre", []byte("before")); err != nil {
-		t.Fatalf("publish before: %v", err)
-	}
+	publishWithRetry(t, ctx, js, "ft.pre", []byte("before"), 15*time.Second)
 
 	// Kill a non-leader follower to minimize restart time.
 	victim := -1
@@ -130,21 +149,7 @@ func TestCluster_SurvivesOneNodeLoss(t *testing.T) {
 	t.Logf("killing node %d", victim)
 	c.ShutdownNode(victim)
 
-	// Publish after — should still succeed with 2/3 nodes up.
-	deadline := time.Now().Add(15 * time.Second)
-	var publishErr error
-	for time.Now().Before(deadline) {
-		attemptCtx, attemptCancel := context.WithTimeout(ctx, time.Second)
-		_, publishErr = js.Publish(attemptCtx, "ft.post", []byte("after"))
-		attemptCancel()
-		if publishErr == nil {
-			break
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	if publishErr != nil {
-		t.Fatalf("publish after 1-node loss failed (should survive): %v", publishErr)
-	}
+	publishWithRetry(t, ctx, js, "ft.post", []byte("after"), 15*time.Second)
 
 	s, err := js.Stream(ctx, "FAIL_TEST")
 	if err != nil {
