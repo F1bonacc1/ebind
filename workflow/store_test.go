@@ -137,6 +137,43 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		}
 	})
 
+	t.Run("Delete_Meta_Step_Result", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		_ = s.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusDone}, 0)
+		_ = s.PutStep(ctx, "d", "a", StepRecord{StepID: "a"}, 0)
+		_ = s.PutResult(ctx, "d", "a", []byte(`42`))
+
+		if err := s.DeleteResult(ctx, "d", "a"); err != nil {
+			t.Fatalf("DeleteResult: %v", err)
+		}
+		if _, err := s.GetResult(ctx, "d", "a"); err != ErrStepNotFound {
+			t.Errorf("expected ErrStepNotFound after result delete, got %v", err)
+		}
+		if err := s.DeleteStep(ctx, "d", "a"); err != nil {
+			t.Fatalf("DeleteStep: %v", err)
+		}
+		if _, _, err := s.GetStep(ctx, "d", "a"); err != ErrStepNotFound {
+			t.Errorf("expected ErrStepNotFound after step delete, got %v", err)
+		}
+		if err := s.DeleteMeta(ctx, "d"); err != nil {
+			t.Fatalf("DeleteMeta: %v", err)
+		}
+		if _, _, err := s.GetMeta(ctx, "d"); err != ErrDAGNotFound {
+			t.Errorf("expected ErrDAGNotFound after meta delete, got %v", err)
+		}
+
+		if err := s.DeleteMeta(ctx, "d"); err != nil {
+			t.Errorf("DeleteMeta idempotent: %v", err)
+		}
+		if err := s.DeleteStep(ctx, "d", "a"); err != nil {
+			t.Errorf("DeleteStep idempotent: %v", err)
+		}
+		if err := s.DeleteResult(ctx, "d", "a"); err != nil {
+			t.Errorf("DeleteResult idempotent: %v", err)
+		}
+	})
+
 	t.Run("ListDAGs", func(t *testing.T) {
 		s := newStore(t)
 		ctx := context.Background()

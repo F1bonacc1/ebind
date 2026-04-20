@@ -76,6 +76,14 @@ tidy: ## Run go mod tidy
 demo: ## Run the single-process end-to-end demo
 	$(GO) run ./cmd/demo
 
+.PHONY: ebctl
+ebctl: ## Build the ebctl operator CLI into ./bin/ebctl
+	$(GO) build -o bin/ebctl ./cmd/ebctl
+
+.PHONY: playground
+playground: ## Run the long-lived DAG playground (for exercising ebctl)
+	$(GO) run ./cmd/ebctl-playground
+
 # ---------------------------------------------------------------------------
 # Maintenance
 

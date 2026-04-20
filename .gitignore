@@ -40,3 +40,4 @@ go.work.sum
 
 # Plans & scratch (keep .claude/ for shared project config if ever tracked)
 /.plans/
+ebctl-playground

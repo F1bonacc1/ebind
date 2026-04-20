@@ -160,6 +160,37 @@ func (s *MemStore) PutMeta(_ context.Context, dagID string, meta DAGMeta, expect
 	return nil
 }
 
+func (s *MemStore) DeleteMeta(_ context.Context, dagID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.metas, dagID)
+	return nil
+}
+
+func (s *MemStore) DeleteStep(_ context.Context, dagID, stepID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if bucket, ok := s.steps[dagID]; ok {
+		delete(bucket, stepID)
+		if len(bucket) == 0 {
+			delete(s.steps, dagID)
+		}
+	}
+	return nil
+}
+
+func (s *MemStore) DeleteResult(_ context.Context, dagID, stepID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if bucket, ok := s.results[dagID]; ok {
+		delete(bucket, stepID)
+		if len(bucket) == 0 {
+			delete(s.results, dagID)
+		}
+	}
+	return nil
+}
+
 func (s *MemStore) WatchResult(ctx context.Context, dagID, stepID string) (<-chan []byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

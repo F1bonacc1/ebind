@@ -173,6 +173,27 @@ func (s *NatsStore) PutResult(ctx context.Context, dagID, stepID string, data []
 	return err
 }
 
+func (s *NatsStore) DeleteMeta(ctx context.Context, dagID string) error {
+	if err := s.kv.Delete(ctx, metaKey(dagID)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return err
+	}
+	return nil
+}
+
+func (s *NatsStore) DeleteStep(ctx context.Context, dagID, stepID string) error {
+	if err := s.kv.Delete(ctx, stepKey(dagID, stepID)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return err
+	}
+	return nil
+}
+
+func (s *NatsStore) DeleteResult(ctx context.Context, dagID, stepID string) error {
+	if err := s.kv.Delete(ctx, resultKey(dagID, stepID)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return err
+	}
+	return nil
+}
+
 func (s *NatsStore) WatchResult(ctx context.Context, dagID, stepID string) (<-chan []byte, error) {
 	key := resultKey(dagID, stepID)
 	w, err := s.kv.Watch(ctx, key, jetstream.IncludeHistory())

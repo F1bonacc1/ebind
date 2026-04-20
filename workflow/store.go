@@ -22,6 +22,13 @@ type StateStore interface {
 	// sweep on leader acquisition to find stranded ready steps across all running DAGs.
 	ListDAGs(ctx context.Context) ([]DAGMeta, error)
 
+	// DeleteMeta, DeleteStep, DeleteResult remove records. Missing keys are not errors
+	// (delete is idempotent). Callers coordinating a DAG-level delete should use
+	// DeleteDAG which composes these in the correct order.
+	DeleteMeta(ctx context.Context, dagID string) error
+	DeleteStep(ctx context.Context, dagID, stepID string) error
+	DeleteResult(ctx context.Context, dagID, stepID string) error
+
 	// WatchResult streams a single message once a result is written at the given key.
 	// Implementations should close the channel on cancel or immediately if the result
 	// already exists (sending the existing value first).
