@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -145,7 +146,7 @@ func TestDebug_Blockers_ExcludesTerminalDeps(t *testing.T) {
 func TestDebug_NotFound(t *testing.T) {
 	wf := NewWorkflow(NewMemStore(), NewMemBus(), &captureEnq{})
 	_, err := Debug(context.Background(), wf, "nonexistent")
-	if err != ErrDAGNotFound {
+	if !errors.Is(err, ErrDAGNotFound) {
 		t.Errorf("want ErrDAGNotFound, got %v", err)
 	}
 }

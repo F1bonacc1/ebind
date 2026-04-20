@@ -76,8 +76,8 @@ func TestWorker_Panic_RecoveredAndDLQ(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
-	te, ok := err.(*task.TaskError)
-	if !ok || te.Kind != task.ErrKindPanic {
+	var te *task.TaskError
+	if !errors.As(err, &te) || te.Kind != task.ErrKindPanic {
 		t.Fatalf("want panic TaskError, got %v", err)
 	}
 
@@ -141,8 +141,8 @@ func TestWorker_NonRetryableError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	err = fut.Get(ctx, nil)
-	te, ok := err.(*task.TaskError)
-	if !ok {
+	var te *task.TaskError
+	if !errors.As(err, &te) {
 		t.Fatalf("want TaskError, got %T: %v", err, err)
 	}
 	if te.Kind != "validation" {
@@ -155,10 +155,10 @@ func TestWorker_NonRetryableError(t *testing.T) {
 
 // Hook is a minimal StepHook capturing calls for assertions.
 type captureHook struct {
-	done   atomic.Int32
-	failed atomic.Int32
+	done       atomic.Int32
+	failed     atomic.Int32
 	lastTaskID string
-	mu     sync.Mutex
+	mu         sync.Mutex
 }
 
 func (c *captureHook) OnStepDone(_ context.Context, t *task.Task, _ []byte) error {

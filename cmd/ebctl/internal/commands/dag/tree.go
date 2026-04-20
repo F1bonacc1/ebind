@@ -33,10 +33,10 @@ func newTreeCmd(c *cli.Context) *cobra.Command {
 			}
 			if c.Printer.Name() == "json" {
 				type node struct {
-					ID       string             `json:"id"`
+					ID       string              `json:"id"`
 					Status   workflow.StepStatus `json:"status"`
-					Deps     []string           `json:"deps,omitempty"`
-					Optional []string           `json:"optional_deps,omitempty"`
+					Deps     []string            `json:"deps,omitempty"`
+					Optional []string            `json:"optional_deps,omitempty"`
 				}
 				nodes := make([]node, 0, len(steps))
 				for _, s := range steps {
@@ -46,12 +46,13 @@ func newTreeCmd(c *cli.Context) *cobra.Command {
 					"dag": meta, "steps": nodes,
 				})
 			}
-			return renderTree(cmd.OutOrStdout(), meta, steps)
+			renderTree(cmd.OutOrStdout(), meta, steps)
+			return nil
 		},
 	}
 }
 
-func renderTree(w io.Writer, meta workflow.DAGMeta, steps []workflow.StepRecord) error {
+func renderTree(w io.Writer, meta workflow.DAGMeta, steps []workflow.StepRecord) {
 	byID := make(map[string]workflow.StepRecord, len(steps))
 	children := make(map[string][]string, len(steps))
 	hasParent := make(map[string]bool, len(steps))
@@ -91,7 +92,6 @@ func renderTree(w io.Writer, meta workflow.DAGMeta, steps []workflow.StepRecord)
 			writeNode(w, s.StepID, byID, children, seen, "", true)
 		}
 	}
-	return nil
 }
 
 func writeNode(w io.Writer, id string, byID map[string]workflow.StepRecord, children map[string][]string, seen map[string]bool, prefix string, last bool) {

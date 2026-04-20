@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		if err := s.PutMeta(ctx, "d1", m, 0); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.PutMeta(ctx, "d1", m, 0); err != ErrStaleRevision {
+		if err := s.PutMeta(ctx, "d1", m, 0); !errors.Is(err, ErrStaleRevision) {
 			t.Errorf("second create should fail with ErrStaleRevision, got %v", err)
 		}
 	})
@@ -32,7 +33,7 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		if err := s.PutMeta(ctx, "d", m, rev); err != nil {
 			t.Errorf("valid CAS: %v", err)
 		}
-		if err := s.PutMeta(ctx, "d", m, rev); err != ErrStaleRevision {
+		if err := s.PutMeta(ctx, "d", m, rev); !errors.Is(err, ErrStaleRevision) {
 			t.Errorf("stale CAS: got %v", err)
 		}
 	})
@@ -62,7 +63,7 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		ctx := context.Background()
 		rec := StepRecord{DAGID: "d", StepID: "a", Status: StatusPending}
 		_ = s.PutStep(ctx, "d", "a", rec, 0)
-		if err := s.PutStep(ctx, "d", "a", rec, 999); err != ErrStaleRevision {
+		if err := s.PutStep(ctx, "d", "a", rec, 999); !errors.Is(err, ErrStaleRevision) {
 			t.Errorf("stale CAS: %v", err)
 		}
 	})
@@ -147,19 +148,19 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		if err := s.DeleteResult(ctx, "d", "a"); err != nil {
 			t.Fatalf("DeleteResult: %v", err)
 		}
-		if _, err := s.GetResult(ctx, "d", "a"); err != ErrStepNotFound {
+		if _, err := s.GetResult(ctx, "d", "a"); !errors.Is(err, ErrStepNotFound) {
 			t.Errorf("expected ErrStepNotFound after result delete, got %v", err)
 		}
 		if err := s.DeleteStep(ctx, "d", "a"); err != nil {
 			t.Fatalf("DeleteStep: %v", err)
 		}
-		if _, _, err := s.GetStep(ctx, "d", "a"); err != ErrStepNotFound {
+		if _, _, err := s.GetStep(ctx, "d", "a"); !errors.Is(err, ErrStepNotFound) {
 			t.Errorf("expected ErrStepNotFound after step delete, got %v", err)
 		}
 		if err := s.DeleteMeta(ctx, "d"); err != nil {
 			t.Fatalf("DeleteMeta: %v", err)
 		}
-		if _, _, err := s.GetMeta(ctx, "d"); err != ErrDAGNotFound {
+		if _, _, err := s.GetMeta(ctx, "d"); !errors.Is(err, ErrDAGNotFound) {
 			t.Errorf("expected ErrDAGNotFound after meta delete, got %v", err)
 		}
 

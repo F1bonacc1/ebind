@@ -9,10 +9,10 @@ import (
 type PlacementMode string
 
 const (
-	PlacementDirect     PlacementMode = "direct"
-	PlacementColocate   PlacementMode = "colocate_with"
-	PlacementFollow     PlacementMode = "follow_target_of"
-	PlacementHere       PlacementMode = "colocate_here"
+	PlacementDirect   PlacementMode = "direct"
+	PlacementColocate PlacementMode = "colocate_with"
+	PlacementFollow   PlacementMode = "follow_target_of"
+	PlacementHere     PlacementMode = "colocate_here"
 )
 
 // PlacementSpec describes how a step chooses its execution target.

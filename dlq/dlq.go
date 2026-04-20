@@ -14,10 +14,10 @@ import (
 )
 
 type Entry struct {
-	Task       task.Task      `json:"task"`
-	Error      task.TaskError `json:"error"`
-	FinalAttempt int          `json:"final_attempt"`
-	DeadLetteredAt time.Time  `json:"dead_lettered_at"`
+	Task           task.Task      `json:"task"`
+	Error          task.TaskError `json:"error"`
+	FinalAttempt   int            `json:"final_attempt"`
+	DeadLetteredAt time.Time      `json:"dead_lettered_at"`
 }
 
 // Publish sends a dead-letter entry to DLQ.<task_name>.

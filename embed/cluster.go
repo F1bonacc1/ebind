@@ -201,12 +201,19 @@ func freePorts(n int) ([]int, error) {
 		l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 		if err != nil {
 			for _, x := range listeners {
-				x.Close()
+				_ = x.Close()
 			}
 			return nil, err
 		}
 		listeners = append(listeners, l)
-		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
+		addr, ok := l.Addr().(*net.TCPAddr)
+		if !ok {
+			for _, x := range listeners {
+				_ = x.Close()
+			}
+			return nil, fmt.Errorf("freePorts: unexpected addr type %T", l.Addr())
+		}
+		ports = append(ports, addr.Port)
 	}
 	for _, l := range listeners {
 		l.Close()

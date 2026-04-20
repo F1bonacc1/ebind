@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -20,7 +21,7 @@ func Cancel(ctx context.Context, wf *Workflow, dagID string) error {
 		}
 		meta.Status = DAGStatusCanceled
 		if err := wf.Store.PutMeta(ctx, dagID, meta, rev); err != nil {
-			if err == ErrStaleRevision {
+			if errors.Is(err, ErrStaleRevision) {
 				continue
 			}
 			return err
@@ -44,7 +45,7 @@ func Cancel(ctx context.Context, wf *Workflow, dagID string) error {
 			rec.Status = StatusCanceled
 			rec.FinishedAt = time.Now().UTC()
 			if err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, rev); err != nil {
-				if err == ErrStaleRevision {
+				if errors.Is(err, ErrStaleRevision) {
 					continue
 				}
 				return err

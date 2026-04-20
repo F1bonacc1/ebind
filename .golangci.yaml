@@ -1,17 +1,14 @@
+version: "2"
 run:
-  timeout: 5m
   tests: true
-
 linters:
-  disable-all: true
+  default: none
   enable:
     - bodyclose
     - copyloopvar
     - errcheck
     - errorlint
     - gocritic
-    - gofmt
-    - goimports
     - govet
     - ineffassign
     - misspell
@@ -22,42 +19,61 @@ linters:
     - unconvert
     - unparam
     - unused
-
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: false
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment
-      - shadow
-  revive:
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+        - commentedOutCode
+    govet:
+      disable:
+        - fieldalignment
+        - shadow
+      enable-all: true
+    revive:
+      rules:
+        - name: var-naming
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: if-return
+        - name: range
+        - name: receiver-naming
+        - name: indent-error-flow
+        - name: superfluous-else
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
     rules:
-      - name: var-naming
-      - name: error-return
-      - name: error-strings
-      - name: error-naming
-      - name: if-return
-      - name: range
-      - name: receiver-naming
-      - name: indent-error-flow
-      - name: superfluous-else
-  gocritic:
-    disabled-checks:
-      - ifElseChain
-      - singleCaseSwitch
-      - commentedOutCode
-
+      - linters:
+          - bodyclose
+          - errcheck
+          - unparam
+        path: _test\.go
+      - linters:
+          - errcheck
+        path: cmd/demo/
+    paths:
+      - third_party$
+      - builtin$
+      - ^examples/
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - unparam
-        - bodyclose
-    - path: cmd/demo/
-      linters:
-        - errcheck
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

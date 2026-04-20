@@ -28,7 +28,7 @@ func newWatchCmd(c *cli.Context) *cobra.Command {
 				return err
 			}
 			cons, err := s.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
-				DeliverPolicy: jetstream.DeliverNewPolicy,
+				DeliverPolicy:  jetstream.DeliverNewPolicy,
 				FilterSubjects: []string{stream.DLQSubjectPrefix + ">"},
 			})
 			if err != nil {

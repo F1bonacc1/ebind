@@ -51,7 +51,7 @@ func newWatchCmd(c *cli.Context) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer sub.Stop()
+			defer func() { _ = sub.Stop() }()
 
 			<-sigCh
 			return nil

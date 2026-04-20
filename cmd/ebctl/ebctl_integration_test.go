@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -97,7 +98,7 @@ func TestDagLsRmAndDlqFlow(t *testing.T) {
 	if err := dagRoot3.Execute(); err != nil {
 		t.Fatalf("dag rm: %v", err)
 	}
-	if _, _, err := wf.Store.GetMeta(ctx, dagID); err != workflow.ErrDAGNotFound {
+	if _, _, err := wf.Store.GetMeta(ctx, dagID); !errors.Is(err, workflow.ErrDAGNotFound) {
 		t.Errorf("meta still present after rm: %v", err)
 	}
 }

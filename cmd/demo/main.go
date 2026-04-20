@@ -121,11 +121,11 @@ func run() error {
 	}
 	log.Printf("Greet completed")
 
-	if _, err := client.Enqueue(c, Foo, "wrong", 1, Meta{}); err == nil {
+	_, err = client.Enqueue(c, Foo, "wrong", 1, Meta{})
+	if err == nil {
 		return fmt.Errorf("expected arg validation error, got nil")
-	} else {
-		log.Printf("arg validation correctly rejected: %v", err)
 	}
+	log.Printf("arg validation correctly rejected: %v", err)
 
 	cancel()
 	if err := <-workerErr; err != nil {

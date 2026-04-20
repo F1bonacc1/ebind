@@ -89,17 +89,19 @@ func (c *Client) Close() {
 func (c *Client) handleResponse(msg jetstream.Msg) {
 	var resp task.Response
 	if err := json.Unmarshal(msg.Data(), &resp); err != nil {
-		msg.Term()
+		_ = msg.Term()
 		return
 	}
 	if ch, ok := c.waiters.LoadAndDelete(resp.TaskID); ok {
-		ch.(chan *task.Response) <- &resp
+		if waiter, ok := ch.(chan *task.Response); ok {
+			waiter <- &resp
+		}
 	}
-	msg.Ack()
+	_ = msg.Ack()
 }
 
 type EnqueueOptions struct {
-	Deadline    time.Time         // absolute deadline for handler execution
+	Deadline    time.Time // absolute deadline for handler execution
 	TraceCtx    map[string]string
 	RetryPolicy *task.RetryPolicy // per-task override; worker falls back to its Options defaults when nil
 	DAGID       string            // workflow-level: identifies the parent DAG
@@ -180,7 +182,6 @@ func EnqueueAsync(c *Client, fn any, args ...any) (string, error) {
 }
 
 func enqueueAsync(c *Client, fn any, opts EnqueueOptions, args ...any) (string, error) {
-	opts.SkipResponse = true
 	d, err := task.Describe(fn)
 	if err != nil {
 		return "", err

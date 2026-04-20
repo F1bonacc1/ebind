@@ -57,9 +57,9 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 
 			if c.Printer.Name() == "json" {
 				type row struct {
-					ID        string            `json:"id"`
+					ID        string             `json:"id"`
 					Status    workflow.DAGStatus `json:"status"`
-					CreatedAt time.Time         `json:"created_at"`
+					CreatedAt time.Time          `json:"created_at"`
 				}
 				rows := make([]row, 0, len(filtered))
 				for _, m := range filtered {

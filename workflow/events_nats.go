@@ -16,9 +16,9 @@ const (
 // NatsBus is a JetStream-backed EventBus. Events durable in a dedicated stream;
 // subscribers use a shared durable consumer so each event is handled once cluster-wide.
 type NatsBus struct {
-	js            jetstream.JetStream
-	consumerName  string
-	eventsStream  jetstream.Stream
+	js           jetstream.JetStream
+	consumerName string
+	eventsStream jetstream.Stream
 }
 
 // NewNatsBus creates (or opens) the DAG events stream.

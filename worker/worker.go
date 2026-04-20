@@ -127,7 +127,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	// Seed the claim cache synchronously so ownsTarget never returns false
 	// due to an unpopulated cache.
-	if _, err := w.refreshClaims(ctx); err != nil {
+	if err := w.refreshClaims(ctx); err != nil {
 		return fmt.Errorf("worker: initial claims: %w", err)
 	}
 
@@ -258,14 +258,14 @@ func (w *Worker) stopAllClaimSubs() {
 // refreshClaims recomputes the effective claim set and atomically swaps it into
 // the cache. Called once synchronously at Run() startup and then periodically
 // from the background refresher.
-func (w *Worker) refreshClaims(ctx context.Context) ([]string, error) {
+func (w *Worker) refreshClaims(ctx context.Context) error {
 	seen := map[string]struct{}{}
 	claims := []string{ConcreteTarget(w.opts.WorkerID)}
 	seen[claims[0]] = struct{}{}
 	if w.opts.Claims != nil {
 		provided, err := w.opts.Claims.Claims(ctx)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, claim := range provided {
 			claim = strings.TrimSpace(claim)
@@ -282,7 +282,7 @@ func (w *Worker) refreshClaims(ctx context.Context) ([]string, error) {
 	sort.Strings(claims)
 	cp := append([]string(nil), claims...)
 	w.claimCache.Store(&cp)
-	return cp, nil
+	return nil
 }
 
 // runClaimRefresher ticks ClaimRefreshInterval, refreshes the claim cache,
@@ -300,7 +300,7 @@ func (w *Worker) runClaimRefresher(ctx context.Context, ts jetstream.Stream, sem
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if _, err := w.refreshClaims(ctx); err != nil {
+			if err := w.refreshClaims(ctx); err != nil {
 				continue
 			}
 			_ = w.reconcileClaimSubs(ctx, ts, sem, wg)
@@ -386,8 +386,8 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 	resp.CompletedAt = time.Now().UTC()
 
 	if callErr != nil {
-		te, _ := callErr.(*task.TaskError)
-		if te == nil {
+		var te *task.TaskError
+		if !errors.As(callErr, &te) {
 			te = &task.TaskError{Kind: task.ErrKindHandler, Message: callErr.Error(), Retryable: true}
 		}
 		if w.shouldRetry(&t, te) {

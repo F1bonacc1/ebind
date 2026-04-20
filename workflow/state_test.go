@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -108,7 +109,7 @@ func TestState_AddStep_Dynamic(t *testing.T) {
 
 func TestState_AddStep_Duplicate(t *testing.T) {
 	s := makeState(StepRecord{StepID: "a"})
-	if err := s.AddStep(StepRecord{StepID: "a"}); err != ErrDuplicateStep {
+	if err := s.AddStep(StepRecord{StepID: "a"}); !errors.Is(err, ErrDuplicateStep) {
 		t.Errorf("want ErrDuplicateStep, got %v", err)
 	}
 }

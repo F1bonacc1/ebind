@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -30,7 +31,7 @@ func TestDeleteDAG_RemovesAllRecords(t *testing.T) {
 		t.Fatalf("DeleteDAG: %v", err)
 	}
 
-	if _, _, err := store.GetMeta(ctx, dagID); err != ErrDAGNotFound {
+	if _, _, err := store.GetMeta(ctx, dagID); !errors.Is(err, ErrDAGNotFound) {
 		t.Errorf("meta still present: err=%v", err)
 	}
 	steps, err := store.ListSteps(ctx, dagID)
@@ -41,7 +42,7 @@ func TestDeleteDAG_RemovesAllRecords(t *testing.T) {
 		t.Errorf("steps still present: %d", len(steps))
 	}
 	for _, id := range []string{"a", "b", "c"} {
-		if _, err := store.GetResult(ctx, dagID, id); err != ErrStepNotFound {
+		if _, err := store.GetResult(ctx, dagID, id); !errors.Is(err, ErrStepNotFound) {
 			t.Errorf("result %s still present: err=%v", id, err)
 		}
 	}

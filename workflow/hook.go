@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/f1bonacc1/ebind/task"
@@ -64,7 +65,7 @@ func (h *StepHook) casUpdateStatus(ctx context.Context, t *task.Task, status Ste
 		if err == nil {
 			return nil
 		}
-		if err != ErrStaleRevision {
+		if !errors.Is(err, ErrStaleRevision) {
 			return err
 		}
 	}

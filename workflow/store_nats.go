@@ -40,7 +40,7 @@ func NewNatsStore(ctx context.Context, js jetstream.JetStream, replicas int) (*N
 	return &NatsStore{kv: kv}, nil
 }
 
-func metaKey(dagID string) string   { return dagID + keyMetaSuffix }
+func metaKey(dagID string) string           { return dagID + keyMetaSuffix }
 func stepKey(dagID, stepID string) string   { return dagID + keyStepPrefix + stepID }
 func resultKey(dagID, stepID string) string { return dagID + keyResultPrefix + stepID }
 
@@ -203,7 +203,7 @@ func (s *NatsStore) WatchResult(ctx context.Context, dagID, stepID string) (<-ch
 	out := make(chan []byte, 1)
 	go func() {
 		defer close(out)
-		defer w.Stop()
+		defer func() { _ = w.Stop() }()
 		for {
 			select {
 			case <-ctx.Done():

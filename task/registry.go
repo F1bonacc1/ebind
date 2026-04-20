@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -159,10 +160,11 @@ func (d *Dispatcher) Call(ctx context.Context, payload []byte) ([]byte, error) {
 	var errResult error
 	errVal := results[len(results)-1]
 	if !errVal.IsNil() {
-		errResult = errVal.Interface().(error)
+		errResult, _ = errVal.Interface().(error)
 	}
 	if errResult != nil {
-		if te, ok := errResult.(*TaskError); ok {
+		var te *TaskError
+		if errors.As(errResult, &te) {
 			return nil, te
 		}
 		return nil, &TaskError{Kind: ErrKindHandler, Message: errResult.Error(), Retryable: true}

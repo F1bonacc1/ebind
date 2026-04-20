@@ -288,7 +288,7 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 		if err == nil {
 			return nil
 		}
-		if err != ErrStaleRevision {
+		if !errors.Is(err, ErrStaleRevision) {
 			return err
 		}
 	}
