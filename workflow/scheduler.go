@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -210,8 +211,13 @@ func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []s
 	}
 	for _, id := range ready {
 		rec := state.Steps[id]
-		// Transition to running in the store (CAS).
+		// Transition to running in the store (CAS). If a concurrent writer
+		// (e.g. workflow.Cancel) already wrote a terminal status, we must not
+		// enqueue the step — our snapshot of rec is stale.
 		if err := s.persistStatus(ctx, state.Meta.ID, id, StatusRunning, ""); err != nil {
+			if errors.Is(err, errStepAlreadyTerminal) {
+				continue
+			}
 			return err
 		}
 		var rawArgs []json.RawMessage
@@ -256,6 +262,9 @@ func (s *Scheduler) snapshotUpstream(ctx context.Context, state *DAGState) (map[
 }
 
 // persistStatus CAS-updates a step's status in the store. Retries on stale.
+// Returns errStepAlreadyTerminal when the stored record is in a terminal state
+// that the requested status cannot override — callers must treat this as
+// "don't enqueue" rather than a silent no-op.
 func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, status StepStatus, errKind string) error {
 	for attempt := 0; attempt < 5; attempt++ {
 		rec, rev, err := s.wf.Store.GetStep(ctx, dagID, stepID)
@@ -266,7 +275,7 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 			return nil // already set
 		}
 		if rec.IsTerminal() && status != StatusSkipped {
-			return nil // don't overwrite terminal with non-skip
+			return errStepAlreadyTerminal
 		}
 		rec.Status = status
 		if errKind != "" {

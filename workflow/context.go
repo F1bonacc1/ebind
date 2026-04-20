@@ -79,7 +79,11 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 		s.afterDeps = append(s.afterDeps, c.parentStep)
 	}
 	if s.placement != nil && s.placement.Mode == PlacementHere {
-		s.placement = &PlacementSpec{Mode: PlacementDirect, Target: worker.ConcreteTarget(c.workerID)}
+		// Resolve at enqueue time via the parent step's final WorkerID. If the
+		// parent handler is retried onto a different worker, child follows the
+		// worker that ACKed — keeping the "current worker" semantics consistent
+		// with the step that actually completed.
+		s.placement = &PlacementSpec{Mode: PlacementColocate, StepID: c.parentStep}
 	}
 	argsJSON, err := marshalArgs(args)
 	if err != nil {
@@ -103,8 +107,17 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 		Placement:    placement,
 		AddedAt:      time.Now().UTC(),
 	}
-	// CAS-create (rev=0 means "must not exist").
+	// CAS-create (rev=0 means "must not exist"). When a handler is retried —
+	// or redelivered because a concurrent subscriber joined the consumer during
+	// a claim flip — StepOpts may run again with the same id. Treat an existing
+	// matching record as success so dynamic-step creation is idempotent.
 	if err := c.wf.Store.PutStep(context.Background(), c.dagID, id, rec, 0); err != nil {
+		if err == ErrStaleRevision {
+			existing, _, getErr := c.wf.Store.GetStep(context.Background(), c.dagID, id)
+			if getErr == nil && existing.FnName == rec.FnName {
+				return s, nil
+			}
+		}
 		return nil, fmt.Errorf("workflow: dynamic step %q: %w", id, err)
 	}
 	// Publish step-added event so scheduler re-evaluates readiness.

@@ -263,3 +263,138 @@ func TestWorker_TaskLevelRetryPolicy_Overrides(t *testing.T) {
 		t.Errorf("attempts: got %d, want 2 (capped by task policy, not worker MaxDeliver)", got)
 	}
 }
+
+// TestWorker_MaxDeliverUnlimited_RetryPolicyBounds exercises the case where
+// the worker's NATS-level MaxDeliver is -1 (unlimited) and the task-level
+// RetryPolicy is the authoritative bound. The handler must be invoked exactly
+// MaximumAttempts times, and the final failure must land in the DLQ.
+func TestWorker_MaxDeliverUnlimited_RetryPolicyBounds(t *testing.T) {
+	policyAttempts.Store(0)
+	h := testutil.SingleNode(t, worker.Options{
+		Concurrency: 1,
+		MaxDeliver:  -1,
+		AckWait:     time.Second,
+		Backoff:     []time.Duration{50 * time.Millisecond},
+	})
+	task.MustRegister(h.Reg, policyFlaky)
+
+	policy := task.RetryPolicy{
+		InitialInterval:    50 * time.Millisecond,
+		BackoffCoefficient: 1.0,
+		MaximumInterval:    time.Second,
+		MaximumAttempts:    3,
+	}
+	fut, err := client.EnqueueOpts(h.Client, policyFlaky, client.EnqueueOptions{RetryPolicy: &policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := fut.Get(ctx, nil); err == nil {
+		t.Fatal("want failure after RetryPolicy exhausted")
+	}
+	if got := policyAttempts.Load(); got != 3 {
+		t.Errorf("attempts: got %d, want 3 (RetryPolicy is authoritative when MaxDeliver=-1)", got)
+	}
+
+	dlqStream, err := h.JS.Stream(ctx, stream.DLQStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var msgs uint64
+	for time.Now().Before(deadline) {
+		info, _ := dlqStream.Info(ctx)
+		msgs = info.State.Msgs
+		if msgs > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if msgs == 0 {
+		t.Error("DLQ empty after RetryPolicy exhaustion")
+	}
+}
+
+// TestWorker_ClaimsCached_BackgroundRefresh verifies that ClaimProvider.Claims
+// is not called on every targeted message. A reasonable caching layer + a
+// background refresher driven by ClaimRefreshInterval should keep the call
+// count bounded regardless of message volume.
+func TestWorker_ClaimsCached_BackgroundRefresh(t *testing.T) {
+	var calls atomic.Int32
+	claimsFn := worker.ClaimsFunc(func(ctx context.Context) ([]string, error) {
+		calls.Add(1)
+		return []string{"primary"}, nil
+	})
+
+	h := testutil.SingleNode(t, worker.Options{
+		Concurrency:          4,
+		Claims:               claimsFn,
+		ClaimRefreshInterval: 500 * time.Millisecond,
+	})
+	task.MustRegister(h.Reg, echo)
+
+	const N = 50
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	futs := make([]*client.Future, 0, N)
+	for i := 0; i < N; i++ {
+		fut, err := client.EnqueueOpts(h.Client, echo, client.EnqueueOptions{Target: "primary"}, "hi")
+		if err != nil {
+			t.Fatal(err)
+		}
+		futs = append(futs, fut)
+	}
+
+	for _, fut := range futs {
+		if _, err := client.Await[string](ctx, fut); err != nil {
+			t.Fatalf("targeted task failed: %v", err)
+		}
+	}
+
+	c := int(calls.Load())
+	// With a 500ms refresh and handlers finishing under 2s total, at most ~5
+	// refresh ticks should fire. Without caching, c would be >= N.
+	if c >= N {
+		t.Errorf("Claims() called %d times for %d targeted tasks; caching did not apply", c, N)
+	}
+	if c > 10 {
+		t.Errorf("Claims() called %d times; expected <= 10 refreshes", c)
+	}
+}
+
+// TestWorker_MaxDeliverUnlimited_NoPolicyDefaults verifies that when neither
+// MaxDeliver nor a task-level RetryPolicy constrains retries, the worker
+// falls back to task.DefaultRetryPolicy() (5 attempts). This guards against
+// the "retry forever" regression that MaxDeliver=-1 could trigger.
+func TestWorker_MaxDeliverUnlimited_NoPolicyDefaults(t *testing.T) {
+	policyAttempts.Store(0)
+	defaultPolicy := task.RetryPolicy{
+		InitialInterval:    20 * time.Millisecond,
+		BackoffCoefficient: 1.0,
+		MaximumInterval:    20 * time.Millisecond,
+		MaximumAttempts:    4,
+	}
+	h := testutil.SingleNode(t, worker.Options{
+		Concurrency:        1,
+		MaxDeliver:         -1,
+		AckWait:            5 * time.Second,
+		Backoff:            []time.Duration{10 * time.Millisecond},
+		DefaultRetryPolicy: &defaultPolicy,
+	})
+	task.MustRegister(h.Reg, policyFlaky)
+
+	fut, err := client.Enqueue(h.Client, policyFlaky)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := fut.Get(ctx, nil); err == nil {
+		t.Fatal("want failure")
+	}
+	if got := policyAttempts.Load(); got != 4 {
+		t.Errorf("attempts: got %d, want 4 (DefaultRetryPolicy fallback)", got)
+	}
+}

@@ -373,6 +373,67 @@ func TestScheduler_Sweep_TriggersAgainAfterReAcquire(t *testing.T) {
 	}
 }
 
+// TestScheduler_Cancel_StaleSnapshot_DoesNotEnqueue exercises the race
+// between workflow.Cancel and an in-flight Scheduler.handleEvent: the
+// scheduler loads a state snapshot (meta=Running), Cancel then flips the
+// meta and marks Pending steps Canceled, and the scheduler must not enqueue
+// steps based on its stale Pending snapshot.
+func TestScheduler_Cancel_StaleSnapshot_DoesNotEnqueue(t *testing.T) {
+	store := NewMemStore()
+	enq := &captureEnq{}
+	wf := NewWorkflow(store, NewMemBus(), enq)
+	ctx := context.Background()
+
+	dagID := "cancel-race"
+	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusDone,
+		ArgsJSON: json.RawMessage(`[]`),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.PutResult(ctx, dagID, "a", json.RawMessage(`1`))
+
+	refA, _ := json.Marshal(Ref{StepID: "a", Mode: RefModeRequired})
+	bArgs, _ := json.Marshal([]json.RawMessage{refA})
+	if err := store.PutStep(ctx, dagID, "b", StepRecord{
+		DAGID: dagID, StepID: "b", FnName: "noopA", Status: StatusPending,
+		Deps: []string{"a"}, ArgsJSON: bArgs,
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Scheduler{wf: wf}
+
+	// Stale snapshot — meta and B still Running/Pending from the scheduler's view.
+	state, err := s.loadState(ctx, dagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Race intervenes: Cancel flips meta → Canceled, B → Canceled.
+	if err := Cancel(ctx, wf, dagID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Scheduler continues with its stale snapshot. Must detect the terminal
+	// record in-store via persistStatus and skip the enqueue.
+	if err := s.enqueueReady(ctx, state, []string{"b"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := enq.count(); got != 0 {
+		t.Errorf("enqueued %d tasks into a canceled DAG, want 0", got)
+	}
+
+	bRec, _, _ := store.GetStep(ctx, dagID, "b")
+	if bRec.Status != StatusCanceled {
+		t.Errorf("B status = %s, want canceled (scheduler overwrote Cancel's write)", bRec.Status)
+	}
+}
+
 func TestScheduler_Finalizes_DAG_Status(t *testing.T) {
 	wf, dag, enq := setupDAG(t)
 	dag.Step("a", noopA, 1)

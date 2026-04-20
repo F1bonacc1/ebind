@@ -30,3 +30,9 @@ var ErrDuplicateStep = errors.New("workflow: duplicate step ID")
 
 // ErrStaleRevision is returned by stores when a CAS operation finds a newer revision.
 var ErrStaleRevision = errors.New("workflow: stale revision")
+
+// errStepAlreadyTerminal is an internal sentinel returned by persistStatus when
+// the step record in the store is already in a terminal state (e.g. canceled
+// by a concurrent Cancel call). Callers handling newly-ready steps must not
+// proceed to enqueue.
+var errStepAlreadyTerminal = errors.New("workflow: step already terminal")

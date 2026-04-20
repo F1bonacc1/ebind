@@ -262,8 +262,7 @@ func setupMultiWorker(t *testing.T, specs ...workerSpec) *multiWorkerHarness {
 		w, err := worker.New(nc, reg, worker.Options{
 			Concurrency:          4,
 			AckWait:              2 * time.Second,
-			MaxDeliver:           5,
-			Backoff:              []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond},
+			Backoff:              []time.Duration{25 * time.Millisecond},
 			StepHook:             wf.Hook(),
 			Middleware:           []worker.Middleware{wf.ContextMiddleware()},
 			WorkerID:             spec.id,
@@ -987,5 +986,140 @@ func TestIntegration_Cancel_StopsNewWorkButLetsRunningFinish(t *testing.T) {
 		if step.StepID == "b" && step.Status != workflow.StatusCanceled {
 			t.Fatalf("b status = %s, want canceled", step.Status)
 		}
+	}
+}
+
+// --- Multi-worker placement stress tests ---
+// These exercise the failure modes in commit 3d77032 where targeted tasks
+// bounce across non-owning workers via NakWithDelay.
+
+var targetedHits atomic.Int32
+var targetedRanOn atomic.Value // stores string
+
+func hTargetedCounter(ctx context.Context) (string, error) {
+	targetedHits.Add(1)
+	wid := workflow.CurrentWorkerID(ctx)
+	targetedRanOn.Store(wid)
+	return wid, nil
+}
+
+// TestIntegration_Targeted_SurvivesLargeNonOwnerPool verifies that targeted
+// tasks are not silently dropped when they must traverse many non-owning
+// workers before reaching the owner. With the pre-fix default of MaxDeliver=5
+// and many bystanders, the expected non-owner NAK count exceeds the budget
+// and NATS silently stops redelivering — the task disappears. We submit many
+// tasks so that even a small per-task drop probability turns into a near-
+// certain failure without the fix.
+func TestIntegration_Targeted_SurvivesLargeNonOwnerPool(t *testing.T) {
+	targetedHits.Store(0)
+	targetedRanOn.Store("")
+
+	owner := &mutableClaims{claims: []string{"primary"}}
+	specs := []workerSpec{{id: "owner", claims: owner}}
+	for i := 0; i < 6; i++ {
+		specs = append(specs, workerSpec{
+			id:     fmt.Sprintf("bystander-%d", i),
+			claims: &mutableClaims{claims: nil},
+		})
+	}
+	h := setupMultiWorker(t, specs...)
+	h.register(t, hTargetedCounter)
+
+	const N = 25
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	dags := make([]*workflow.DAG, 0, N)
+	steps := make([]*workflow.Step, 0, N)
+	for i := 0; i < N; i++ {
+		dag := workflow.New()
+		step := dag.StepOpts("s", hTargetedCounter, []workflow.StepOption{workflow.OnTarget("primary")})
+		if err := dag.Submit(ctx, h.wf); err != nil {
+			t.Fatal(err)
+		}
+		dags = append(dags, dag)
+		steps = append(steps, step)
+	}
+
+	for i, dag := range dags {
+		result, err := workflow.Await[string](ctx, h.wf, dag.ID(), steps[i])
+		if err != nil {
+			t.Fatalf("task %d disappeared in a 7-worker pool: %v", i, err)
+		}
+		if result != "owner" {
+			t.Errorf("task %d ran on %q, want owner", i, result)
+		}
+	}
+	if got := targetedHits.Load(); got != N {
+		t.Errorf("handler hits: got %d, want %d", got, N)
+	}
+
+	dlqStream, err := h.js.Stream(ctx, stream.DLQStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, _ := dlqStream.Info(ctx)
+	if info.State.Msgs != 0 {
+		t.Errorf("DLQ got %d messages; targeted nak loop leaked to DLQ", info.State.Msgs)
+	}
+}
+
+var inflateAttempts atomic.Int32
+
+func hTargetedFlaky(ctx context.Context) (string, error) {
+	n := inflateAttempts.Add(1)
+	if n < 2 {
+		return "", errors.New("first attempt fails")
+	}
+	return workflow.CurrentWorkerID(ctx), nil
+}
+
+// TestIntegration_Targeted_AttemptNotInflatedByWrongTargetNaks verifies that
+// when a targeted task has to bounce through several non-owning workers via
+// NAK before reaching its owner, the owner's attempt counter still starts
+// at 1 on first invocation. Otherwise a task with MaximumAttempts=2 that
+// bounced through 2 non-owners would be out of retry budget before the
+// handler ever ran.
+func TestIntegration_Targeted_AttemptNotInflatedByWrongTargetNaks(t *testing.T) {
+	inflateAttempts.Store(0)
+
+	owner := &mutableClaims{claims: []string{"primary"}}
+	specs := []workerSpec{{id: "owner", claims: owner}}
+	for i := 0; i < 3; i++ {
+		specs = append(specs, workerSpec{
+			id:     fmt.Sprintf("bystander-%d", i),
+			claims: &mutableClaims{claims: nil},
+		})
+	}
+	h := setupMultiWorker(t, specs...)
+	h.register(t, hTargetedFlaky)
+
+	policy := task.RetryPolicy{
+		InitialInterval:    50 * time.Millisecond,
+		BackoffCoefficient: 1.0,
+		MaximumInterval:    time.Second,
+		MaximumAttempts:    2,
+	}
+	dag := workflow.New()
+	step := dag.StepOpts("s", hTargetedFlaky, []workflow.StepOption{
+		workflow.OnTarget("primary"),
+		workflow.WithStepRetry(policy),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := workflow.Await[string](ctx, h.wf, dag.ID(), step)
+	if err != nil {
+		t.Fatalf("owner did not get fair retry budget: %v", err)
+	}
+	if result != "owner" {
+		t.Errorf("ran on %q, want owner", result)
+	}
+	if got := inflateAttempts.Load(); got != 2 {
+		t.Errorf("handler invocations: got %d, want 2 (fail-then-succeed)", got)
 	}
 }
