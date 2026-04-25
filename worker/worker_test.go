@@ -398,3 +398,97 @@ func TestWorker_MaxDeliverUnlimited_NoPolicyDefaults(t *testing.T) {
 		t.Errorf("attempts: got %d, want 4 (DefaultRetryPolicy fallback)", got)
 	}
 }
+
+// shutdownLeakHandler is package-scoped so its CanonicalName is stable across
+// test runs. The closure-based pattern doesn't work — registry.Register on a
+// closure rejects with "anonymous function" because runtime.FuncForPC returns
+// a "func1" name. Channels are reset per-test via shutdownLeakReset.
+var (
+	shutdownLeakAfterRun atomic.Int32
+	shutdownLeakTotal    atomic.Int32
+	shutdownLeakStarted  chan struct{}
+	shutdownLeakRunDone  chan struct{}
+)
+
+func shutdownLeakReset() {
+	shutdownLeakAfterRun.Store(0)
+	shutdownLeakTotal.Store(0)
+	shutdownLeakStarted = make(chan struct{}, 1)
+	shutdownLeakRunDone = make(chan struct{})
+}
+
+func shutdownLeakHandler(ctx context.Context) error {
+	shutdownLeakTotal.Add(1)
+	select {
+	case shutdownLeakStarted <- struct{}{}:
+	default:
+	}
+	// If Run() has already returned by the time this fires, the shutdown
+	// leaked a handler — exactly the bug we're catching.
+	select {
+	case <-shutdownLeakRunDone:
+		shutdownLeakAfterRun.Add(1)
+	default:
+	}
+	time.Sleep(50 * time.Millisecond)
+	return nil
+}
+
+// TestWorker_Shutdown_NoHandlerLeakAfterRunReturns guards against a
+// WaitGroup race in the consumer callback in worker.go's startConsumer:
+// between `sem <- struct{}{}` and `wg.Add(1)`, shutdown can observe wg=0,
+// return from Run(), and then the racing callback either panics with
+// "WaitGroup is reused before previous Wait has returned" or leaks a
+// goroutine that processes a message after Run() said it was done.
+//
+// The setup forces the race window to be reachable on every run:
+// Concurrency=1 plus a burst of enqueues so callbacks pile up blocked on
+// `sem <-`, then we cancel ctx while exactly one handler is in flight.
+// When the in-flight handler's `defer { <-sem; wg.Done() }` runs, Go's
+// channel direct-handoff hands `sem` to a piled-up callback's send, then
+// `wg.Done()` drops wg to 0 and Wait returns — before the unblocked
+// callback ever reaches its `wg.Add(1)`.
+func TestWorker_Shutdown_NoHandlerLeakAfterRunReturns(t *testing.T) {
+	shutdownLeakReset()
+
+	h := testutil.SingleNode(t, worker.Options{
+		Concurrency:   1,
+		AckWait:       30 * time.Second,
+		ShutdownGrace: 5 * time.Second,
+		MaxDeliver:    1,
+	})
+	task.MustRegister(h.Reg, shutdownLeakHandler)
+
+	const N = 10
+	for i := 0; i < N; i++ {
+		if _, err := client.Enqueue(h.Client, shutdownLeakHandler); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	select {
+	case <-shutdownLeakStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no handler started — consumer never bound?")
+	}
+
+	h.Cancel()
+
+	select {
+	case err := <-h.Errs:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("Run did not return in time")
+	}
+	close(shutdownLeakRunDone)
+
+	// Give any leaked goroutines a chance to wake and record themselves.
+	time.Sleep(500 * time.Millisecond)
+
+	if n := shutdownLeakAfterRun.Load(); n > 0 {
+		t.Fatalf("%d handler invocation(s) ran AFTER Run() returned (total seen: %d) — shutdown leak",
+			n, shutdownLeakTotal.Load())
+	}
+}

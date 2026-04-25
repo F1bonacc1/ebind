@@ -87,6 +87,12 @@ type Worker struct {
 	opts   Options
 	invoke Handler
 
+	// stopping is set true at the start of Run's shutdown sequence. The
+	// consume callback checks it (fast-path before sem, recheck after sem)
+	// to bail out with a Nak instead of incrementing wg, eliminating the
+	// race where a callback's wg.Add(1) lands after wg.Wait() observed 0.
+	stopping atomic.Bool
+
 	claimCache atomic.Pointer[[]string]
 
 	// activeClaimSubs tracks subscriptions to per-claim targeted durables so
@@ -164,8 +170,18 @@ func (w *Worker) Run(ctx context.Context) error {
 	go w.runClaimRefresher(ctx, tasksStream, sem, &wg)
 
 	<-ctx.Done()
+	// Order matters:
+	//   1. Set stopping so consume callbacks fast-path Nak instead of
+	//      racing wg.Add(1) against wg.Wait().
+	//   2. Stop() on every consumer (non-blocking).
+	//   3. <-Closed() on every consumer — guarantees the dispatch
+	//      goroutine has fully exited, so every callback has already
+	//      executed wg.Add(1) (or bailed without it).
+	//   4. wg.Wait() drains spawned handler goroutines.
+	w.stopping.Store(true)
 	generalCC.Stop()
 	w.stopAllClaimSubs()
+	<-generalCC.Closed()
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
@@ -180,7 +196,21 @@ func (w *Worker) Run(ctx context.Context) error {
 
 func (w *Worker) startConsumer(ctx context.Context, cons jetstream.Consumer, sem chan struct{}, wg *sync.WaitGroup) (jetstream.ConsumeContext, error) {
 	return cons.Consume(func(msg jetstream.Msg) {
+		// Fast-path: shutdown already begun, don't bother with sem or wg.
+		if w.stopping.Load() {
+			_ = msg.Nak()
+			return
+		}
 		sem <- struct{}{}
+		// Re-check after acquiring sem: stopping may have flipped while we
+		// were blocked. Without this check, a piled-up callback could still
+		// reach wg.Add(1) and race wg.Wait(). The <-Closed() barrier in Run
+		// guarantees the dispatch loop sees this Nak before wg.Wait runs.
+		if w.stopping.Load() {
+			<-sem
+			_ = msg.Nak()
+			return
+		}
 		wg.Add(1)
 		go func() {
 			defer func() { <-sem; wg.Done() }()
@@ -249,9 +279,17 @@ func (w *Worker) subscribeClaim(ctx context.Context, ts jetstream.Stream, claim 
 func (w *Worker) stopAllClaimSubs() {
 	w.claimSubsMu.Lock()
 	defer w.claimSubsMu.Unlock()
+	// Two passes: Stop() is non-blocking, then drain each Closed() in
+	// turn. With both passes, all claim-sub dispatch loops exit in
+	// parallel rather than serially per-sub.
+	ccs := make([]jetstream.ConsumeContext, 0, len(w.activeClaimSubs))
 	for claim, cc := range w.activeClaimSubs {
 		cc.Stop()
+		ccs = append(ccs, cc)
 		delete(w.activeClaimSubs, claim)
+	}
+	for _, cc := range ccs {
+		<-cc.Closed()
 	}
 }
 
