@@ -157,27 +157,18 @@ result, err := workflow.AwaitByID[Profile](ctx, wfB, dagID, stepID)
 
 ## Architecture
 
-```
-┌──────────────┐        publish TASKS.<name>         ┌──────────────┐
-│   Producer   │ ───────────────────────────────────▶│ NATS JetStrm │
-│              │                                     │  TASKS       │
-│ client.Enq   │                                     └──────┬───────┘
-└──────┬───────┘                                            │ pull
-       │                                                    ▼
-       │ subscribe RESP.<client_id>.>     ┌──────────────────────┐
-       │◀──────────────── RESP ───────────│      Worker(s)       │
-       │                                  │  - reflect.Call      │
-       ▼                                  │  - middleware chain  │
-  Future.Get() / Await[T]                 │  - StepHook          │
-                                          └──────┬───────────────┘
-                                                 │ DAG events
-                                                 ▼
-                                    ┌────────────────────────────┐
-                                    │  Scheduler (every worker,  │
-                                    │   leader-gated)            │
-                                    │  - state in NATS KV        │
-                                    │  - resync on acquire       │
-                                    └────────────────────────────┘
+```mermaid
+flowchart LR
+    Producer["<b>Producer</b><br/>client.Enqueue"]
+    Tasks["<b>NATS JetStream</b><br/>TASKS stream"]
+    Worker["<b>Worker(s)</b><br/>• reflect.Call<br/>• middleware chain<br/>• StepHook"]
+    Future["Future.Get() /<br/>Await[T]"]
+    Scheduler["<b>Scheduler</b><br/>(every worker, leader-gated)<br/>• state in NATS KV<br/>• resync on acquire"]
+
+    Producer -- "publish TASKS.&lt;name&gt;" --> Tasks
+    Tasks -- "pull" --> Worker
+    Worker -- "RESP.&lt;client_id&gt;.&gt;" --> Future
+    Worker -- "DAG events" --> Scheduler
 ```
 
 - **`task.Registry`** — name → reflect.Value map; `Register(fn)` introspects signature.
