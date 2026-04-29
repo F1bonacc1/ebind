@@ -9,7 +9,7 @@
 
 A Go task queue + DAG workflow engine built on NATS JetStream.
 
-Function-first ergonomics (`Register(reg, MyFunc)`, `Enqueue(c, MyFunc, args...)`, `Await[T](ctx, fut)`) on top of a persistent queue with retries, dead-lettering, and optional DAG orchestration — all driven by a single NATS dependency that can run as an embedded in-process server (including 3-node HA cluster) or against an external JetStream deployment.
+Function-first ergonomics (`Register(reg, MyFunc)`, `Enqueue(c, MyFunc, args...)`, `Await[T](ctx, fut)`) on top of a persistent queue with retries, dead-lettering, and optional DAG orchestration - all driven by a single NATS dependency that can run as an embedded in-process server (including 3-node HA cluster) or against an external JetStream deployment.
 
 ## Why ebind
 
@@ -27,7 +27,7 @@ go get github.com/f1bonacc1/ebind
 
 Requires Go 1.22+ and NATS JetStream 2.8+.
 
-## Quickstart — standalone task queue
+## Quickstart - standalone task queue
 
 ```go
 package main
@@ -73,7 +73,7 @@ func main() {
     w, _ := worker.New(nc, reg, worker.Options{Concurrency: 16})
     go w.Run(ctx)
 
-    // 4. Enqueue from anywhere in the cluster — producer and worker can be different binaries.
+    // 4. Enqueue from anywhere in the cluster - producer and worker can be different binaries.
     c, _ := client.New(ctx, nc, client.Options{})
     defer c.Close()
 
@@ -92,7 +92,7 @@ Run the bundled end-to-end demo:
 make demo
 ```
 
-## Quickstart — DAG workflow
+## Quickstart - DAG workflow
 
 ```go
 import (
@@ -131,10 +131,10 @@ profile, err := workflow.Await[Profile](ctx, wf, dag.ID(), c)
 
 Key behaviors:
 
-- `a.Ref()` — `combine` runs only if `fetch` succeeds; cascade-skips otherwise.
-- `b.RefOrDefault(v)` — `combine` runs with `v` substituted if `enrich` fails or is skipped.
-- `workflow.Optional()` — `enrich`'s failure does not fail the DAG.
-- `workflow.WithRetry(policy)` — per-DAG default retry; `workflow.WithStepRetry(policy)` overrides per-step.
+- `a.Ref()` - `combine` runs only if `fetch` succeeds; cascade-skips otherwise.
+- `b.RefOrDefault(v)` - `combine` runs with `v` substituted if `enrich` fails or is skipped.
+- `workflow.Optional()` - `enrich`'s failure does not fail the DAG.
+- `workflow.WithRetry(policy)` - per-DAG default retry; `workflow.WithStepRetry(policy)` overrides per-step.
 - From inside a handler, `workflow.FromContext(ctx).Step(...)` adds more steps dynamically.
 
 ### Resuming `Await` from another instance
@@ -142,13 +142,13 @@ Key behaviors:
 DAG state + step results live in NATS KV. Workers keep running independently of whoever called `Await`. If the waiting process dies, the DAG continues; results land in KV and stay there. A different process (same NATS cluster) can resume the wait with only the DAG and step IDs:
 
 ```go
-// Instance A — submitter. Persist these two strings somewhere (DB, Redis, file).
+// Instance A - submitter. Persist these two strings somewhere (DB, Redis, file).
 dagID  := dag.ID()
 stepID := c.ID()            // the *Step you'd pass to Await
 _ = dag.Submit(ctx, wf)
 // ... instance A may exit now ...
 
-// Instance B — resumer. No *Step handle needed.
+// Instance B - resumer. No *Step handle needed.
 wfB, _  := workflow.NewFromNATS(ctx, nc, 1)
 result, err := workflow.AwaitByID[Profile](ctx, wfB, dagID, stepID)
 ```
@@ -157,34 +157,25 @@ result, err := workflow.AwaitByID[Profile](ctx, wfB, dagID, stepID)
 
 ## Architecture
 
-```
-┌──────────────┐        publish TASKS.<name>         ┌──────────────┐
-│   Producer   │ ───────────────────────────────────▶│ NATS JetStrm │
-│              │                                     │  TASKS       │
-│ client.Enq   │                                     └──────┬───────┘
-└──────┬───────┘                                            │ pull
-       │                                                    ▼
-       │ subscribe RESP.<client_id>.>     ┌──────────────────────┐
-       │◀──────────────── RESP ───────────│      Worker(s)       │
-       │                                  │  - reflect.Call      │
-       ▼                                  │  - middleware chain  │
-  Future.Get() / Await[T]                 │  - StepHook          │
-                                          └──────┬───────────────┘
-                                                 │ DAG events
-                                                 ▼
-                                    ┌────────────────────────────┐
-                                    │  Scheduler (every worker,  │
-                                    │   leader-gated)            │
-                                    │  - state in NATS KV        │
-                                    │  - resync on acquire       │
-                                    └────────────────────────────┘
+```mermaid
+flowchart LR
+    Producer["<b>Producer</b><br/>client.Enqueue"]
+    Tasks["<b>NATS JetStream</b><br/>TASKS stream"]
+    Worker["<b>Worker(s)</b><br/>• reflect.Call<br/>• middleware chain<br/>• StepHook"]
+    Future["Future.Get() /<br/>Await[T]"]
+    Scheduler["<b>Scheduler</b><br/>(every worker, leader-gated)<br/>• state in NATS KV<br/>• resync on acquire"]
+
+    Producer -- "publish TASKS.&lt;name&gt;" --> Tasks
+    Tasks -- "pull" --> Worker
+    Worker -- "RESP.&lt;client_id&gt;.&gt;" --> Future
+    Worker -- "DAG events" --> Scheduler
 ```
 
-- **`task.Registry`** — name → reflect.Value map; `Register(fn)` introspects signature.
-- **`client.Client`** — one response-consumer per client; routes responses to typed Futures.
-- **`worker.Worker`** — pull consumer + middleware chain (`Recover`, `Log`, user) + per-task retry policy.
-- **`embed.StartCluster(3)`** — in-process 3-node JetStream cluster with loopback routes.
-- **`workflow`** — DAG builder + persistent state (KV bucket `ebind-dags`) + event-driven scheduler with leader-elector-gated sweep for stranded recovery.
+- **`task.Registry`** - name → reflect.Value map; `Register(fn)` introspects signature.
+- **`client.Client`** - one response-consumer per client; routes responses to typed Futures.
+- **`worker.Worker`** - pull consumer + middleware chain (`Recover`, `Log`, user) + per-task retry policy.
+- **`embed.StartCluster(3)`** - in-process 3-node JetStream cluster with loopback routes.
+- **`workflow`** - DAG builder + persistent state (KV bucket `ebind-dags`) + event-driven scheduler with leader-elector-gated sweep for stranded recovery.
 
 See [CLAUDE.md](./CLAUDE.md) for the full architectural walk-through.
 
@@ -231,9 +222,9 @@ make demo          # run cmd/demo end-to-end
 
 ## Status
 
-- v1 (task queue): done — retries, DLQ, middleware, embedded HA cluster.
-- v2 (DAG workflows): done — optional steps, retry policies, dynamic DAGs.
-- v2.1 (stranded recovery): done — leader-acquisition sweep.
+- v1 (task queue): done - retries, DLQ, middleware, embedded HA cluster.
+- v2 (DAG workflows): done - optional steps, retry policies, dynamic DAGs.
+- v2.1 (stranded recovery): done - leader-acquisition sweep.
 - v2+ (future): phantom-Running detection, cross-DAG signals, saga/compensation.
 
 ## License
