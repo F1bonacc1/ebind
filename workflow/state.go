@@ -45,6 +45,7 @@ type StepRecord struct {
 	Status       StepStatus        `json:"status"`
 	Attempt      int               `json:"attempt"`
 	ErrorKind    string            `json:"error_kind,omitempty"`
+	ErrorMessage string            `json:"error_message,omitempty"`
 	Optional     bool              `json:"optional,omitempty"`
 	Policy       *task.RetryPolicy `json:"policy,omitempty"` // per-step override
 	Placement    *PlacementSpec    `json:"placement,omitempty"`
@@ -118,7 +119,7 @@ func (s *DAGState) MarkDone(stepID string) ([]string, error) {
 
 // MarkFailed transitions to `failed` (idempotent) and cascade-skips all downstream
 // steps whose required deps are unsatisfied by the failure. Returns (newlyReady, newlySkipped).
-func (s *DAGState) MarkFailed(stepID, errorKind string) (newlyReady, newlySkipped []string, err error) {
+func (s *DAGState) MarkFailed(stepID, errorKind, errorMessage string) (newlyReady, newlySkipped []string, err error) {
 	step, ok := s.Steps[stepID]
 	if !ok {
 		return nil, nil, ErrStepNotFound
@@ -126,6 +127,7 @@ func (s *DAGState) MarkFailed(stepID, errorKind string) (newlyReady, newlySkippe
 	if step.Status != StatusFailed {
 		step.Status = StatusFailed
 		step.ErrorKind = errorKind
+		step.ErrorMessage = errorMessage
 		step.FinishedAt = time.Now().UTC()
 		s.Steps[stepID] = step
 	}

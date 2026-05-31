@@ -173,7 +173,7 @@ func (s *Scheduler) onCompleted(ctx context.Context, state *DAGState, ev Event) 
 	case StatusDone:
 		_, _ = state.MarkDone(ev.StepID)
 	case StatusFailed:
-		_, newlySkipped, _ = state.MarkFailed(ev.StepID, ev.ErrorKind)
+		_, newlySkipped, _ = state.MarkFailed(ev.StepID, ev.ErrorKind, ev.ErrorMessage)
 	case StatusSkipped:
 		newlySkipped, _ = state.MarkSkipped(ev.StepID)
 	default:

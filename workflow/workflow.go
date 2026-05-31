@@ -20,6 +20,12 @@ type Workflow struct {
 	SweepCheckInterval time.Duration
 	// SweepTimeout is the max wall-clock a single sweep may take. Default 60s.
 	SweepTimeout time.Duration
+
+	// MaxStepErrorBytes bounds the failed-step error message persisted into the
+	// step record (and carried on completion events). 0 ⇒ DefaultMaxStepErrorBytes;
+	// negative ⇒ persist no message, keeping only the error kind. The full
+	// message always remains available in the DLQ entry and the response stream.
+	MaxStepErrorBytes int
 }
 
 // NewWorkflow constructs a Workflow with the three dependencies. Defaults:
@@ -37,7 +43,7 @@ func (wf *Workflow) WithElector(le LeaderElector) *Workflow {
 // Hook returns a worker.StepHook that persists step outcomes to the store and
 // publishes completion events to the bus. Wire it into worker.Options.StepHook.
 func (wf *Workflow) Hook() *StepHook {
-	return &StepHook{store: wf.Store, bus: wf.Bus}
+	return &StepHook{store: wf.Store, bus: wf.Bus, maxErrBytes: wf.MaxStepErrorBytes}
 }
 
 // RunScheduler drives the scheduler loop — subscribes to completion events,

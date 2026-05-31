@@ -1,6 +1,7 @@
 package dag
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -59,6 +60,9 @@ func newStepGetCmd(c *cli.Context) *cobra.Command {
 			if rec.ErrorKind != "" {
 				fmt.Fprintf(w, "  error_kind:   %s\n", rec.ErrorKind)
 			}
+			if rec.ErrorMessage != "" {
+				fmt.Fprintf(w, "  error_msg:    %s\n", rec.ErrorMessage)
+			}
 			if len(rec.Deps) > 0 {
 				fmt.Fprintf(w, "  deps:         %v\n", rec.Deps)
 			}
@@ -92,7 +96,7 @@ func newStepResultCmd(c *cli.Context) *cobra.Command {
 			data, err := wf.Store.GetResult(ctx, args[0], args[1])
 			if err != nil {
 				if errors.Is(err, workflow.ErrStepNotFound) {
-					return fmt.Errorf("no result for %s/%s (step may not be done yet)", args[0], args[1])
+					return noResultError(ctx, wf, args[0], args[1])
 				}
 				return err
 			}
@@ -111,4 +115,36 @@ func newStepResultCmd(c *cli.Context) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&raw, "raw", false, "write result bytes verbatim (no newline)")
 	return cmd
+}
+
+// noResultError explains why a step has no result payload using the step's
+// terminal status (and persisted error, if it failed) instead of a generic
+// "may not be done yet".
+func noResultError(ctx context.Context, wf *workflow.Workflow, dagID, stepID string) error {
+	rec, _, err := wf.Store.GetStep(ctx, dagID, stepID)
+	if err != nil {
+		if errors.Is(err, workflow.ErrStepNotFound) {
+			return fmt.Errorf("no result for %s/%s: step not found", dagID, stepID)
+		}
+		return err
+	}
+	switch rec.Status {
+	case workflow.StatusFailed:
+		reason := rec.ErrorKind
+		switch {
+		case reason != "" && rec.ErrorMessage != "":
+			reason += ": " + rec.ErrorMessage
+		case reason == "" && rec.ErrorMessage != "":
+			reason = rec.ErrorMessage
+		case reason == "":
+			reason = "no error recorded"
+		}
+		return fmt.Errorf("no result for %s/%s: step failed (%s)", dagID, stepID, reason)
+	case workflow.StatusSkipped:
+		return fmt.Errorf("no result for %s/%s: step was skipped", dagID, stepID)
+	case workflow.StatusCanceled:
+		return fmt.Errorf("no result for %s/%s: step was canceled", dagID, stepID)
+	default:
+		return fmt.Errorf("no result for %s/%s: step is %s (not done yet)", dagID, stepID, rec.Status)
+	}
 }

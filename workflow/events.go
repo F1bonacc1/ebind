@@ -16,11 +16,12 @@ const (
 
 // Event is the payload delivered by EventBus to scheduler subscribers.
 type Event struct {
-	Kind      EventKind  `json:"kind"`
-	DAGID     string     `json:"dag_id"`
-	StepID    string     `json:"step_id"`
-	Status    StepStatus `json:"status,omitempty"` // for EventCompleted
-	ErrorKind string     `json:"error_kind,omitempty"`
+	Kind         EventKind  `json:"kind"`
+	DAGID        string     `json:"dag_id"`
+	StepID       string     `json:"step_id"`
+	Status       StepStatus `json:"status,omitempty"` // for EventCompleted
+	ErrorKind    string     `json:"error_kind,omitempty"`
+	ErrorMessage string     `json:"error_message,omitempty"`
 	// Ack acknowledges the event has been processed. Subscribers must call this
 	// on every delivered event. Nak redelivers after the implementation-specific delay.
 	Ack func() error `json:"-"`
@@ -50,12 +51,13 @@ func EventSubject(e Event) string {
 // MarshalEvent serializes an Event for on-wire delivery (without Ack/Nak).
 func MarshalEvent(e Event) ([]byte, error) {
 	return json.Marshal(struct {
-		Kind      EventKind  `json:"kind"`
-		DAGID     string     `json:"dag_id"`
-		StepID    string     `json:"step_id"`
-		Status    StepStatus `json:"status,omitempty"`
-		ErrorKind string     `json:"error_kind,omitempty"`
-	}{e.Kind, e.DAGID, e.StepID, e.Status, e.ErrorKind})
+		Kind         EventKind  `json:"kind"`
+		DAGID        string     `json:"dag_id"`
+		StepID       string     `json:"step_id"`
+		Status       StepStatus `json:"status,omitempty"`
+		ErrorKind    string     `json:"error_kind,omitempty"`
+		ErrorMessage string     `json:"error_message,omitempty"`
+	}{e.Kind, e.DAGID, e.StepID, e.Status, e.ErrorKind, e.ErrorMessage})
 }
 
 // UnmarshalEvent deserializes a wire payload into an Event. Ack/Nak are not populated

@@ -155,6 +155,28 @@ result, err := workflow.AwaitByID[Profile](ctx, wfB, dagID, stepID)
 
 `AwaitByID` uses NATS KV `IncludeHistory()` under the hood, so late subscribers still receive results that were written before they started watching. See [`examples/11-workflow-resume`](./examples/11-workflow-resume) for a runnable two-invocation demo.
 
+## Inspecting failures
+
+When a task or DAG step fails terminally (retries exhausted or a non-retryable error), ebind records the failure in three places:
+
+- **The DAG step record** (NATS KV, lives for the DAG's lifetime): the step status flips to `failed` and the record stores both `error_kind` (a category — e.g. `handler`, `deadline`, `panic`) and `error_msg` (the handler's error text). This is written by the same hook that fails the step, so it's available as soon as the step shows `failed` — no DLQ round-trip needed.
+- **The DLQ** (`EBIND_DLQ` stream, default 7-day retention): the full `dlq.Entry` with the complete `TaskError`, attempt count, and timestamp.
+- **The response stream** (`EBIND_RESP`, short retention): the `TaskError` surfaces through `Await` / `Future.Get` as a Go error.
+
+Inspect either with the `ebctl` operator CLI:
+
+```sh
+# DAG step — durable error kind + message straight from the step record
+ebctl dag get <dag-id>                 # every step: status + error kind
+ebctl dag step get <dag-id> <step-id>  # one step: error_kind + error_msg
+
+# DLQ — terminally failed tasks with the full error message
+ebctl dlq ls                           # table: SEQ, FN, ERROR, ATTEMPT, AGE
+ebctl dlq show <seq>                   # full entry incl. error_message + payload
+```
+
+The error text persisted into the step record is bounded by `Workflow.MaxStepErrorBytes` (default 4096; set negative to keep only the error kind — useful when error text may contain sensitive data). The full, untruncated message is always available in the DLQ entry. Note that only *terminal* failures are recorded; an attempt that will still be retried writes nothing to the step record — use the `worker.Log` middleware to capture per-attempt errors.
+
 ## Architecture
 
 ```mermaid
@@ -190,6 +212,7 @@ See [CLAUDE.md](./CLAUDE.md) for the full architectural walk-through.
 | Retry control | `task.RetryPolicy` on envelope (per-task) or `worker.Options.MaxDeliver` default |
 | Non-retryable errors | `RetryPolicy.NonRetryableErrorKinds` OR `TaskError{Retryable: false}` |
 | Dead-lettering | `dlq.Publish` auto-called on final failure → `EBIND_DLQ` stream |
+| Failure visibility | Failed step record carries `error_kind` + `error_msg` (durable in KV, via `ebctl dag step get`); full `TaskError` in `EBIND_DLQ`; cap with `Workflow.MaxStepErrorBytes` |
 | Graceful shutdown | `worker.Run(ctx)` drains in-flight on ctx-cancel (configurable grace) |
 | HA | 3-node embedded cluster with `Replicas: 3` streams & KV |
 | Stranded DAG recovery | `Scheduler` sweep on `LeaderElector` false→true edge |
@@ -206,6 +229,7 @@ embed/        in-process NATS server (single + cluster)
 workflow/     DAG builder + scheduler + KV-backed state
 internal/testutil/  harness for integration tests
 cmd/demo/     single-process end-to-end demo
+cmd/ebctl/    operator CLI: inspect DAGs/steps/results, DLQ, streams
 ```
 
 ## Development

@@ -49,7 +49,7 @@ func TestState_MarkFailed_CascadesRequired(t *testing.T) {
 		StepRecord{StepID: "b", Deps: []string{"a"}, ArgsJSON: refArgs(Ref{StepID: "a", Mode: RefModeRequired})},
 		StepRecord{StepID: "c", Deps: []string{"b"}, ArgsJSON: refArgs(Ref{StepID: "b", Mode: RefModeRequired})},
 	)
-	_, skipped, err := s.MarkFailed("a", "boom")
+	_, skipped, err := s.MarkFailed("a", "boom", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestState_MarkFailed_RefOrDefaultDoesNotCascade(t *testing.T) {
 		StepRecord{StepID: "a"},
 		StepRecord{StepID: "b", Deps: []string{"a"}, ArgsJSON: refArgs(Ref{StepID: "a", Mode: RefModeOrDefault, Default: json.RawMessage(`0`)})},
 	)
-	ready, skipped, err := s.MarkFailed("a", "boom")
+	ready, skipped, err := s.MarkFailed("a", "boom", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestState_MarkFailed_RefOrDefaultDoesNotCascade(t *testing.T) {
 
 func TestState_MarkFailed_IsIdempotent(t *testing.T) {
 	s := makeState(StepRecord{StepID: "a", Status: StatusFailed})
-	ready, skipped, err := s.MarkFailed("a", "again")
+	ready, skipped, err := s.MarkFailed("a", "again", "again")
 	if err != nil || ready != nil || skipped != nil {
 		t.Errorf("second MarkFailed: ready=%v skipped=%v err=%v", ready, skipped, err)
 	}
@@ -190,7 +190,7 @@ func TestState_After_CascadesOnFail(t *testing.T) {
 		StepRecord{StepID: "a"},
 		StepRecord{StepID: "b", Deps: []string{"a"}, ArgsJSON: json.RawMessage(`[]`)},
 	)
-	_, skipped, err := s.MarkFailed("a", "boom")
+	_, skipped, err := s.MarkFailed("a", "boom", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestState_AfterAny_DoesNotCascadeOnFail(t *testing.T) {
 		StepRecord{StepID: "a"},
 		StepRecord{StepID: "b", OptionalDeps: []string{"a"}, ArgsJSON: json.RawMessage(`[]`)},
 	)
-	ready, skipped, err := s.MarkFailed("a", "boom")
+	ready, skipped, err := s.MarkFailed("a", "boom", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,12 +253,12 @@ func TestState_Mixed_After_And_RefOrDefault(t *testing.T) {
 		)},
 	)
 	// Fail a: b should NOT cascade (RefOrDefault).
-	_, skipped, _ := s.MarkFailed("a", "boom")
+	_, skipped, _ := s.MarkFailed("a", "boom", "")
 	if len(skipped) != 0 {
 		t.Errorf("RefOrDefault should prevent cascade; got %v", skipped)
 	}
 	// Now fail c: b has no RefOrDefault for c → cascade expected.
-	_, skipped2, _ := s.MarkFailed("c", "boom")
+	_, skipped2, _ := s.MarkFailed("c", "boom", "")
 	if len(skipped2) != 1 || skipped2[0] != "b" {
 		t.Errorf("After-style dep without matching RefOrDefault should cascade; got %v", skipped2)
 	}
@@ -276,5 +276,19 @@ func TestState_ReadyToRun_FanIn(t *testing.T) {
 	ready := s.ReadyToRun()
 	if len(ready) != 1 || ready[0] != "c" {
 		t.Errorf("fan-in c should be ready once both parents done; ready=%v", ready)
+	}
+}
+
+func TestState_MarkFailed_StoresErrorMessage(t *testing.T) {
+	s := makeState(StepRecord{StepID: "a"})
+	if _, _, err := s.MarkFailed("a", "handler", "dial tcp: connection refused"); err != nil {
+		t.Fatal(err)
+	}
+	got := s.Steps["a"]
+	if got.ErrorKind != "handler" {
+		t.Errorf("ErrorKind = %q, want handler", got.ErrorKind)
+	}
+	if got.ErrorMessage != "dial tcp: connection refused" {
+		t.Errorf("ErrorMessage = %q, want full message", got.ErrorMessage)
 	}
 }

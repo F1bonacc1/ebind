@@ -30,7 +30,7 @@ See `task/registry.go::Register` and `task/registry.go::Describe`.
 
 **KV bucket `ebind-dags`** (workflow only):
 - `<dag_id>/meta` — DAG-level metadata (status, default policy)
-- `<dag_id>/step/<step_id>` — StepRecord (fn name, unresolved Refs in args, deps, status, retry policy)
+- `<dag_id>/step/<step_id>` — StepRecord (fn name, unresolved Refs in args, deps, status, retry policy, and on failure `error_kind` + `error_message`)
 - `<dag_id>/result/<step_id>` — raw result bytes
 
 **JetStream streams:**
@@ -48,7 +48,7 @@ producer ─► TASKS stream ─► worker pool ─► handler fn ─► result
                                     │
                                     ├─► RESP.<client_id>.<task_id> ─► Future.Get/Await
                                     │
-                                    └─(if DAG)─► StepHook ─► KV {step=Done, result=bytes}
+                                    └─(if DAG)─► StepHook ─► KV {step=Done+result | step=Failed+error_kind/msg}
                                                          │
                                                          └─► DAG events stream ─► Scheduler
                                                                                       │
@@ -100,7 +100,7 @@ workflow/
   step.go                Step + StepOption
   dag.go                 DAG builder, Submit, cycle detection
   scheduler.go           handleEvent + watchLeadership + sweep
-  hook.go                workflow.StepHook (implements worker.StepHook)
+  hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
   context.go             FromContext — dynamic step addition
   await.go               Await[T] via KV WatchResult + DAGInfo
 
@@ -109,6 +109,14 @@ internal/testutil/
 
 cmd/demo/
   main.go                Single-process e2e demo
+
+cmd/ebctl/               operator CLI (cobra)
+  main.go                entrypoint
+  internal/cli/          shared Context (NATS conn, Workflow, Printer)
+  internal/commands/dag    dag ls/get/tree/step (get|result)/watch/cancel/rm
+  internal/commands/dlq    dlq ls/show/watch/requeue/purge
+  internal/commands/stream stream ls/info/consumer/peek/purge/rmmsg
+  internal/format/         pretty/JSON Printer abstraction
 ```
 
 ## Test taxonomy
@@ -147,6 +155,9 @@ Within one scheduler instance, `mu` serializes event handling. Across instances,
 
 ### Sweep on leader acquisition
 When `IsLeader()` flips false→true, the scheduler sweeps all running DAGs and re-enqueues any stranded ready steps. Edge-triggered, not level-triggered. Defaults: 5s poll, 60s sweep timeout. Overlap-guarded.
+
+### Failed-step error message persistence
+On terminal failure the worker's `StepHook.OnStepFailed` writes both `error_kind` and `error_message` (the handler's `err.Error()`) into the step record, and carries them on the completion event so the scheduler's in-memory `MarkFailed` stays consistent. The message is truncated to `Workflow.MaxStepErrorBytes` (default `DefaultMaxStepErrorBytes` = 4096; **negative ⇒ store kind only**, the compliance opt-out). The step record is the durable, DAG-lifetime source for *why* a step failed (`ebctl dag step get`); the full untruncated `TaskError` also lives in `EBIND_DLQ` (7d) and `EBIND_RESP` (short). The hook persists the record *before* the DLQ publish, so a step showing `failed` always has its error available. Only terminal failures are recorded — mid-retry attempts write nothing (use `worker.Log` middleware to capture interim errors).
 
 ### CanonicalName instability
 Do not rename or move a registered handler function in production deployments without an alias:
