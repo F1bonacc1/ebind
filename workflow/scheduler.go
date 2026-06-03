@@ -41,7 +41,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	return nil
 }
 
-// watchLeadership polls IsLeader() and triggers a sweep on each false→true edge.
+// watchLeadership polls IsLeader() and triggers a sweep on each false→true edge
+// plus periodically while leader so that crash recovery (pausing→paused,
+// paused→finalized) is not dependent on leadership transitions.
 // Initial state is wasLeader=false, so a scheduler that starts as leader
 // performs a startup sweep on its very first tick.
 func (s *Scheduler) watchLeadership(ctx context.Context) {
@@ -58,14 +60,13 @@ func (s *Scheduler) watchLeadership(ctx context.Context) {
 		case <-tick.C:
 			isLeader := s.wf.Elector.IsLeader()
 			s.leaderMu.Lock()
-			edge := isLeader && !s.wasLeader
 			s.wasLeader = isLeader
-			running := s.sweepRunning
-			if edge && !running {
+			shouldSweep := isLeader && !s.sweepRunning
+			if shouldSweep {
 				s.sweepRunning = true
 			}
 			s.leaderMu.Unlock()
-			if edge && !running {
+			if shouldSweep {
 				go s.runSweep(ctx)
 			}
 		}
@@ -98,18 +99,77 @@ func (s *Scheduler) sweep(ctx context.Context) error {
 		return err
 	}
 	for _, dag := range dags {
-		if dag.Status != DAGStatusRunning {
-			continue
+		switch dag.Status {
+		case DAGStatusRunning:
+			state, err := s.loadState(ctx, dag.ID)
+			if err != nil {
+				continue
+			}
+			s.mu.Lock()
+			ready := state.ReadyToRun()
+			err = s.enqueueReady(ctx, state, ready)
+			s.mu.Unlock()
+			_ = err
+
+		case DAGStatusPausing:
+			// D-16: Recovery for leader crash while pausing — transition to paused.
+			state, err := s.loadState(ctx, dag.ID)
+			if err != nil {
+				continue
+			}
+			if state.HasInFlightSteps() {
+				continue // still draining; do nothing
+			}
+			meta, rev, err := s.wf.Store.GetMeta(ctx, dag.ID)
+			if err != nil {
+				continue
+			}
+			if meta.Status != DAGStatusPausing {
+				continue // concurrent writer changed it
+			}
+			meta.Status = DAGStatusPaused
+			meta.PausedAt = time.Now().UTC()
+			_ = s.wf.Store.PutMeta(ctx, dag.ID, meta, rev) // CAS; benign fail on race
+
+		case DAGStatusPaused:
+			// D-18: Skip non-terminal paused DAGs — zero CPU.
+			// D-17: Auto-finalize if all steps are terminal.
+			// Can't use state.Terminal() here: it returns (running,false)
+			// when meta is paused (by design). Check steps directly.
+			state, err := s.loadState(ctx, dag.ID)
+			if err != nil {
+				continue
+			}
+			allTerminal := true
+			for _, step := range state.Steps {
+				if !step.IsTerminal() {
+					allTerminal = false
+					break
+				}
+			}
+			if !allTerminal {
+				continue // not all terminal — skip (zero CPU per D-18)
+			}
+			meta, rev, err := s.wf.Store.GetMeta(ctx, dag.ID)
+			if err != nil {
+				continue
+			}
+			if meta.Status != DAGStatusPaused {
+				continue
+			}
+			// Derive final status from step outcomes.
+			meta.Status = DAGStatusDone
+			for _, step := range state.Steps {
+				if !step.Optional && (step.Status == StatusFailed || step.Status == StatusSkipped) {
+					meta.Status = DAGStatusFailed
+					break
+				}
+			}
+			_ = s.wf.Store.PutMeta(ctx, dag.ID, meta, rev)
+
+		default:
+			continue // done/failed/canceled — existing behavior
 		}
-		state, err := s.loadState(ctx, dag.ID)
-		if err != nil {
-			continue
-		}
-		s.mu.Lock()
-		ready := state.ReadyToRun()
-		err = s.enqueueReady(ctx, state, ready)
-		s.mu.Unlock()
-		_ = err
 	}
 	return nil
 }
@@ -148,13 +208,22 @@ func (s *Scheduler) handleEvent(ctx context.Context, ev Event) error {
 	if err != nil {
 		return err
 	}
-	if state.Meta.Status == DAGStatusCanceled {
+	// Canceled and fully paused DAGs — gate ALL events (no processing).
+	if state.Meta.Status == DAGStatusCanceled || state.Meta.Status == DAGStatusPaused {
+		return nil
+	}
+	// Pausing DAGs: gate step-added events (no new work during drain), but
+	// allow completion events through so the pausing→paused auto-transition
+	// in onCompleted can fire when the last in-flight step finishes (D-13).
+	if state.Meta.Status == DAGStatusPausing && ev.Kind == EventStepAdded {
 		return nil
 	}
 	switch ev.Kind {
 	case EventCompleted:
 		return s.onCompleted(ctx, state, ev)
 	case EventStepAdded:
+		return s.onStepAdded(ctx, state)
+	case EventResumed:
 		return s.onStepAdded(ctx, state)
 	}
 	return nil
@@ -191,18 +260,53 @@ func (s *Scheduler) onCompleted(ctx context.Context, state *DAGState, ev Event) 
 		return err
 	}
 
+	// ----- pausing→paused auto-transition (SG-04) -----
+	if state.Meta.Status == DAGStatusPausing && !state.HasInFlightSteps() {
+		meta, rev, err := s.wf.Store.GetMeta(ctx, state.Meta.ID)
+		if err != nil {
+			return err
+		}
+		if meta.Status != DAGStatusPausing {
+			return nil // concurrent Resume or Cancel changed it; benign (D-14)
+		}
+		meta.Status = DAGStatusPaused
+		meta.PausedAt = time.Now().UTC()
+		if err := s.wf.Store.PutMeta(ctx, state.Meta.ID, meta, rev); err != nil {
+			if errors.Is(err, ErrStaleRevision) {
+				return nil // benign CAS race (Resume won) — sweep handles it
+			}
+			return err
+		}
+		// If all steps are already terminal, finalize immediately instead of
+		// staying paused (all-terminal paused DAG should be done/failed).
+		if state.AllStepsTerminal() {
+			return s.finalizeDAG(ctx, state)
+		}
+		return nil
+	}
+	// ----- end pausing→paused -----
+
 	// Finalize DAG if all terminal.
 	return s.maybeFinalize(ctx, state)
 }
 
 func (s *Scheduler) onStepAdded(ctx context.Context, state *DAGState) error {
-	return s.enqueueReady(ctx, state, state.ReadyToRun())
+	if err := s.enqueueReady(ctx, state, state.ReadyToRun()); err != nil {
+		return err
+	}
+	// If this is a resume and all steps are already terminal, finalize.
+	if state.AllStepsTerminal() {
+		return s.finalizeDAG(ctx, state)
+	}
+	return nil
 }
 
 // enqueueReady resolves args and publishes task envelopes for each ready step.
 // If arg resolution returns cascade-skip, we mark the step skipped instead.
 func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []string) error {
-	if len(ready) == 0 || state.Meta.Status == DAGStatusCanceled {
+	if len(ready) == 0 || state.Meta.Status == DAGStatusCanceled ||
+		state.Meta.Status == DAGStatusPausing ||
+		state.Meta.Status == DAGStatusPaused {
 		return nil
 	}
 	results, statuses, err := s.snapshotUpstream(ctx, state)
@@ -295,6 +399,24 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 	return ErrStaleRevision
 }
 
+// finalizeDAG transitions the DAG to its final status (done/failed) using
+// AllStepsTerminal + DeriveFinalStatus. Reads fresh meta for CAS safety.
+func (s *Scheduler) finalizeDAG(ctx context.Context, state *DAGState) error {
+	finalStatus := state.DeriveFinalStatus()
+	meta, rev, err := s.wf.Store.GetMeta(ctx, state.Meta.ID)
+	if err != nil {
+		return err
+	}
+	if meta.Status == DAGStatusDone || meta.Status == DAGStatusFailed || meta.Status == DAGStatusCanceled {
+		return nil // already finalized
+	}
+	if meta.Status == DAGStatusRunning || meta.Status == DAGStatusPaused {
+		meta.Status = finalStatus
+		return s.wf.Store.PutMeta(ctx, state.Meta.ID, meta, rev)
+	}
+	return nil
+}
+
 // maybeFinalize checks if all steps are terminal; if so, updates DAG meta status.
 func (s *Scheduler) maybeFinalize(ctx context.Context, state *DAGState) error {
 	status, done := state.Terminal()
@@ -305,7 +427,7 @@ func (s *Scheduler) maybeFinalize(ctx context.Context, state *DAGState) error {
 	if err != nil {
 		return err
 	}
-	if meta.Status == DAGStatusCanceled {
+	if meta.Status == DAGStatusCanceled || meta.Status == DAGStatusPausing || meta.Status == DAGStatusPaused {
 		return nil
 	}
 	if meta.Status == status {

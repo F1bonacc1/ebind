@@ -90,7 +90,7 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 			return c.Printer.Table(cmd.OutOrStdout(), headers, rows)
 		},
 	}
-	cmd.Flags().StringVar(&statusFilter, "status", "", "filter by status: running|done|failed|canceled")
+	cmd.Flags().StringVar(&statusFilter, "status", "", "filter by status: running|done|failed|canceled|pausing|paused")
 	cmd.Flags().DurationVar(&since, "since", 0, "only DAGs created within this duration (e.g. 1h)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max rows (0 = unlimited)")
 	return cmd

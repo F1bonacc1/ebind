@@ -16,6 +16,8 @@ func NewCmd(c *cli.Context) *cobra.Command {
 	cmd.AddCommand(newGetCmd(c))
 	cmd.AddCommand(newTreeCmd(c))
 	cmd.AddCommand(newCancelCmd(c))
+	cmd.AddCommand(newPauseCmd(c))
+	cmd.AddCommand(newResumeCmd(c))
 	cmd.AddCommand(newRmCmd(c))
 	cmd.AddCommand(newWatchCmd(c))
 	cmd.AddCommand(newStepCmd(c))

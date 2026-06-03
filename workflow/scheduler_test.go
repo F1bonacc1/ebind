@@ -460,3 +460,369 @@ func TestScheduler_Finalizes_DAG_Status(t *testing.T) {
 	}
 	t.Fatal("DAG never finalized to done")
 }
+
+// TestScheduler_Pause_BlocksDispatch verifies the dispatch gate (SG-02):
+// after pausing a running DAG, completion events are consumed but no new
+// steps are enqueued.
+func TestScheduler_Pause_BlocksDispatch(t *testing.T) {
+	wf, dag, enq := setupDAG(t)
+	a := dag.Step("a", noopA, 1)
+	b := dag.StepOpts("b", noopA, nil, a.Ref())
+	_ = dag.Step("c", noopC, b.Ref(), "x")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startScheduler(t, wf, ctx)
+	if err := dag.Submit(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	waitEnqueued(t, enq, 1, time.Second) // root a enqueued
+
+	// Manually set meta to pausing (Phase 3 API not yet built).
+	meta, rev, err := wf.Store.GetMeta(ctx, dag.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Status = DAGStatusPausing
+	if err := wf.Store.PutMeta(ctx, dag.ID(), meta, rev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Complete step a — dispatch gate should block b from being enqueued.
+	emulateHook(t, wf, dag.ID(), "a", []byte(`2`), nil)
+
+	// Wait briefly for scheduler to process the event.
+	time.Sleep(300 * time.Millisecond)
+
+	// Assert no new enqueues — still only the root step a.
+	if got := enq.count(); got != 1 {
+		t.Errorf("expected 1 enqueue (a only), got %d", got)
+	}
+
+	// Assert step b is still pending in store.
+	bRec, _, err := wf.Store.GetStep(ctx, dag.ID(), "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bRec.Status != StatusPending {
+		t.Errorf("step b status = %s, want pending", bRec.Status)
+	}
+
+	// Complete step a again (idempotent) — assert no change.
+	prevCount := enq.count()
+	emulateHook(t, wf, dag.ID(), "a", []byte(`2`), nil)
+	time.Sleep(200 * time.Millisecond)
+	if got := enq.count(); got != prevCount {
+		t.Errorf("idempotent completion: expected %d enqueues, got %d", prevCount, got)
+	}
+}
+
+// TestScheduler_Pause_TransitionsToPaused verifies the pausing→paused
+// auto-transition (SG-04): when the last in-flight step completes while
+// pausing, meta transitions through paused to done (all steps are terminal).
+func TestScheduler_Pause_TransitionsToPaused(t *testing.T) {
+	wf, dag, enq := setupDAG(t)
+	dag.Step("a", noopA, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startScheduler(t, wf, ctx)
+	if err := dag.Submit(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	waitEnqueued(t, enq, 1, time.Second)
+
+	// Set meta to pausing.
+	meta, rev, err := wf.Store.GetMeta(ctx, dag.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Status = DAGStatusPausing
+	if err := wf.Store.PutMeta(ctx, dag.ID(), meta, rev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Complete step a — auto-transition fires: pausing→paused→done (all
+	// steps are terminal, so finalizeDAG completes the DAG).
+	emulateHook(t, wf, dag.ID(), "a", []byte(`2`), nil)
+
+	// Poll meta until done (or timeout).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m, _, _ := wf.Store.GetMeta(ctx, dag.ID())
+		if m.Status == DAGStatusDone {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	m, _, _ := wf.Store.GetMeta(ctx, dag.ID())
+	t.Fatalf("DAG never transitioned to done; status = %s", m.Status)
+}
+
+// TestScheduler_Pause_InFlightContinues verifies that a running step
+// completes normally during pause (result is persisted).
+func TestScheduler_Pause_InFlightContinues(t *testing.T) {
+	wf, dag, enq := setupDAG(t)
+	dag.Step("a", noopA, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startScheduler(t, wf, ctx)
+	if err := dag.Submit(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	waitEnqueued(t, enq, 1, time.Second)
+
+	// Set meta to pausing.
+	meta, rev, err := wf.Store.GetMeta(ctx, dag.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Status = DAGStatusPausing
+	if err := wf.Store.PutMeta(ctx, dag.ID(), meta, rev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Complete step a with a known result.
+	result := []byte("42")
+	emulateHook(t, wf, dag.ID(), "a", result, nil)
+
+	// Step a should be done in store.
+	aRec, _, err := wf.Store.GetStep(ctx, dag.ID(), "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aRec.Status != StatusDone {
+		t.Errorf("step a status = %s, want done", aRec.Status)
+	}
+
+	// Result should be persisted.
+	storedResult, err := wf.Store.GetResult(ctx, dag.ID(), "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(storedResult) != string(result) {
+		t.Errorf("result = %s, want %s", string(storedResult), string(result))
+	}
+}
+
+// TestScheduler_Pause_StepAddedDuringPause verifies that a dynamic step
+// added during pause stays pending (not enqueued) until resume.
+func TestScheduler_Pause_StepAddedDuringPause(t *testing.T) {
+	wf, dag, enq := setupDAG(t)
+	dag.Step("a", noopA, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startScheduler(t, wf, ctx)
+	if err := dag.Submit(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	waitEnqueued(t, enq, 1, time.Second)
+
+	// Set meta to pausing.
+	meta, rev, err := wf.Store.GetMeta(ctx, dag.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Status = DAGStatusPausing
+	if err := wf.Store.PutMeta(ctx, dag.ID(), meta, rev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate adding a dynamic step b (no deps, ready to run).
+	if err := wf.Store.PutStep(ctx, dag.ID(), "b", StepRecord{
+		DAGID: dag.ID(), StepID: "b", FnName: "noopA",
+		Status: StatusPending, ArgsJSON: json.RawMessage(`[1]`),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Publish step-added event for b.
+	ev := Event{Kind: EventStepAdded, DAGID: dag.ID(), StepID: "b"}
+	data, _ := MarshalEvent(ev)
+	if err := wf.Bus.Publish(ctx, EventSubject(ev), data); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for scheduler to process.
+	time.Sleep(300 * time.Millisecond)
+
+	// Step b should still be pending (not enqueued, gated by event entry gate).
+	bRec, _, err := wf.Store.GetStep(ctx, dag.ID(), "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bRec.Status != StatusPending {
+		t.Errorf("step b status = %s, want pending", bRec.Status)
+	}
+
+	// No new enqueues.
+	if got := enq.count(); got != 1 {
+		t.Errorf("expected 1 enqueue, got %d", got)
+	}
+}
+
+// TestScheduler_Sweep_HandlesPausingDAG verifies that sweep transitions
+// a pausing DAG (with no in-flight steps) to paused (SG-03, D-16).
+func TestScheduler_Sweep_HandlesPausingDAG(t *testing.T) {
+	store := NewMemStore()
+	bus := NewMemBus()
+	enq := &captureEnq{}
+	elector := &toggleElector{leader: false}
+	wf := NewWorkflow(store, bus, enq)
+	wf.Elector = elector
+	wf.SweepCheckInterval = 50 * time.Millisecond
+	wf.SweepTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dagID := "pausing-sweep"
+
+	// Seed: meta=pausing, step a=done (no in-flight).
+	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusPausing}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+		DAGID: dagID, StepID: "a", FnName: "noopA",
+		Status: StatusDone, ArgsJSON: json.RawMessage(`[]`),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	startScheduler(t, wf, ctx)
+
+	// Non-leader: no sweep runs, stay pausing.
+	time.Sleep(200 * time.Millisecond)
+	m, _, _ := store.GetMeta(ctx, dagID)
+	if m.Status != DAGStatusPausing {
+		t.Fatalf("non-leader: expected pausing, got %s", m.Status)
+	}
+
+	// Flip to leader: sweep fires and transitions pausing→paused.
+	elector.set(true)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m, _, _ = store.GetMeta(ctx, dagID)
+		if m.Status == DAGStatusPaused {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	m, _, _ = store.GetMeta(ctx, dagID)
+	if m.Status != DAGStatusPaused {
+		t.Fatalf("after sweep: want paused, got %s", m.Status)
+	}
+
+	// No enqueues.
+	if enq.count() != 0 {
+		t.Errorf("expected 0 enqueues, got %d", enq.count())
+	}
+}
+
+// TestScheduler_Sweep_SkipsPausedDAG verifies that sweep skips paused
+// DAGs with non-terminal steps (SG-03, D-18) — no enqueues.
+func TestScheduler_Sweep_SkipsPausedDAG(t *testing.T) {
+	store := NewMemStore()
+	bus := NewMemBus()
+	enq := &captureEnq{}
+	elector := &toggleElector{leader: false}
+	wf := NewWorkflow(store, bus, enq)
+	wf.Elector = elector
+	wf.SweepCheckInterval = 50 * time.Millisecond
+	wf.SweepTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dagID := "paused-skip"
+
+	// Seed: meta=paused, step a=pending (ready to run, but skipped).
+	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusPaused}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+		DAGID: dagID, StepID: "a", FnName: "noopA",
+		Status: StatusPending, ArgsJSON: json.RawMessage(`[1]`),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	startScheduler(t, wf, ctx)
+
+	// Flip to leader immediately — sweep runs on first tick.
+	elector.set(true)
+
+	// Wait for multiple sweep ticks.
+	time.Sleep(400 * time.Millisecond)
+
+	// Meta should still be paused (not finalized — step a is pending).
+	m, _, _ := store.GetMeta(ctx, dagID)
+	if m.Status != DAGStatusPaused {
+		t.Errorf("want paused, got %s", m.Status)
+	}
+
+	// No enqueues — paused DAG skipped.
+	if enq.count() != 0 {
+		t.Errorf("expected 0 enqueues, got %d", enq.count())
+	}
+}
+
+// TestScheduler_Sweep_AutoFinalizesPausedDAG verifies that sweep
+// auto-finalizes a paused DAG when all steps are terminal (SG-03, D-17).
+func TestScheduler_Sweep_AutoFinalizesPausedDAG(t *testing.T) {
+	store := NewMemStore()
+	bus := NewMemBus()
+	enq := &captureEnq{}
+	elector := &toggleElector{leader: false}
+	wf := NewWorkflow(store, bus, enq)
+	wf.Elector = elector
+	wf.SweepCheckInterval = 50 * time.Millisecond
+	wf.SweepTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dagID := "paused-finalize"
+
+	// Seed: meta=paused, all steps done.
+	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusPaused}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+		DAGID: dagID, StepID: "a", FnName: "noopA",
+		Status: StatusDone, ArgsJSON: json.RawMessage(`[]`),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStep(ctx, dagID, "b", StepRecord{
+		DAGID: dagID, StepID: "b", FnName: "noopA",
+		Status: StatusDone, ArgsJSON: json.RawMessage(`[]`),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	startScheduler(t, wf, ctx)
+
+	// Flip to leader — sweep fires on first tick.
+	elector.set(true)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m, _, _ := store.GetMeta(ctx, dagID)
+		if m.Status == DAGStatusDone {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	m, _, _ := store.GetMeta(ctx, dagID)
+	if m.Status != DAGStatusDone {
+		t.Fatalf("after sweep: want done, got %s", m.Status)
+	}
+
+	if enq.count() != 0 {
+		t.Errorf("expected 0 enqueues, got %d", enq.count())
+	}
+}

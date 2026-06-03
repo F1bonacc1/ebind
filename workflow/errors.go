@@ -36,3 +36,9 @@ var ErrStaleRevision = errors.New("workflow: stale revision")
 // by a concurrent Cancel call). Callers handling newly-ready steps must not
 // proceed to enqueue.
 var errStepAlreadyTerminal = errors.New("workflow: step already terminal")
+
+// ErrDAGNotRunning is returned by Pause when the DAG is not in running status.
+var ErrDAGNotRunning = errors.New("workflow: DAG not running")
+
+// ErrDAGNotPaused is returned by Resume when the DAG is not in paused status.
+var ErrDAGNotPaused = errors.New("workflow: DAG not paused")
