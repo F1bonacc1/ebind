@@ -101,6 +101,105 @@ func TestCluster_FormsQuorum(t *testing.T) {
 	}
 }
 
+func TestCluster_RestartNode(t *testing.T) {
+	c, err := StartCluster(ClusterConfig{Size: 3, Name: "test-restart"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Shutdown()
+
+	waitClusterReady(t, c, 15*time.Second)
+
+	nc, err := nats.Connect(c.ClientURLs(), nats.ReconnectWait(100*time.Millisecond), nats.MaxReconnects(-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	s, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name:     "RESTART_TEST",
+		Subjects: []string{"rt.>"},
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	publishWithRetry(t, ctx, js, "rt.pre", []byte("before"), 15*time.Second)
+
+	victim := -1
+	for i, n := range c.Nodes {
+		if !n.srv.JetStreamIsLeader() {
+			victim = i
+			break
+		}
+	}
+	if victim < 0 {
+		t.Fatal("no follower to kill")
+	}
+	victimURL := c.Nodes[victim].ClientURL()
+	t.Logf("killing node %d (%s)", victim, victimURL)
+	c.ShutdownNode(victim)
+
+	publishWithRetry(t, ctx, js, "rt.during", []byte("degraded"), 15*time.Second)
+
+	if err := c.RestartNode(victim); err != nil {
+		t.Fatalf("restart node %d: %v", victim, err)
+	}
+	if got := c.Nodes[victim].ClientURL(); got != victimURL {
+		t.Fatalf("restarted node client URL changed: got %s, want %s", got, victimURL)
+	}
+	waitClusterReady(t, c, 30*time.Second)
+	if err := c.WaitNodeHealthy(victim, 60*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// A client that only knows the restarted node must be able to connect and
+	// use JetStream through it.
+	vnc, err := nats.Connect(victimURL)
+	if err != nil {
+		t.Fatalf("connect to restarted node: %v", err)
+	}
+	defer vnc.Close()
+	vjs, err := jetstream.New(vnc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishWithRetry(t, ctx, vjs, "rt.post", []byte("after"), 15*time.Second)
+
+	// The stream must converge back to 3 current replicas.
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		info, err := s.Info(ctx)
+		if err == nil && info.Cluster != nil && len(info.Cluster.Replicas) == 2 {
+			current := true
+			for _, r := range info.Cluster.Replicas {
+				if !r.Current {
+					current = false
+				}
+			}
+			if current {
+				if info.State.Msgs < 3 {
+					t.Errorf("want >=3 msgs in stream, got %d", info.State.Msgs)
+				}
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stream did not converge to 3 current replicas: %+v", info)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func TestCluster_SurvivesOneNodeLoss(t *testing.T) {
 	c, err := StartCluster(ClusterConfig{Size: 3, Name: "test-failover"})
 	if err != nil {

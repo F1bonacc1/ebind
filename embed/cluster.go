@@ -23,9 +23,10 @@ type ClusterConfig struct {
 }
 
 type Cluster struct {
-	Nodes []*Node
-	dir   string
-	owned bool // true if BaseDir was auto-created and we should clean it up
+	Nodes     []*Node
+	dir       string
+	owned     bool // true if BaseDir was auto-created and we should clean it up
+	readyWait time.Duration
 }
 
 // StartCluster spins up an in-process cluster of Size nodes on loopback with random free ports.
@@ -69,7 +70,7 @@ func StartCluster(cfg ClusterConfig) (*Cluster, error) {
 		return nil, err
 	}
 
-	cluster := &Cluster{dir: dir, owned: owned}
+	cluster := &Cluster{dir: dir, owned: owned, readyWait: cfg.ReadyWait}
 
 	// Phase 1: construct all servers and start them concurrently so routes can form
 	// before any single node commits to a singleton JetStream meta group.
@@ -103,13 +104,14 @@ func StartCluster(cfg ClusterConfig) (*Cluster, error) {
 			NoLog:     true,
 			NoSigs:    true,
 		}
+		pristine := opts.Clone()
 		srv, err := natsserver.NewServer(opts)
 		if err != nil {
 			cluster.Shutdown()
 			return nil, fmt.Errorf("embed: cluster node %d: %w", i, err)
 		}
 		servers[i] = srv
-		cluster.Nodes = append(cluster.Nodes, &Node{srv: srv, cfg: NodeConfig{
+		cluster.Nodes = append(cluster.Nodes, &Node{srv: srv, opts: pristine, cfg: NodeConfig{
 			ServerName: opts.ServerName,
 			Host:       opts.Host,
 			Port:       opts.Port,
@@ -167,6 +169,63 @@ func (c *Cluster) ShutdownNode(i int) {
 		return
 	}
 	c.Nodes[i].Shutdown()
+}
+
+// RestartNode stops node i (if running) and starts a fresh server with the
+// node's original options — same client port, cluster port, routes, and
+// StoreDir — so it rejoins the cluster and recovers its JetStream assets from
+// disk. Blocks until the new server accepts connections; use WaitNodeHealthy
+// to wait for JetStream raft groups to catch up.
+//
+// Not safe to call concurrently with other Cluster/Node methods.
+func (c *Cluster) RestartNode(i int) error {
+	if i < 0 || i >= len(c.Nodes) {
+		return fmt.Errorf("embed: restart node %d: index out of range", i)
+	}
+	n := c.Nodes[i]
+	if n.srv != nil && n.srv.Running() {
+		n.srv.Shutdown()
+		n.srv.WaitForShutdown()
+	}
+	// Rebinding the same client/cluster ports right after shutdown can race the
+	// OS releasing the listeners, so retry until the cluster's ready deadline.
+	deadline := time.Now().Add(c.readyWait)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		srv, err := natsserver.NewServer(n.opts.Clone())
+		if err != nil {
+			lastErr = err
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		go srv.Start()
+		if srv.ReadyForConnections(5 * time.Second) {
+			n.srv = srv
+			return nil
+		}
+		srv.Shutdown()
+		srv.WaitForShutdown()
+		lastErr = fmt.Errorf("embed: node %d did not become ready for connections", i)
+	}
+	return fmt.Errorf("embed: restart node %d within %s: %w", i, c.readyWait, lastErr)
+}
+
+// WaitNodeHealthy polls node i's health endpoint until JetStream reports ok —
+// meaning the node's raft groups have caught up after a (re)start — or the
+// timeout expires.
+func (c *Cluster) WaitNodeHealthy(i int, timeout time.Duration) error {
+	if i < 0 || i >= len(c.Nodes) {
+		return fmt.Errorf("embed: wait node %d healthy: index out of range", i)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		hs := c.Nodes[i].srv.Healthz(&natsserver.HealthzOptions{})
+		if hs != nil && hs.Status == "ok" {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("embed: node %d not healthy within %s", i, timeout)
 }
 
 // WaitReady blocks until the JetStream meta-leader is elected and the meta group
