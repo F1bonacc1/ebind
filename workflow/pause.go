@@ -10,13 +10,18 @@ import (
 // Pause requests a graceful pause of a running DAG. Uses step-level fencing:
 // pending steps are CAS-held before writing meta, so no concurrent enqueue can
 // sneak in between (Blocking Issue #1 fix). If the DAG has no in-flight steps
-// after holding, it transitions directly to paused. Otherwise transitions to
+// after fencing, it transitions directly to paused. Otherwise transitions to
 // pausing and the scheduler auto-transitions to paused when the last in-flight
 // step completes. Uses KV CAS with up to 5 retries on stale revision.
 //
 // Drain semantics: an in-flight (running) step is not interrupted — it keeps
 // its full retry chain, including backoff redeliveries, until it reaches a
 // terminal state. Pause only prevents NEW steps from being enqueued.
+//
+// Crash recovery: if the caller dies between fencing and the meta write, held
+// steps remain under a running meta and the DAG stalls. The scheduler sweep
+// auto-releases such orphaned holds after heldOrphanAge; retrying Pause (or
+// calling Resume) repairs the state immediately.
 //
 // Returns ErrDAGNotRunning if the DAG is not in a running state (including
 // already pausing/paused, done, failed, or canceled).
@@ -29,25 +34,13 @@ func Pause(ctx context.Context, wf *Workflow, dagID string) error {
 		if !(&DAGState{Meta: meta}).CanPause() {
 			return fmt.Errorf("ebind: cannot pause DAG %s: status is %s: %w", dagID, meta.Status, ErrDAGNotRunning)
 		}
-		steps, err := wf.Store.ListSteps(ctx, dagID)
+
+		inFlight, err := fencePendingSteps(ctx, wf.Store, dagID)
 		if err != nil {
 			return err
 		}
-		state := &DAGState{Meta: meta, Steps: make(map[string]StepRecord, len(steps))}
-		for _, s := range steps {
-			state.Steps[s.StepID] = s
-		}
 
-		// Step-level fencing: CAS-hold every pending step. If any CAS fails
-		// (concurrent enqueue won the race), retry from the top.
-		if err := holdPendingSteps(ctx, wf, dagID, state); err != nil {
-			if errors.Is(err, ErrStaleRevision) {
-				continue
-			}
-			return err
-		}
-
-		if state.HasInFlightSteps() {
+		if inFlight {
 			meta.Status = DAGStatusPausing
 		} else {
 			meta.Status = DAGStatusPaused
@@ -64,47 +57,78 @@ func Pause(ctx context.Context, wf *Workflow, dagID string) error {
 	return ErrStaleRevision
 }
 
-// holdPendingSteps CAS-writes Held=true on every pending step (status=pending, not
-// already terminal, not already held). Running/in-flight steps are left alone.
-// If any CAS fails, the caller retries Pause from the top. The scheduler's
-// persistStatus refuses held→running, so this fences against concurrent enqueue.
-func holdPendingSteps(ctx context.Context, wf *Workflow, dagID string, state *DAGState) error {
-	for id, step := range state.Steps {
-		if step.Status != StatusPending || step.Held {
-			continue
-		}
-		rec, rev, err := wf.Store.GetStep(ctx, dagID, id)
+// fencePendingSteps CAS-holds (Held=true) every pending step of the DAG and
+// reports whether any step is in flight (running). The scheduler's
+// persistStatus refuses held→running, so a held step can never be enqueued.
+//
+// It re-lists and repeats until a full pass changes nothing, so steps added
+// dynamically while the fence is being applied get fenced too. This converges
+// because a dynamic add (workflow.FromContext) is written strictly before its
+// adding handler completes: a pass that observes no running steps has
+// therefore also observed every add. The final stable pass decides in-flight.
+//
+// If the loop cannot stabilize within 5 passes (sustained concurrent writes),
+// it conservatively reports in-flight so callers treat the DAG as draining —
+// the next completion event or sweep retries the fence.
+func fencePendingSteps(ctx context.Context, store StateStore, dagID string) (bool, error) {
+	for pass := 0; pass < 5; pass++ {
+		steps, err := store.ListSteps(ctx, dagID)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if rec.Status != StatusPending {
-			// Started running (or finished) since our snapshot. Refresh the
-			// snapshot so HasInFlightSteps sees the live status — otherwise a
-			// pending→running transition in this window would let Pause go
-			// direct to paused while the step is still executing.
-			state.Steps[id] = rec
-			continue
+		inFlight := false
+		changed := false
+		for _, snap := range steps {
+			if snap.Status == StatusRunning {
+				inFlight = true
+				continue
+			}
+			if snap.Status != StatusPending || snap.Held {
+				continue
+			}
+			rec, rev, err := store.GetStep(ctx, dagID, snap.StepID)
+			if err != nil {
+				return false, err
+			}
+			if rec.Status == StatusRunning {
+				inFlight = true
+				continue
+			}
+			if rec.Status != StatusPending || rec.Held {
+				continue
+			}
+			rec.Held = true
+			rec.HeldAt = time.Now().UTC()
+			if err := store.PutStep(ctx, dagID, snap.StepID, rec, rev); err != nil {
+				if errors.Is(err, ErrStaleRevision) {
+					changed = true // concurrent writer; re-observe next pass
+					continue
+				}
+				return false, err
+			}
+			changed = true
 		}
-		rec.Held = true
-		if err := wf.Store.PutStep(ctx, dagID, id, rec, rev); err != nil {
-			return err
+		if !changed {
+			return inFlight, nil
 		}
-		state.Steps[id] = rec
 	}
-	return nil
+	return true, nil
 }
 
-// Resume resumes a paused (or pausing) DAG. Releases held steps back to
-// pending, transitions meta to running, then publishes EventResumed so the
+// Resume resumes a paused (or pausing) DAG. Transitions meta to running,
+// releases held steps back to pending, then publishes EventResumed so the
 // scheduler re-evaluates ready steps. Uses KV CAS with up to 5 retries on
 // stale revision.
 //
-// Idempotent: if meta is already running (e.g. prior publish failure), releases
-// any held steps and re-publishes EventResumed rather than returning an error.
-// This fixes the "stuck running" window described in Blocking Issue #5.
+// Idempotent: calling Resume on a DAG whose meta is already running succeeds —
+// it releases any held steps and re-publishes EventResumed. This makes a retry
+// after a partial failure (crash or publish error between the meta write and
+// the event publish) converge instead of failing with ErrDAGNotPaused, and
+// doubles as the immediate manual repair for holds orphaned by a crashed
+// Pause.
 //
-// Returns ErrDAGNotPaused if the DAG is not in a resumable state (running,
-// done, failed, canceled).
+// Returns ErrDAGNotPaused if the DAG is in a terminal state (done, failed,
+// canceled) or does not exist.
 func Resume(ctx context.Context, wf *Workflow, dagID string) error {
 	for attempt := 0; attempt < 5; attempt++ {
 		meta, rev, err := wf.Store.GetMeta(ctx, dagID)
@@ -168,6 +192,7 @@ func releaseHeldSteps(ctx context.Context, wf *Workflow, dagID string) error {
 				break // already released by concurrent writer
 			}
 			cur.Held = false
+			cur.HeldAt = time.Time{}
 			if err := wf.Store.PutStep(ctx, dagID, rec.StepID, cur, rev); err != nil {
 				if errors.Is(err, ErrStaleRevision) {
 					continue

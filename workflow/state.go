@@ -50,8 +50,9 @@ type StepRecord struct {
 	ErrorKind    string            `json:"error_kind,omitempty"`
 	ErrorMessage string            `json:"error_message,omitempty"`
 	Optional     bool              `json:"optional,omitempty"`
-	Held         bool              `json:"held,omitempty"`   // held by Pause(); prevents enqueue
-	Policy       *task.RetryPolicy `json:"policy,omitempty"` // per-step override
+	Held         bool              `json:"held,omitempty"`    // held by Pause(); prevents enqueue
+	HeldAt       time.Time         `json:"held_at,omitempty"` // when the hold was applied; age-gates orphan repair
+	Policy       *task.RetryPolicy `json:"policy,omitempty"`  // per-step override
 	Placement    *PlacementSpec    `json:"placement,omitempty"`
 	WorkerID     string            `json:"worker_id,omitempty"`
 	AddedAt      time.Time         `json:"added_at"`

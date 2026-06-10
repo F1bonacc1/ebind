@@ -112,13 +112,12 @@ func (s *Scheduler) sweep(ctx context.Context) error {
 			_ = err
 
 		case DAGStatusPausing:
-			// D-16: Recovery for leader crash while pausing — transition to paused.
-			state, err := s.loadState(ctx, dag.ID)
-			if err != nil {
-				continue
-			}
-			if state.HasInFlightSteps() {
-				continue // still draining; do nothing
+			// D-16: Recovery for leader crash while pausing — transition to
+			// paused. Re-fence first so dynamically-added stragglers are held
+			// and the in-flight decision is made on a fresh, stable view.
+			inFlight, err := fencePendingSteps(ctx, s.wf.Store, dag.ID)
+			if err != nil || inFlight {
+				continue // still draining (or transient error); retry next sweep
 			}
 			meta, rev, err := s.wf.Store.GetMeta(ctx, dag.ID)
 			if err != nil {
@@ -266,7 +265,17 @@ func (s *Scheduler) onCompleted(ctx context.Context, state *DAGState, ev Event) 
 	}
 
 	// ----- pausing→paused auto-transition (SG-04) -----
-	if state.Meta.Status == DAGStatusPausing && !state.HasInFlightSteps() {
+	if state.Meta.Status == DAGStatusPausing {
+		// Re-fence before declaring quiescence: steps added dynamically during
+		// the drain get held here, and the fresh observation (not the stale
+		// event-time snapshot) decides whether the drain is complete.
+		inFlight, err := fencePendingSteps(ctx, s.wf.Store, state.Meta.ID)
+		if err != nil {
+			return err
+		}
+		if inFlight {
+			return nil // still draining
+		}
 		meta, rev, err := s.wf.Store.GetMeta(ctx, state.Meta.ID)
 		if err != nil {
 			return err
