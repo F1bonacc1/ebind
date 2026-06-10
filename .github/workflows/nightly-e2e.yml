@@ -1,0 +1,32 @@
+name: Nightly E2E
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 02:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-soak:
+    name: Cluster chaos e2e x10 (flake hunt)
+    # Scheduled runs should only fire on the canonical repo, not forks.
+    if: github.repository == 'F1bonacc1/ebind'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run cluster e2e test 10x
+        run: make test-e2e E2E_COUNT=10 E2E_TIMEOUT=4500s

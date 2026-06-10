@@ -57,6 +57,22 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  e2e:
+    name: Cluster chaos e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run cluster e2e test
+        run: make test-e2e
+
   build:
     name: Build
     runs-on: ubuntu-latest
