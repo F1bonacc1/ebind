@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 // injectOnListStore simulates a dynamic step add (workflow.FromContext) racing
@@ -71,5 +72,93 @@ func TestPauseFence_DynamicAddDuringFence(t *testing.T) {
 		if rec.HeldAt.IsZero() {
 			t.Errorf("step %s: HeldAt must be stamped when holding", id)
 		}
+	}
+}
+
+// TestSweep_ReleasesOrphanedHolds verifies the sweep repairs a crash between
+// Pause's fence and its meta write: a stale hold under a running meta is
+// released and the step is enqueued in the same sweep pass.
+func TestSweep_ReleasesOrphanedHolds(t *testing.T) {
+	store := NewMemStore()
+	enq := &captureEnq{}
+	elector := &toggleElector{leader: false}
+	wf := NewWorkflow(store, NewMemBus(), enq)
+	wf.Elector = elector
+	wf.SweepCheckInterval = 20 * time.Millisecond
+	wf.SweepTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dagID := "orphan-hold"
+	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the crash leftover: pending step held long ago, meta running.
+	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending,
+		Held: true, HeldAt: time.Now().UTC().Add(-10 * time.Minute),
+		ArgsJSON: json.RawMessage(`[1]`),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	startScheduler(t, wf, ctx)
+	elector.set(true) // leadership edge -> sweep
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if enq.count() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if enq.count() < 1 {
+		rec, _, _ := store.GetStep(ctx, dagID, "a")
+		t.Fatalf("orphaned-held step was not repaired+enqueued by sweep (held=%v status=%s)", rec.Held, rec.Status)
+	}
+	rec, _, _ := store.GetStep(ctx, dagID, "a")
+	if rec.Held {
+		t.Error("hold must be released by the sweep repair")
+	}
+}
+
+// TestSweep_KeepsFreshHolds verifies the age gate: a hold placed moments ago
+// (an in-progress Pause) is NOT released by the sweep — releasing it would
+// reopen the lost-pause race.
+func TestSweep_KeepsFreshHolds(t *testing.T) {
+	store := NewMemStore()
+	enq := &captureEnq{}
+	elector := &toggleElector{leader: false}
+	wf := NewWorkflow(store, NewMemBus(), enq)
+	wf.Elector = elector
+	wf.SweepCheckInterval = 20 * time.Millisecond
+	wf.SweepTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dagID := "fresh-hold"
+	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending,
+		Held: true, HeldAt: time.Now().UTC(),
+		ArgsJSON: json.RawMessage(`[1]`),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	startScheduler(t, wf, ctx)
+	elector.set(true)
+
+	time.Sleep(300 * time.Millisecond) // several sweep ticks
+	rec, _, _ := store.GetStep(ctx, dagID, "a")
+	if !rec.Held {
+		t.Error("fresh hold must NOT be released by the sweep")
+	}
+	if got := enq.count(); got != 0 {
+		t.Errorf("held step must not be enqueued, got %d enqueues", got)
 	}
 }

@@ -105,6 +105,16 @@ func (s *Scheduler) sweep(ctx context.Context) error {
 			if err != nil {
 				continue
 			}
+			// Repair: a held step under a running meta means Pause crashed
+			// between fencing and its meta write (or Resume crashed between
+			// its meta write and releasing) — nothing else will ever release
+			// it and the DAG stalls. Age-gated so an in-progress Pause is
+			// never unfenced.
+			if s.releaseOrphanedHolds(ctx, dag.ID, state) {
+				if state, err = s.loadState(ctx, dag.ID); err != nil {
+					continue
+				}
+			}
 			s.mu.Lock()
 			ready := state.ReadyToRun()
 			err = s.enqueueReady(ctx, state, ready)
@@ -412,6 +422,40 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 		}
 	}
 	return ErrStaleRevision
+}
+
+// heldOrphanAge is how old a step hold must be before the sweep treats it as
+// orphaned (a crashed Pause/Resume) and releases it. Pause normally completes
+// in milliseconds, so holds under a running meta older than this have no
+// owner. Deliberately conservative: releasing a hold that a live Pause just
+// placed would reopen the lost-pause race.
+const heldOrphanAge = 2 * time.Minute
+
+// releaseOrphanedHolds CAS-releases held pending steps whose hold is older
+// than heldOrphanAge (zero HeldAt counts as ancient). Only called for DAGs
+// whose meta is running — holds under pausing/paused metas are owned by the
+// pause lifecycle and are released by Resume. Reports whether anything was
+// released so the caller can reload state before enqueueing.
+func (s *Scheduler) releaseOrphanedHolds(ctx context.Context, dagID string, state *DAGState) bool {
+	released := false
+	for id, snap := range state.Steps {
+		if !snap.Held || snap.Status != StatusPending {
+			continue
+		}
+		if !snap.HeldAt.IsZero() && time.Since(snap.HeldAt) < heldOrphanAge {
+			continue
+		}
+		rec, rev, err := s.wf.Store.GetStep(ctx, dagID, id)
+		if err != nil || !rec.Held || rec.Status != StatusPending {
+			continue
+		}
+		rec.Held = false
+		rec.HeldAt = time.Time{}
+		if err := s.wf.Store.PutStep(ctx, dagID, id, rec, rev); err == nil {
+			released = true
+		}
+	}
+	return released
 }
 
 // finalizeDAG transitions the DAG to its final status (done/failed) using
