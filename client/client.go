@@ -55,9 +55,12 @@ func New(ctx context.Context, nc *nats.Conn, opts Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("client: response stream %q missing (call stream.EnsureStreams first): %w", stream.ResponseStream, err)
 	}
-	// Ephemeral consumer: responses are per-client-process; on restart we'd start fresh.
+	// Durable consumer with an inactivity TTL: durables inherit the response
+	// stream's replica count, so in-flight Futures survive the loss of a single
+	// cluster node (a named ephemeral would be R=1 regardless of the stream).
+	// InactiveThreshold still garbage-collects it after the client goes away.
 	cons, err := respStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Name:              "ebind-resp-" + c.id,
+		Durable:           "ebind-resp-" + c.id,
 		FilterSubject:     stream.ResponseSubjectPrefix + c.id + ".>",
 		AckPolicy:         jetstream.AckExplicitPolicy,
 		DeliverPolicy:     jetstream.DeliverNewPolicy,
