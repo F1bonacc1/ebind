@@ -133,8 +133,12 @@ func WriteDebug(w io.Writer, dbg DAGDebug) error {
 	if dbg.TotalDuration > 0 {
 		totalStr = fmt.Sprintf("  total %s", humanDuration(dbg.TotalDuration))
 	}
-	if _, err := fmt.Fprintf(w, "DAG %s  [%s]%s%s\n",
-		dbg.Meta.ID, statusHeaderLabel(dbg.Meta.Status), ageStr, totalStr); err != nil {
+	pausedStr := ""
+	if !dbg.Meta.PausedAt.IsZero() {
+		pausedStr = fmt.Sprintf("  paused %s ago", humanDuration(time.Since(dbg.Meta.PausedAt)))
+	}
+	if _, err := fmt.Fprintf(w, "DAG %s  [%s]%s%s%s\n",
+		dbg.Meta.ID, statusHeaderLabel(dbg.Meta.Status), ageStr, pausedStr, totalStr); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(w, "  steps: %d done, %d failed, %d skipped, %d canceled, %d pending, %d running\n\n",
@@ -199,6 +203,10 @@ func statusHeaderLabel(s DAGStatus) string {
 		return "CANCELED"
 	case DAGStatusRunning:
 		return "RUNNING"
+	case DAGStatusPausing:
+		return "PAUSING"
+	case DAGStatusPaused:
+		return "PAUSED"
 	}
 	return string(s)
 }
@@ -232,6 +240,9 @@ func stepAnnotation(s StepDebug) string {
 	var parts []string
 	if s.Optional {
 		parts = append(parts, "optional")
+	}
+	if s.Held {
+		parts = append(parts, "held")
 	}
 	if s.Attempt > 1 {
 		parts = append(parts, fmt.Sprintf("attempts=%d", s.Attempt))

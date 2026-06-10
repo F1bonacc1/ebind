@@ -324,7 +324,7 @@ func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []s
 		// (e.g. workflow.Cancel) already wrote a terminal status, we must not
 		// enqueue the step — our snapshot of rec is stale.
 		if err := s.persistStatus(ctx, state.Meta.ID, id, StatusRunning); err != nil {
-			if errors.Is(err, errStepAlreadyTerminal) {
+			if errors.Is(err, errStepNotEnqueueable) {
 				continue
 			}
 			return err
@@ -371,9 +371,10 @@ func (s *Scheduler) snapshotUpstream(ctx context.Context, state *DAGState) (map[
 }
 
 // persistStatus CAS-updates a step's status in the store. Retries on stale.
-// Returns errStepAlreadyTerminal when the stored record is in a terminal state
-// that the requested status cannot override — callers must treat this as
-// "don't enqueue" rather than a silent no-op.
+// Returns errStepNotEnqueueable when the stored record is in a terminal state
+// that the requested status cannot override, or is held by Pause (held→running
+// refused — the step-level pause fence) — callers must treat this as "don't
+// enqueue" rather than a silent no-op.
 func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, status StepStatus) error {
 	for attempt := 0; attempt < 5; attempt++ {
 		rec, rev, err := s.wf.Store.GetStep(ctx, dagID, stepID)
@@ -384,10 +385,10 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 			return nil // already set
 		}
 		if rec.Held && status == StatusRunning {
-			return errStepAlreadyTerminal
+			return errStepNotEnqueueable
 		}
 		if rec.IsTerminal() && status != StatusSkipped {
-			return errStepAlreadyTerminal
+			return errStepNotEnqueueable
 		}
 		rec.Status = status
 		if status == StatusRunning && rec.StartedAt.IsZero() {

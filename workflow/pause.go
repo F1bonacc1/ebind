@@ -14,6 +14,10 @@ import (
 // pausing and the scheduler auto-transitions to paused when the last in-flight
 // step completes. Uses KV CAS with up to 5 retries on stale revision.
 //
+// Drain semantics: an in-flight (running) step is not interrupted — it keeps
+// its full retry chain, including backoff redeliveries, until it reaches a
+// terminal state. Pause only prevents NEW steps from being enqueued.
+//
 // Returns ErrDAGNotRunning if the DAG is not in a running state (including
 // already pausing/paused, done, failed, or canceled).
 func Pause(ctx context.Context, wf *Workflow, dagID string) error {
@@ -74,7 +78,12 @@ func holdPendingSteps(ctx context.Context, wf *Workflow, dagID string, state *DA
 			return err
 		}
 		if rec.Status != StatusPending {
-			continue // started running since our snapshot
+			// Started running (or finished) since our snapshot. Refresh the
+			// snapshot so HasInFlightSteps sees the live status — otherwise a
+			// pending→running transition in this window would let Pause go
+			// direct to paused while the step is still executing.
+			state.Steps[id] = rec
+			continue
 		}
 		rec.Held = true
 		if err := wf.Store.PutStep(ctx, dagID, id, rec, rev); err != nil {
