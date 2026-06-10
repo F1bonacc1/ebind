@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -305,24 +306,40 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 	// Before enqueueing, transition each root to Running + StartedAt so that
 	// every step in the system has a consistent lifecycle. Dependent steps
 	// receive the same transition via Scheduler.enqueueReady/persistStatus.
+	//
+	// A scheduler sweep can list this DAG between the step persist above and
+	// the CAS below, claim a ready root itself, and win the race — that is the
+	// documented one-wins-other-retries model, so a stale revision here means
+	// re-read and reassess, not fail the Submit.
 	for _, s := range d.steps {
 		if len(s.allDeps()) != 0 {
 			continue
 		}
-		// Get-then-Put so the rev we CAS against is always current, even if the
-		// initial persist step used different revision semantics.
-		cur, rev, err := wf.Store.GetStep(ctx, d.id, s.id)
-		if err != nil {
-			return fmt.Errorf("workflow: get root %q: %w", s.id, err)
-		}
-		cur.Status = StatusRunning
-		cur.StartedAt = time.Now().UTC()
-		if err := wf.Store.PutStep(ctx, d.id, s.id, cur, rev); err != nil {
-			return fmt.Errorf("workflow: mark root running %q: %w", s.id, err)
-		}
-		recs[s.id] = cur
-		if err := enqueueStep(ctx, wf.Enq, cur, recs, nil, nil); err != nil {
-			return fmt.Errorf("workflow: enqueue root %q: %w", s.id, err)
+		for attempt := 0; ; attempt++ {
+			cur, rev, err := wf.Store.GetStep(ctx, d.id, s.id)
+			if err != nil {
+				return fmt.Errorf("workflow: get root %q: %w", s.id, err)
+			}
+			if cur.Status != StatusPending || cur.Held {
+				// A concurrent writer (scheduler sweep, Cancel, Pause) already
+				// owns this root's lifecycle; it has enqueued the step or made
+				// it ineligible. Either way Submit must not enqueue it again.
+				recs[s.id] = cur
+				break
+			}
+			cur.Status = StatusRunning
+			cur.StartedAt = time.Now().UTC()
+			err = wf.Store.PutStep(ctx, d.id, s.id, cur, rev)
+			if err == nil {
+				recs[s.id] = cur
+				if err := enqueueStep(ctx, wf.Enq, cur, recs, nil, nil); err != nil {
+					return fmt.Errorf("workflow: enqueue root %q: %w", s.id, err)
+				}
+				break
+			}
+			if !errors.Is(err, ErrStaleRevision) || attempt >= 4 {
+				return fmt.Errorf("workflow: mark root running %q: %w", s.id, err)
+			}
 		}
 	}
 	return nil
