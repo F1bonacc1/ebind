@@ -19,6 +19,10 @@ type NodeConfig struct {
 type Node struct {
 	srv *natsserver.Server
 	cfg NodeConfig
+	// opts is a pristine copy of the server options captured before NewServer
+	// (which mutates options in place), so the node can be restarted with the
+	// same identity: ports, routes, and store dir.
+	opts *natsserver.Options
 }
 
 func StartNode(cfg NodeConfig) (*Node, error) {
@@ -37,6 +41,7 @@ func StartNode(cfg NodeConfig) (*Node, error) {
 		NoLog:      true,
 		NoSigs:     true,
 	}
+	pristine := opts.Clone()
 	srv, err := natsserver.NewServer(opts)
 	if err != nil {
 		return nil, fmt.Errorf("embed: new server: %w", err)
@@ -46,7 +51,7 @@ func StartNode(cfg NodeConfig) (*Node, error) {
 		srv.Shutdown()
 		return nil, fmt.Errorf("embed: server not ready within %s", cfg.ReadyWait)
 	}
-	return &Node{srv: srv, cfg: cfg}, nil
+	return &Node{srv: srv, cfg: cfg, opts: pristine}, nil
 }
 
 func (n *Node) ClientURL() string { return n.srv.ClientURL() }

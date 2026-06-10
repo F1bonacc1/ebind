@@ -34,6 +34,13 @@ test-v: ## Run all tests verbosely
 test-count: ## Run tests 3x to catch flakes
 	$(GO) test -race -count=3 -timeout 300s $(PKGS)
 
+E2E_COUNT ?= 1
+E2E_TIMEOUT ?= 600s
+
+.PHONY: test-e2e
+test-e2e: ## Run the cluster chaos e2e test (3-node embedded NATS; E2E_COUNT=n to repeat)
+	$(GO) test -race -tags e2e -count=$(E2E_COUNT) -timeout $(E2E_TIMEOUT) -v ./e2e/
+
 .PHONY: bench
 bench: ## Run benchmarks
 	$(GO) test -run=- -bench=. -benchmem $(PKGS)

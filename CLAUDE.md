@@ -130,12 +130,15 @@ cmd/ebctl/               operator CLI (cobra)
   - `worker/worker_test.go`, `workflow/integration_test.go`
 - **Cluster integration** — 3-node in-process cluster:
   - `embed/cluster_test.go`
+- **Cluster chaos e2e** (build tag `e2e`, excluded from `make test`) — every supported operation on a 3-node cluster at R=3, with node kill + restart injected mid-workflow:
+  - `e2e/cluster_e2e_test.go`
 
 Run patterns:
 ```sh
 make test              # all tests with -race
 make test-short        # unit-only
 make test-count        # 3× runs (flake hunt)
+make test-e2e          # cluster chaos e2e (~2 min, tag-gated)
 make cover             # HTML coverage
 ```
 
