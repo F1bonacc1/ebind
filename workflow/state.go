@@ -15,6 +15,8 @@ const (
 	DAGStatusDone     DAGStatus = "done"
 	DAGStatusFailed   DAGStatus = "failed"
 	DAGStatusCanceled DAGStatus = "canceled"
+	DAGStatusPausing  DAGStatus = "pausing"
+	DAGStatusPaused   DAGStatus = "paused"
 )
 
 // DAGMeta is the meta record stored in the state store (key: <dag_id>/meta).
@@ -23,6 +25,7 @@ type DAGMeta struct {
 	Status        DAGStatus         `json:"status"`
 	CreatedAt     time.Time         `json:"created_at"`
 	DefaultPolicy *task.RetryPolicy `json:"default_policy,omitempty"`
+	PausedAt      time.Time         `json:"paused_at,omitempty"`
 	TerminalSteps []string          `json:"terminal_steps,omitempty"`
 }
 
@@ -47,7 +50,9 @@ type StepRecord struct {
 	ErrorKind    string            `json:"error_kind,omitempty"`
 	ErrorMessage string            `json:"error_message,omitempty"`
 	Optional     bool              `json:"optional,omitempty"`
-	Policy       *task.RetryPolicy `json:"policy,omitempty"` // per-step override
+	Held         bool              `json:"held,omitempty"`    // held by Pause(); prevents enqueue
+	HeldAt       time.Time         `json:"held_at,omitempty"` // when the hold was applied; age-gates orphan repair
+	Policy       *task.RetryPolicy `json:"policy,omitempty"`  // per-step override
 	Placement    *PlacementSpec    `json:"placement,omitempty"`
 	WorkerID     string            `json:"worker_id,omitempty"`
 	AddedAt      time.Time         `json:"added_at"`
@@ -68,11 +73,12 @@ type DAGState struct {
 }
 
 // ReadyToRun returns step IDs whose deps are all `done` (or satisfied-via-default)
-// and whose status is `pending`. Used after MarkDone/MarkFailed to find next work.
+// and whose status is `pending` and not held. Used after MarkDone/MarkFailed to
+// find next work. Held steps are excluded — they are reserved by Pause().
 func (s *DAGState) ReadyToRun() []string {
 	var out []string
 	for id, step := range s.Steps {
-		if step.Status != StatusPending {
+		if step.Status != StatusPending || step.Held {
 			continue
 		}
 		if s.depsSatisfied(step) {
@@ -80,6 +86,56 @@ func (s *DAGState) ReadyToRun() []string {
 		}
 	}
 	return out
+}
+
+// HasInFlightSteps returns true if any step in the DAG is currently running.
+// Used to determine whether pausing can skip directly to paused.
+func (s *DAGState) HasInFlightSteps() bool {
+	for _, step := range s.Steps {
+		if step.Status == StatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
+// AllStepsTerminal returns true when every step in the DAG is in a terminal
+// status (done/failed/skipped/canceled). Returns false if there are no steps.
+func (s *DAGState) AllStepsTerminal() bool {
+	if len(s.Steps) == 0 {
+		return false
+	}
+	for _, step := range s.Steps {
+		if !step.IsTerminal() {
+			return false
+		}
+	}
+	return true
+}
+
+// DeriveFinalStatus returns the overall DAG final status based on step results.
+// Only meaningful when AllStepsTerminal() is true.
+// Returns DAGStatusFailed if any non-optional step is failed or skipped,
+// otherwise DAGStatusDone.
+func (s *DAGState) DeriveFinalStatus() DAGStatus {
+	for _, step := range s.Steps {
+		if !step.Optional && (step.Status == StatusFailed || step.Status == StatusSkipped) {
+			return DAGStatusFailed
+		}
+	}
+	return DAGStatusDone
+}
+
+// CanPause returns true if the DAG can accept a pause request.
+// Must be running (not already pausing/paused/terminal).
+func (s *DAGState) CanPause() bool {
+	return s.Meta.Status == DAGStatusRunning
+}
+
+// CanResume returns true if the DAG can accept a resume request.
+// Must be paused or pausing.
+func (s *DAGState) CanResume() bool {
+	return s.Meta.Status == DAGStatusPaused || s.Meta.Status == DAGStatusPausing
 }
 
 // depsSatisfied: all deps (required + optional) are terminal (done/failed/skipped).
@@ -231,6 +287,9 @@ func (s *DAGState) Terminal() (DAGStatus, bool) {
 	}
 	if s.Meta.Status == DAGStatusCanceled {
 		return DAGStatusCanceled, true
+	}
+	if s.Meta.Status == DAGStatusPausing || s.Meta.Status == DAGStatusPaused {
+		return DAGStatusRunning, false
 	}
 	if hasFailure {
 		return DAGStatusFailed, true

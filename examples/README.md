@@ -32,6 +32,7 @@ go run ./examples/07-workflow-fanout
 | 11 | [`11-workflow-resume`](./11-workflow-resume) | Resume `Await` from a different process using `AwaitByID[T]` with `(dagID, stepID)` |
 | 12 | [`12-workflow-placement`](./12-workflow-placement) | `OnTarget`, `ColocateWith`, `FollowTargetOf`, and dynamic `ColocateHere()` across two workers |
 | 13 | [`13-workflow-cancel`](./13-workflow-cancel) | Cancel a DAG durably: running work may finish, pending downstream work is canceled |
+| 14 | [`14-workflow-pause-resume`](./14-workflow-pause-resume) | Pause a DAG gracefully: in-flight steps drain, pending steps are fenced; `Resume` continues where it left off |
 
 ## Reading order
 
@@ -40,7 +41,7 @@ If you're new to ebind, walk the examples in order — each adds one concept on 
 1. **01 → 03**: basic task queue mechanics
 2. **04**: HA deployment topology
 3. **05**: extending the worker pipeline
-4. **06 → 13**: workflow layer, from simple linear to dynamic placement and cancellation
+4. **06 → 14**: workflow layer, from simple linear to dynamic placement, cancellation, and pause/resume
 
 ## Common shape
 

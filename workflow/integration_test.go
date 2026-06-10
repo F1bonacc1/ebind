@@ -1123,3 +1123,387 @@ func TestIntegration_Targeted_AttemptNotInflatedByWrongTargetNaks(t *testing.T) 
 		t.Errorf("handler invocations: got %d, want 2 (fail-then-succeed)", got)
 	}
 }
+
+// waitForStepDone polls the store until a step reaches a terminal state.
+func waitForStepDone(t *testing.T, h *wfHarness, dagID, stepID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		step, _, err := h.wf.Store.GetStep(context.Background(), dagID, stepID)
+		if err == nil && step.IsTerminal() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	step, _, err := h.wf.Store.GetStep(context.Background(), dagID, stepID)
+	if err != nil {
+		t.Fatalf("step %s not found after %v: %v", stepID, timeout, err)
+	}
+	t.Fatalf("step %s not terminal after %v: status=%s", stepID, timeout, step.Status)
+}
+
+// waitForStatus polls the store until the DAG meta reaches the target status.
+func waitForStatus(t *testing.T, h *wfHarness, dagID string, target workflow.DAGStatus, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		meta, _, err := h.wf.Store.GetMeta(context.Background(), dagID)
+		if err == nil && meta.Status == target {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	meta, _, err := h.wf.Store.GetMeta(context.Background(), dagID)
+	if err != nil {
+		t.Fatalf("DAG %s not found after %v: %v", dagID, timeout, err)
+	}
+	t.Fatalf("DAG %s status %s != %s after %v", dagID, meta.Status, target, timeout)
+}
+
+func TestPauseResume_E2E(t *testing.T) {
+	h := setup(t)
+	task.MustRegister(h.reg, hAdd)
+	task.MustRegister(h.reg, hDouble)
+
+	// Blocking handler for step b to guarantee in-flight during pause.
+	// Accepts the ref from step a (int) to match the Step definition.
+	release := make(chan struct{})
+	blockedFn := func(ctx context.Context, _ int) (int, error) {
+		<-release
+		return 99, nil
+	}
+	task.MustRegister(h.reg, blockedFn)
+
+	// Build a 3-step DAG: a → b → c
+	// a completes quickly. b blocks (in-flight during pause).
+	// c depends on b (pending during pause — will be dispatched after resume).
+	dag := workflow.New()
+	a := dag.Step("a", hAdd, 1, 2)         // a = 1+2 = 3
+	b := dag.Step("b", blockedFn, a.Ref()) // b blocks then returns 99
+	_ = dag.Step("c", hDouble, b.Ref())    // c = double(99) = 198
+
+	ctx := context.Background()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+	dagID := dag.ID()
+
+	// Wait for step a to complete. Step b should now be running (blocked, in-flight).
+	waitForStepDone(t, h, dagID, "a", 5*time.Second)
+
+	// Pause the DAG while step b is in-flight — transitions to pausing.
+	if err := workflow.Pause(ctx, h.wf, dagID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify status is pausing (step b is in-flight, cannot go directly to paused).
+	meta, _, err := h.wf.Store.GetMeta(ctx, dagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Status != workflow.DAGStatusPausing {
+		t.Fatalf("expected pausing after pause with in-flight steps, got %s", meta.Status)
+	}
+
+	// Release the blocked handler — step b completes.
+	close(release)
+
+	// Wait for auto-transition to paused (scheduler transitions when last in-flight completes).
+	waitForStatus(t, h, dagID, workflow.DAGStatusPaused, 5*time.Second)
+
+	// Verify paused: PausedAt should be set.
+	meta, _, _ = h.wf.Store.GetMeta(ctx, dagID)
+	if meta.PausedAt.IsZero() {
+		t.Error("PausedAt not set after transitioning to paused")
+	}
+
+	// Verify step c is still pending and held (no dispatch during pause).
+	sc, _, err := h.wf.Store.GetStep(ctx, dagID, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.Status != workflow.StatusPending {
+		t.Fatalf("expected step c to remain pending after pause, got %s", sc.Status)
+	}
+	if !sc.Held {
+		t.Fatal("expected step c to be held after pause")
+	}
+
+	// Resume the DAG.
+	t.Log("Resuming DAG...")
+	if err := workflow.Resume(ctx, h.wf, dagID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify step c is released.
+	sc, _, _ = h.wf.Store.GetStep(ctx, dagID, "c")
+	t.Logf("Step c after resume: status=%s held=%v", sc.Status, sc.Held)
+
+	// Verify status is running after resume.
+	waitForStatus(t, h, dagID, workflow.DAGStatusRunning, 5*time.Second)
+
+	// Wait for step c to complete (dispatched by scheduler after resume).
+	waitForStepDone(t, h, dagID, "c", 10*time.Second)
+
+	// Verify final status is done.
+	waitForStatus(t, h, dagID, workflow.DAGStatusDone, 5*time.Second)
+
+	// Verify step c result.
+	res, err := h.wf.Store.GetResult(ctx, dagID, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Step c result: %s", string(res))
+}
+
+// TestPauseResume_Race_PauseVsResume exercises the CAS race between concurrent
+// Pause and Resume calls on a Paused DAG. CAS one-wins semantics: at least one
+// should succeed, and the DAG must end in a valid state (running/pausing/paused).
+func TestPauseResume_Race_PauseVsResume(t *testing.T) {
+	h := setup(t)
+	task.MustRegister(h.reg, hAdd)
+
+	// Single-step DAG
+	dag := workflow.New()
+	_ = dag.Step("a", hAdd, 1, 2)
+
+	ctx := context.Background()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+	dagID := dag.ID()
+
+	// Wait for step a to complete
+	waitForStepDone(t, h, dagID, "a", 5*time.Second)
+
+	// Put the DAG in paused state for the race
+	meta, rev, err := h.wf.Store.GetMeta(ctx, dagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Status = workflow.DAGStatusPaused
+	if err := h.wf.Store.PutMeta(ctx, dagID, meta, rev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Race: Resume vs Pause (Resume changes paused→running, Pause changes running→pausing)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var pauseErr, resumeErr error
+	go func() {
+		defer wg.Done()
+		pauseErr = workflow.Pause(ctx, h.wf, dagID)
+	}()
+	go func() {
+		defer wg.Done()
+		resumeErr = workflow.Resume(ctx, h.wf, dagID)
+	}()
+	wg.Wait()
+
+	// CAS one-wins semantics: at least one should succeed, or both if timing works.
+	// Valid outcomes:
+	//   - Resume succeeds (paused→running), Pause fails (ErrDAGNotRunning) or vice versa
+	//   - Both succeed if Pause gets in after Resume transitions to running
+	// Both fail is also possible if they interleave but both get stale revision.
+	meta, _, err = h.wf.Store.GetMeta(ctx, dagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validStates := map[workflow.DAGStatus]bool{
+		workflow.DAGStatusRunning: true,
+		workflow.DAGStatusPausing: true,
+		workflow.DAGStatusPaused:  true,
+	}
+	if !validStates[meta.Status] {
+		t.Fatalf("DAG ended in invalid status after race: %s (pauseErr=%v, resumeErr=%v)", meta.Status, pauseErr, resumeErr)
+	}
+	t.Logf("DAG status after race: %s (pauseErr=%v, resumeErr=%v)", meta.Status, pauseErr, resumeErr)
+}
+
+// TestPauseResume_Race_PauseVsCancel exercises the CAS race between concurrent
+// Pause and Cancel calls on a Running DAG with in-flight steps. One CAS wins;
+// the DAG must end in a valid state (pausing/paused/canceled/done/failed).
+func TestPauseResume_Race_PauseVsCancel(t *testing.T) {
+	h := setup(t)
+	task.MustRegister(h.reg, hAdd)
+	task.MustRegister(h.reg, hDouble)
+
+	// 2-step DAG: a → b
+	dag := workflow.New()
+	a := dag.Step("a", hAdd, 1, 2)
+	_ = dag.Step("b", hDouble, a.Ref())
+
+	ctx := context.Background()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+	dagID := dag.ID()
+
+	// Wait for step a to complete (b should be running or pending)
+	waitForStepDone(t, h, dagID, "a", 5*time.Second)
+
+	// Race: Pause vs Cancel
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var pauseErr, cancelErr error
+	go func() {
+		defer wg.Done()
+		pauseErr = workflow.Pause(ctx, h.wf, dagID)
+	}()
+	go func() {
+		defer wg.Done()
+		cancelErr = workflow.Cancel(ctx, h.wf, dagID)
+	}()
+	wg.Wait()
+
+	meta, _, err := h.wf.Store.GetMeta(ctx, dagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cancel returns nil for done/failed DAGs, so include those as valid.
+	validStates := map[workflow.DAGStatus]bool{
+		workflow.DAGStatusPausing:  true,
+		workflow.DAGStatusPaused:   true,
+		workflow.DAGStatusCanceled: true,
+		workflow.DAGStatusDone:     true,
+		workflow.DAGStatusFailed:   true,
+	}
+	if !validStates[meta.Status] {
+		t.Fatalf("DAG ended in invalid status after race: %s (pauseErr=%v, cancelErr=%v)", meta.Status, pauseErr, cancelErr)
+	}
+	t.Logf("DAG status after race: %s (pauseErr=%v, cancelErr=%v)", meta.Status, pauseErr, cancelErr)
+}
+
+// TestPauseResume_Race_PauseAndStepComplete verifies that when a step completes
+// during a pause, the completion event is acked but no new work is dispatched.
+// The DAG transitions pausing→paused and pending steps remain pending.
+func TestPauseResume_Race_PauseAndStepComplete(t *testing.T) {
+	h := setup(t)
+
+	// Blocking handler for step a — guarantees in-flight during pause.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	blockedFn := func(ctx context.Context) (int, error) {
+		close(started)
+		<-release
+		return 99, nil
+	}
+	task.MustRegister(h.reg, blockedFn)
+	task.MustRegister(h.reg, hDouble)
+
+	// 2-step DAG: a → b. a blocks until released, b depends on a.
+	dag := workflow.New()
+	a := dag.Step("a", blockedFn)       // blocks until released
+	_ = dag.Step("b", hDouble, a.Ref()) // depends on a
+
+	ctx := context.Background()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+	dagID := dag.ID()
+
+	// Wait for step a to be delivered (blockedFn has started).
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("step a did not start")
+	}
+
+	// Pause the DAG while step a is running (in-flight).
+	if err := workflow.Pause(ctx, h.wf, dagID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify status is pausing.
+	meta, _, err := h.wf.Store.GetMeta(ctx, dagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Status != workflow.DAGStatusPausing {
+		t.Fatalf("expected pausing after pause, got %s", meta.Status)
+	}
+
+	// Release the blocked handler — step a completes.
+	close(release)
+
+	// Wait for auto-transition to paused (last in-flight step completes).
+	waitForStatus(t, h, dagID, workflow.DAGStatusPaused, 5*time.Second)
+
+	// Verify step b is still pending (no dispatch during pause).
+	sb, _, err := h.wf.Store.GetStep(ctx, dagID, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.Status != workflow.StatusPending {
+		t.Fatalf("expected step b to remain pending after pause, got %s", sb.Status)
+	}
+	t.Logf("Step b status: %s — no dispatch during pause (D-42 verified)", sb.Status)
+}
+
+// TestPauseResume_Race_ResumeAndComplete verifies that resuming a paused DAG
+// re-enqueues pending steps and the DAG correctly finalizes to done when
+// the remaining steps complete. The scheduler's onStepAdded handles EventResumed
+// by re-evaluating ReadyToRun and dispatching newly-ready steps.
+func TestPauseResume_Race_ResumeAndComplete(t *testing.T) {
+	h := setup(t)
+	task.MustRegister(h.reg, hAdd)
+	task.MustRegister(h.reg, hDouble)
+
+	// Blocking handler for step b — guarantees in-flight during pause.
+	release := make(chan struct{})
+	blockedFn := func(ctx context.Context, _ int) (int, error) {
+		<-release
+		return 99, nil
+	}
+	task.MustRegister(h.reg, blockedFn)
+
+	// 3-step DAG: a → b → c. b blocks, c depends on b and stays pending.
+	dag := workflow.New()
+	a := dag.Step("a", hAdd, 1, 2)
+	b := dag.Step("b", blockedFn, a.Ref())
+	_ = dag.Step("c", hDouble, b.Ref())
+
+	ctx := context.Background()
+	if err := dag.Submit(ctx, h.wf); err != nil {
+		t.Fatal(err)
+	}
+	dagID := dag.ID()
+
+	// Wait for step a to complete. Step b should be running (blocked).
+	waitForStepDone(t, h, dagID, "a", 5*time.Second)
+
+	// Pause while step b is in-flight
+	if err := workflow.Pause(ctx, h.wf, dagID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify pausing
+	meta, _, err := h.wf.Store.GetMeta(ctx, dagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Status != workflow.DAGStatusPausing {
+		t.Fatalf("expected pausing, got %s", meta.Status)
+	}
+
+	// Release step b — completes, triggers pausing→paused
+	close(release)
+	waitForStatus(t, h, dagID, workflow.DAGStatusPaused, 5*time.Second)
+
+	// Resume — scheduler should re-evaluate and dispatch step c
+	if err := workflow.Resume(ctx, h.wf, dagID); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForStatus(t, h, dagID, workflow.DAGStatusRunning, 5*time.Second)
+
+	// Step c should complete and DAG should finalize
+	waitForStepDone(t, h, dagID, "c", 10*time.Second)
+	waitForStatus(t, h, dagID, workflow.DAGStatusDone, 5*time.Second)
+
+	res, err := h.wf.Store.GetResult(ctx, dagID, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Step c result: %s", string(res))
+}

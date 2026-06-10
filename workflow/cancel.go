@@ -18,6 +18,8 @@ func Cancel(ctx context.Context, wf *Workflow, dagID string) error {
 		switch meta.Status {
 		case DAGStatusDone, DAGStatusFailed, DAGStatusCanceled:
 			return nil
+		case DAGStatusPausing, DAGStatusPaused:
+			// Explicit fallthrough — cancel transitions pause states to canceled
 		}
 		meta.Status = DAGStatusCanceled
 		if err := wf.Store.PutMeta(ctx, dagID, meta, rev); err != nil {

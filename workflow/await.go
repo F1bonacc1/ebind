@@ -17,6 +17,11 @@ import (
 //   - ErrStepSkipped if the step was skipped (upstream cascade)
 //   - context error if ctx expires before resolution
 //
+// Note: if the DAG is paused, a pending step will never produce a result until
+// the DAG is resumed — Await blocks until ctx expiry in that case. Callers that
+// need to distinguish "paused" from "slow" should check the DAG status via
+// Store.GetMeta before (or while) awaiting.
+//
 // Await is a thin wrapper over AwaitByID; prefer AwaitByID when the caller
 // does not own the *Step handle (e.g., a different process resuming a DAG).
 func Await[T any](ctx context.Context, wf *Workflow, dagID string, step *Step) (T, error) {

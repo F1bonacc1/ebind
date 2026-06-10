@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -137,6 +138,229 @@ func TestDlqEmpty(t *testing.T) {
 	}
 }
 
+func TestDagPause(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1, AckWait: time.Second})
+	c := newTestCtx(t, h, "pretty")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed a running DAG
+	const dagID = "dag-pause-test"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute: ebctl dag pause <dag-id>
+	dagRoot := cmddag.NewCmd(c)
+	var buf bytes.Buffer
+	dagRoot.SetOut(&buf)
+	dagRoot.SetArgs([]string{"pause", dagID})
+	if err := dagRoot.Execute(); err != nil {
+		t.Fatalf("dag pause: %v", err)
+	}
+
+	// Verify output
+	output := strings.TrimSpace(buf.String())
+	expected := fmt.Sprintf("paused %s", dagID)
+	if output != expected {
+		t.Errorf("expected output %q, got %q", expected, output)
+	}
+
+	// Verify DAG status transitioned
+	meta, _, err := wf.Store.GetMeta(ctx, dagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should be pausing or paused (no in-flight steps)
+	if meta.Status != workflow.DAGStatusPausing && meta.Status != workflow.DAGStatusPaused {
+		t.Errorf("expected pausing or paused, got %s", meta.Status)
+	}
+}
+
+func TestDagResume(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1, AckWait: time.Second})
+	c := newTestCtx(t, h, "pretty")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed a paused DAG
+	const dagID = "dag-resume-test"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusPaused, CreatedAt: time.Now().UTC(), PausedAt: time.Now().UTC(),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute: ebctl dag resume <dag-id>
+	dagRoot := cmddag.NewCmd(c)
+	var buf bytes.Buffer
+	dagRoot.SetOut(&buf)
+	dagRoot.SetArgs([]string{"resume", dagID})
+	if err := dagRoot.Execute(); err != nil {
+		t.Fatalf("dag resume: %v", err)
+	}
+
+	// Verify output
+	output := strings.TrimSpace(buf.String())
+	expected := fmt.Sprintf("resumed %s", dagID)
+	if output != expected {
+		t.Errorf("expected output %q, got %q", expected, output)
+	}
+
+	// Verify DAG status transitioned
+	meta, _, err := wf.Store.GetMeta(ctx, dagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Status != workflow.DAGStatusRunning {
+		t.Errorf("expected running, got %s", meta.Status)
+	}
+}
+
+func TestDagPause_InvalidState(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "pretty")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test pause on a DAG that is already done
+	const dagID = "dag-pause-invalid"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusDone, CreatedAt: time.Now().UTC(),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	dagRoot := cmddag.NewCmd(c)
+	var buf bytes.Buffer
+	dagRoot.SetOut(&buf)
+	dagRoot.SetArgs([]string{"pause", dagID})
+	err = dagRoot.Execute()
+	if err == nil {
+		t.Fatal("expected error for pause on done DAG")
+	}
+	// Error should contain dagID and current status (from the wrapped API error)
+	if !strings.Contains(err.Error(), dagID) {
+		t.Errorf("error missing dagID: %v", err)
+	}
+	if !strings.Contains(err.Error(), "done") {
+		t.Errorf("error missing status 'done': %v", err)
+	}
+}
+
+func TestDagResume_InvalidState(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "pretty")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test resume on a done DAG — terminal states reject resume.
+	// (Resume on a running DAG is idempotent and succeeds by design.)
+	const dagID = "dag-resume-invalid"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusDone, CreatedAt: time.Now().UTC(),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	dagRoot := cmddag.NewCmd(c)
+	var buf bytes.Buffer
+	dagRoot.SetOut(&buf)
+	dagRoot.SetArgs([]string{"resume", dagID})
+	err = dagRoot.Execute()
+	if err == nil {
+		t.Fatal("expected error for resume on done DAG")
+	}
+	// Error should contain dagID and current status
+	if !strings.Contains(err.Error(), dagID) {
+		t.Errorf("error missing dagID: %v", err)
+	}
+	if !strings.Contains(err.Error(), "done") {
+		t.Errorf("error missing status 'done': %v", err)
+	}
+}
+
+func TestDagLs_StatusFilterPaused(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed two DAGs: one running, one paused
+	runningID := "dag-ls-running"
+	pausedID := "dag-ls-paused"
+	if err := wf.Store.PutMeta(ctx, runningID, workflow.DAGMeta{
+		ID: runningID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.Store.PutMeta(ctx, pausedID, workflow.DAGMeta{
+		ID: pausedID, Status: workflow.DAGStatusPaused, CreatedAt: time.Now().UTC(),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test: ebctl dag ls --status paused — must show only the paused DAG
+	dagRoot := cmddag.NewCmd(c)
+	var buf bytes.Buffer
+	dagRoot.SetOut(&buf)
+	dagRoot.SetArgs([]string{"ls", "--status", "paused"})
+	if err := dagRoot.Execute(); err != nil {
+		t.Fatalf("dag ls --status paused: %v", err)
+	}
+
+	raw := buf.Bytes()
+	if !jsonRowsContain(t, raw, "id", pausedID) {
+		t.Errorf("dag ls --status paused should include %s:\n%s", pausedID, string(raw))
+	}
+	if jsonRowsContain(t, raw, "id", runningID) {
+		t.Errorf("dag ls --status paused should NOT include %s:\n%s", runningID, string(raw))
+	}
+
+	// Test: ebctl dag ls without filter — both should show
+	dagRoot2 := cmddag.NewCmd(c)
+	var buf2 bytes.Buffer
+	dagRoot2.SetOut(&buf2)
+	dagRoot2.SetArgs([]string{"ls"})
+	if err := dagRoot2.Execute(); err != nil {
+		t.Fatalf("dag ls: %v", err)
+	}
+	raw2 := buf2.Bytes()
+	if !jsonRowsContain(t, raw2, "id", runningID) {
+		t.Errorf("dag ls should include %s:\n%s", runningID, string(raw2))
+	}
+	if !jsonRowsContain(t, raw2, "id", pausedID) {
+		t.Errorf("dag ls should include %s:\n%s", pausedID, string(raw2))
+	}
+}
+
 // jsonRowsContain is a readability helper — looks for a key/value pair inside
 // the printed JSON array. Used to keep assertion intent close to the test body.
 func jsonRowsContain(t *testing.T, raw []byte, key, val string) bool {
@@ -146,7 +370,7 @@ func jsonRowsContain(t *testing.T, raw []byte, key, val string) bool {
 		return false
 	}
 	for _, r := range rows {
-		if fmt, ok := r[key]; ok && fmt == val {
+		if v, ok := r[key]; ok && v == val {
 			return true
 		}
 	}

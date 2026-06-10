@@ -31,8 +31,15 @@ var ErrDuplicateStep = errors.New("workflow: duplicate step ID")
 // ErrStaleRevision is returned by stores when a CAS operation finds a newer revision.
 var ErrStaleRevision = errors.New("workflow: stale revision")
 
-// errStepAlreadyTerminal is an internal sentinel returned by persistStatus when
-// the step record in the store is already in a terminal state (e.g. canceled
-// by a concurrent Cancel call). Callers handling newly-ready steps must not
-// proceed to enqueue.
-var errStepAlreadyTerminal = errors.New("workflow: step already terminal")
+// errStepNotEnqueueable is an internal sentinel returned by persistStatus when
+// the step record in the store cannot transition to the requested status:
+// either it is already terminal (e.g. canceled by a concurrent Cancel call) or
+// it is held by a concurrent Pause (held→running is refused — the step-level
+// pause fence). Callers handling newly-ready steps must not proceed to enqueue.
+var errStepNotEnqueueable = errors.New("workflow: step not enqueueable")
+
+// ErrDAGNotRunning is returned by Pause when the DAG is not in running status.
+var ErrDAGNotRunning = errors.New("workflow: DAG not running")
+
+// ErrDAGNotPaused is returned by Resume when the DAG is not in paused status.
+var ErrDAGNotPaused = errors.New("workflow: DAG not paused")

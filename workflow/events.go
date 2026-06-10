@@ -6,12 +6,14 @@ import (
 	"fmt"
 )
 
-// EventKind distinguishes the two scheduler-relevant events.
+// EventKind distinguishes the scheduler-relevant event types.
 type EventKind string
 
 const (
 	EventCompleted EventKind = "completed"
 	EventStepAdded EventKind = "step_added"
+	// EventResumed is published by Resume() to trigger step re-evaluation in the scheduler.
+	EventResumed EventKind = "resumed"
 )
 
 // Event is the payload delivered by EventBus to scheduler subscribers.
