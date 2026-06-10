@@ -273,16 +273,16 @@ func TestResume_PausingDAG(t *testing.T) {
 	}
 }
 
-// TestResume_NotPaused_Error verifies that resuming a DAG in any non-paused
+// TestResume_NotPaused_Error verifies that resuming a DAG in any non-resumable
 // status returns an error wrapping ErrDAGNotPaused with the dagID and current
 // status in the error message.
-// Note: pausing is intentionally absent — it is a valid pre-state for resume.
+// Note: pausing and running are intentionally absent — both are valid
+// pre-states for resume (running for idempotent retry, pausing per review).
 func TestResume_NotPaused_Error(t *testing.T) {
 	tests := []struct {
 		name   string
 		status DAGStatus
 	}{
-		{"running", DAGStatusRunning},
 		{"done", DAGStatusDone},
 		{"failed", DAGStatusFailed},
 		{"canceled", DAGStatusCanceled},

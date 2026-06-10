@@ -133,21 +133,15 @@ func (s *Scheduler) sweep(ctx context.Context) error {
 
 		case DAGStatusPaused:
 			// D-18: Skip non-terminal paused DAGs — zero CPU.
-			// D-17: Auto-finalize if all steps are terminal.
+			// D-17: Auto-finalize if all steps are terminal (repair-only —
+			// the primary path is finalizeDAG in the event pipeline).
 			// Can't use state.Terminal() here: it returns (running,false)
 			// when meta is paused (by design). Check steps directly.
 			state, err := s.loadState(ctx, dag.ID)
 			if err != nil {
 				continue
 			}
-			allTerminal := true
-			for _, step := range state.Steps {
-				if !step.IsTerminal() {
-					allTerminal = false
-					break
-				}
-			}
-			if !allTerminal {
+			if !state.AllStepsTerminal() {
 				continue // not all terminal — skip (zero CPU per D-18)
 			}
 			meta, rev, err := s.wf.Store.GetMeta(ctx, dag.ID)
@@ -157,14 +151,7 @@ func (s *Scheduler) sweep(ctx context.Context) error {
 			if meta.Status != DAGStatusPaused {
 				continue
 			}
-			// Derive final status from step outcomes.
-			meta.Status = DAGStatusDone
-			for _, step := range state.Steps {
-				if !step.Optional && (step.Status == StatusFailed || step.Status == StatusSkipped) {
-					meta.Status = DAGStatusFailed
-					break
-				}
-			}
+			meta.Status = state.DeriveFinalStatus()
 			_ = s.wf.Store.PutMeta(ctx, dag.ID, meta, rev)
 
 		default:
@@ -224,9 +211,27 @@ func (s *Scheduler) handleEvent(ctx context.Context, ev Event) error {
 	case EventStepAdded:
 		return s.onStepAdded(ctx, state)
 	case EventResumed:
-		return s.onStepAdded(ctx, state)
+		return s.onResumed(ctx, state)
 	}
 	return nil
+}
+
+// onResumed handles EventResumed. Before re-evaluating ready steps it re-applies
+// cascade-skip for any failed/skipped step: completion events that arrived while
+// the DAG was paused were gated, so After()-linked dependents never got
+// cascade-skipped (Ref-linked ones are covered by ResolveArgs at enqueue time).
+func (s *Scheduler) onResumed(ctx context.Context, state *DAGState) error {
+	for id, step := range state.Steps {
+		if step.Status != StatusFailed && step.Status != StatusSkipped {
+			continue
+		}
+		for _, skipped := range state.cascadeSkipFrom(id) {
+			if err := s.persistStatus(ctx, state.Meta.ID, skipped, StatusSkipped); err != nil {
+				return err
+			}
+		}
+	}
+	return s.onStepAdded(ctx, state)
 }
 
 func (s *Scheduler) onCompleted(ctx context.Context, state *DAGState, ev Event) error {
@@ -250,7 +255,7 @@ func (s *Scheduler) onCompleted(ctx context.Context, state *DAGState, ev Event) 
 	}
 	newlyReady := state.ReadyToRun()
 	for _, skipped := range newlySkipped {
-		if err := s.persistStatus(ctx, ev.DAGID, skipped, StatusSkipped, ""); err != nil {
+		if err := s.persistStatus(ctx, ev.DAGID, skipped, StatusSkipped); err != nil {
 			return err
 		}
 	}
@@ -318,7 +323,7 @@ func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []s
 		// Transition to running in the store (CAS). If a concurrent writer
 		// (e.g. workflow.Cancel) already wrote a terminal status, we must not
 		// enqueue the step — our snapshot of rec is stale.
-		if err := s.persistStatus(ctx, state.Meta.ID, id, StatusRunning, ""); err != nil {
+		if err := s.persistStatus(ctx, state.Meta.ID, id, StatusRunning); err != nil {
 			if errors.Is(err, errStepAlreadyTerminal) {
 				continue
 			}
@@ -334,7 +339,7 @@ func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []s
 		}
 		if skip {
 			// Cascade-skip required-ref dependent.
-			_ = s.persistStatus(ctx, state.Meta.ID, id, StatusSkipped, "")
+			_ = s.persistStatus(ctx, state.Meta.ID, id, StatusSkipped)
 			// Publish a synthetic skipped event so dependents can also advance.
 			ev := Event{Kind: EventCompleted, DAGID: state.Meta.ID, StepID: id, Status: StatusSkipped}
 			data, _ := MarshalEvent(ev)
@@ -369,7 +374,7 @@ func (s *Scheduler) snapshotUpstream(ctx context.Context, state *DAGState) (map[
 // Returns errStepAlreadyTerminal when the stored record is in a terminal state
 // that the requested status cannot override — callers must treat this as
 // "don't enqueue" rather than a silent no-op.
-func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, status StepStatus, errKind string) error {
+func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, status StepStatus) error {
 	for attempt := 0; attempt < 5; attempt++ {
 		rec, rev, err := s.wf.Store.GetStep(ctx, dagID, stepID)
 		if err != nil {
@@ -378,13 +383,13 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 		if rec.Status == status {
 			return nil // already set
 		}
+		if rec.Held && status == StatusRunning {
+			return errStepAlreadyTerminal
+		}
 		if rec.IsTerminal() && status != StatusSkipped {
 			return errStepAlreadyTerminal
 		}
 		rec.Status = status
-		if errKind != "" {
-			rec.ErrorKind = errKind
-		}
 		if status == StatusRunning && rec.StartedAt.IsZero() {
 			rec.StartedAt = time.Now().UTC()
 		}

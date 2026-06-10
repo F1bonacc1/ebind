@@ -50,6 +50,7 @@ type StepRecord struct {
 	ErrorKind    string            `json:"error_kind,omitempty"`
 	ErrorMessage string            `json:"error_message,omitempty"`
 	Optional     bool              `json:"optional,omitempty"`
+	Held         bool              `json:"held,omitempty"`   // held by Pause(); prevents enqueue
 	Policy       *task.RetryPolicy `json:"policy,omitempty"` // per-step override
 	Placement    *PlacementSpec    `json:"placement,omitempty"`
 	WorkerID     string            `json:"worker_id,omitempty"`
@@ -71,11 +72,12 @@ type DAGState struct {
 }
 
 // ReadyToRun returns step IDs whose deps are all `done` (or satisfied-via-default)
-// and whose status is `pending`. Used after MarkDone/MarkFailed to find next work.
+// and whose status is `pending` and not held. Used after MarkDone/MarkFailed to
+// find next work. Held steps are excluded — they are reserved by Pause().
 func (s *DAGState) ReadyToRun() []string {
 	var out []string
 	for id, step := range s.Steps {
-		if step.Status != StatusPending {
+		if step.Status != StatusPending || step.Held {
 			continue
 		}
 		if s.depsSatisfied(step) {

@@ -24,7 +24,13 @@ func newPauseCmd(c *cli.Context) *cobra.Command {
 			if err := workflow.Pause(ctx, wf, args[0]); err != nil {
 				return err
 			}
-			return c.Printer.Text(cmd.OutOrStdout(), fmt.Sprintf("paused %s", args[0]))
+			// Report the actual resulting state: pausing (draining in-flight
+			// steps) or paused (no in-flight work).
+			status := workflow.DAGStatusPaused
+			if meta, _, err := wf.Store.GetMeta(ctx, args[0]); err == nil {
+				status = meta.Status
+			}
+			return c.Printer.Text(cmd.OutOrStdout(), fmt.Sprintf("%s %s", status, args[0]))
 		},
 	}
 }

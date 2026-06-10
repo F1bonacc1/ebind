@@ -1217,7 +1217,7 @@ func TestPauseResume_E2E(t *testing.T) {
 		t.Error("PausedAt not set after transitioning to paused")
 	}
 
-	// Verify step c is still pending (no dispatch during pause).
+	// Verify step c is still pending and held (no dispatch during pause).
 	sc, _, err := h.wf.Store.GetStep(ctx, dagID, "c")
 	if err != nil {
 		t.Fatal(err)
@@ -1225,11 +1225,19 @@ func TestPauseResume_E2E(t *testing.T) {
 	if sc.Status != workflow.StatusPending {
 		t.Fatalf("expected step c to remain pending after pause, got %s", sc.Status)
 	}
+	if !sc.Held {
+		t.Fatal("expected step c to be held after pause")
+	}
 
 	// Resume the DAG.
+	t.Log("Resuming DAG...")
 	if err := workflow.Resume(ctx, h.wf, dagID); err != nil {
 		t.Fatal(err)
 	}
+
+	// Verify step c is released.
+	sc, _, _ = h.wf.Store.GetStep(ctx, dagID, "c")
+	t.Logf("Step c after resume: status=%s held=%v", sc.Status, sc.Held)
 
 	// Verify status is running after resume.
 	waitForStatus(t, h, dagID, workflow.DAGStatusRunning, 5*time.Second)

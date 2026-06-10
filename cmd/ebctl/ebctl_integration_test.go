@@ -276,10 +276,11 @@ func TestDagResume_InvalidState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Test resume on a running DAG
+	// Test resume on a done DAG — terminal states reject resume.
+	// (Resume on a running DAG is idempotent and succeeds by design.)
 	const dagID = "dag-resume-invalid"
 	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
-		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+		ID: dagID, Status: workflow.DAGStatusDone, CreatedAt: time.Now().UTC(),
 	}, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -290,14 +291,14 @@ func TestDagResume_InvalidState(t *testing.T) {
 	dagRoot.SetArgs([]string{"resume", dagID})
 	err = dagRoot.Execute()
 	if err == nil {
-		t.Fatal("expected error for resume on running DAG")
+		t.Fatal("expected error for resume on done DAG")
 	}
 	// Error should contain dagID and current status
 	if !strings.Contains(err.Error(), dagID) {
 		t.Errorf("error missing dagID: %v", err)
 	}
-	if !strings.Contains(err.Error(), "running") {
-		t.Errorf("error missing status 'running': %v", err)
+	if !strings.Contains(err.Error(), "done") {
+		t.Errorf("error missing status 'done': %v", err)
 	}
 }
 
