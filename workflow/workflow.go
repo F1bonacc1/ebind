@@ -14,10 +14,15 @@ type Workflow struct {
 	Elector  LeaderElector // nil ⇒ always leader
 	NakDelay time.Duration // default 1s; used by scheduler when non-leader sees an event
 
-	// SweepCheckInterval is the cadence at which the scheduler polls IsLeader()
-	// to detect leadership acquisition. On a false→true edge it runs a sweep of
-	// all in-flight DAGs to re-enqueue stranded ready steps. Default 5s.
+	// SweepCheckInterval is the cadence at which the scheduler polls IsLeader().
+	// On a false→true leadership edge it runs a sweep immediately. Default 5s.
 	SweepCheckInterval time.Duration
+	// SweepInterval is the cadence of periodic repair sweeps while this node
+	// stays leader (stranded-step re-enqueue, pausing→paused recovery,
+	// paused finalize, orphaned-hold release). A sweep lists every DAG meta
+	// and every step of each non-terminal DAG, so this bounds the steady-state
+	// repair cost; keep it well above SweepCheckInterval. Default 60s.
+	SweepInterval time.Duration
 	// SweepTimeout is the max wall-clock a single sweep may take. Default 60s.
 	SweepTimeout time.Duration
 

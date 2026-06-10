@@ -162,3 +162,43 @@ func TestSweep_KeepsFreshHolds(t *testing.T) {
 		t.Errorf("held step must not be enqueued, got %d enqueues", got)
 	}
 }
+
+// TestSweep_PeriodicWhileLeader verifies that repair sweeps keep firing while
+// leadership is held (not only on the false→true edge): a DAG that becomes
+// stranded AFTER the startup sweep is still repaired by a later periodic
+// sweep, with no events published at all.
+func TestSweep_PeriodicWhileLeader(t *testing.T) {
+	store := NewMemStore()
+	enq := &captureEnq{}
+	wf := NewWorkflow(store, NewMemBus(), enq) // default elector: always leader
+	wf.SweepCheckInterval = 20 * time.Millisecond
+	wf.SweepInterval = 50 * time.Millisecond
+	wf.SweepTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startScheduler(t, wf, ctx)
+
+	// Let the startup (edge) sweep pass before the DAG exists.
+	time.Sleep(150 * time.Millisecond)
+
+	dagID := "late-stranded"
+	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending,
+		ArgsJSON: json.RawMessage(`[1]`),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if enq.count() >= 1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("stranded step was not picked up by a periodic sweep while leadership was held")
+}

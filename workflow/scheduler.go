@@ -41,18 +41,24 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	return nil
 }
 
-// watchLeadership polls IsLeader() and triggers a sweep on each false→true edge
-// plus periodically while leader so that crash recovery (pausing→paused,
-// paused→finalized) is not dependent on leadership transitions.
-// Initial state is wasLeader=false, so a scheduler that starts as leader
-// performs a startup sweep on its very first tick.
+// watchLeadership polls IsLeader() every SweepCheckInterval and triggers a
+// sweep on each false→true edge (immediate recovery on takeover) plus every
+// SweepInterval while leadership is held, so crash/lost-event repair
+// (pausing→paused, paused→finalized, orphaned holds) does not depend on
+// leadership transitions. Initial state is wasLeader=false, so a scheduler
+// that starts as leader performs a startup sweep on its very first tick.
 func (s *Scheduler) watchLeadership(ctx context.Context) {
-	interval := s.wf.SweepCheckInterval
-	if interval <= 0 {
-		interval = 5 * time.Second
+	poll := s.wf.SweepCheckInterval
+	if poll <= 0 {
+		poll = 5 * time.Second
 	}
-	tick := time.NewTicker(interval)
+	sweepEvery := s.wf.SweepInterval
+	if sweepEvery <= 0 {
+		sweepEvery = time.Minute
+	}
+	tick := time.NewTicker(poll)
 	defer tick.Stop()
+	var lastSweep time.Time // zero ⇒ Since() is huge ⇒ first leader tick sweeps
 	for {
 		select {
 		case <-ctx.Done():
@@ -60,13 +66,16 @@ func (s *Scheduler) watchLeadership(ctx context.Context) {
 		case <-tick.C:
 			isLeader := s.wf.Elector.IsLeader()
 			s.leaderMu.Lock()
+			edge := isLeader && !s.wasLeader
 			s.wasLeader = isLeader
-			shouldSweep := isLeader && !s.sweepRunning
-			if shouldSweep {
+			due := isLeader && (edge || time.Since(lastSweep) >= sweepEvery)
+			start := due && !s.sweepRunning
+			if start {
 				s.sweepRunning = true
+				lastSweep = time.Now()
 			}
 			s.leaderMu.Unlock()
-			if shouldSweep {
+			if start {
 				go s.runSweep(ctx)
 			}
 		}
