@@ -21,7 +21,7 @@ func (s *injectOnListStore) ListSteps(ctx context.Context, dagID string) ([]Step
 	steps, err := s.StateStore.ListSteps(ctx, dagID)
 	if err == nil && !s.injected && dagID == s.dagID {
 		s.injected = true
-		_ = s.StateStore.PutStep(ctx, dagID, s.stepID, StepRecord{
+		_ = s.PutStep(ctx, dagID, s.stepID, StepRecord{
 			DAGID: dagID, StepID: s.stepID, Status: StatusPending, ArgsJSON: json.RawMessage(`[]`),
 		}, 0)
 	}
@@ -38,10 +38,10 @@ func TestPauseFence_DynamicAddDuringFence(t *testing.T) {
 	store := &injectOnListStore{StateStore: NewMemStore(), dagID: dagID, stepID: "dyn"}
 	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
 
-	if err := store.StateStore.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
+	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StateStore.PutStep(ctx, dagID, "a", StepRecord{
+	if err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`),
 	}, 0); err != nil {
 		t.Fatal(err)
