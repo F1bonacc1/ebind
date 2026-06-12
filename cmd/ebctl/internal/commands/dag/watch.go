@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -42,11 +43,18 @@ func newWatchCmd(c *cli.Context) *cobra.Command {
 				}
 				line := fmt.Sprintf("%s  DAG %s  step %s  %s",
 					time.Now().UTC().Format(time.RFC3339), ev.DAGID, ev.StepID, ev.Kind)
-				if ev.Kind == workflow.EventCompleted {
+				switch ev.Kind {
+				case workflow.EventCompleted:
 					line += fmt.Sprintf("  status=%s", ev.Status)
 					if ev.ErrorKind != "" {
 						line += "  err=" + ev.ErrorKind
 					}
+				case workflow.EventBPHit:
+					line += fmt.Sprintf("  ⦿ position=%s labels=%s",
+						ev.BPPosition, strings.Join(ev.BPLabels, ","))
+				case workflow.EventBPResumed:
+					line += fmt.Sprintf("  position=%s label=%s",
+						ev.BPPosition, strings.Join(ev.BPLabels, ","))
 				}
 				_ = c.Printer.Text(cmd.OutOrStdout(), line)
 			})

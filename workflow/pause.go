@@ -206,12 +206,8 @@ func releaseHeldSteps(ctx context.Context, wf *Workflow, dagID string) error {
 }
 
 // publishResumeEvent publishes an EventResumed for the given DAG. Extracted as
-// a helper for Resume's idempotent retry path.
+// a helper for Resume's idempotent retry path; encodes the StepID=dagID
+// convention for DAG-level events.
 func publishResumeEvent(ctx context.Context, wf *Workflow, dagID string) error {
-	ev := Event{Kind: EventResumed, DAGID: dagID, StepID: dagID}
-	data, err := MarshalEvent(ev)
-	if err != nil {
-		return err
-	}
-	return wf.Bus.Publish(ctx, EventSubject(ev), data)
+	return publishEvent(ctx, wf.Bus, Event{Kind: EventResumed, DAGID: dagID, StepID: dagID})
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
 )
@@ -17,6 +18,7 @@ type DAGDebug struct {
 	Counts        map[StepStatus]int // count of steps in each status
 	TotalDuration time.Duration      // max(FinishedAt) - Meta.CreatedAt; 0 while running
 	Blockers      []StepBlocker      // Pending steps still waiting on non-terminal deps
+	Breakpoints   []BreakpointInfo   // declared breakpoints with computed state
 }
 
 // StepDebug enriches StepRecord with computed per-step durations.
@@ -24,13 +26,17 @@ type StepDebug struct {
 	StepRecord
 	QueueDuration time.Duration // StartedAt - AddedAt (0 if step never started)
 	ExecDuration  time.Duration // FinishedAt - StartedAt (0 if step never finished)
+	BPNote        string        // computed breakpoint annotation, e.g. "bp:blocked[X]"
 }
 
-// StepBlocker names a Pending step and lists its non-terminal deps (required
-// and optional combined). Useful for "why isn't this step running yet?".
+// StepBlocker names a Pending step and explains why it isn't running yet.
+// WaitingOn lists non-terminal deps (required and optional combined); GatedBy
+// lists deps that are done but whose armed after-breakpoint holds this step.
+// Both carry pure step IDs.
 type StepBlocker struct {
 	StepID    string
 	WaitingOn []string
+	GatedBy   []string
 }
 
 // Debug returns a structured snapshot of the given DAG. Safe to call from any
@@ -59,15 +65,17 @@ func Debug(ctx context.Context, wf *Workflow, dagID string) (DAGDebug, error) {
 	}
 
 	dbg := DAGDebug{
-		Meta:   meta,
-		Steps:  make([]StepDebug, 0, len(steps)),
-		Counts: map[StepStatus]int{},
+		Meta:        meta,
+		Steps:       make([]StepDebug, 0, len(steps)),
+		Counts:      map[StepStatus]int{},
+		Breakpoints: ComputeBreakpoints(meta, steps),
 	}
+	bpNotes := breakpointNotes(dbg.Breakpoints)
 
 	var maxFinished time.Time
 	allTerminal := true
 	for _, s := range steps {
-		sd := StepDebug{StepRecord: s}
+		sd := StepDebug{StepRecord: s, BPNote: bpNotes[s.StepID]}
 		if !s.StartedAt.IsZero() && !s.AddedAt.IsZero() {
 			sd.QueueDuration = s.StartedAt.Sub(s.AddedAt)
 		}
@@ -89,28 +97,56 @@ func Debug(ctx context.Context, wf *Workflow, dagID string) (DAGDebug, error) {
 		dbg.TotalDuration = maxFinished.Sub(meta.CreatedAt)
 	}
 
+	dagState := &DAGState{Meta: meta, Steps: stepByID}
 	for _, s := range steps {
 		if s.Status != StatusPending {
 			continue
 		}
-		var waiting []string
-		for _, dep := range s.Deps {
+		var waiting, gated []string
+		classify := func(dep string) {
 			d, ok := stepByID[dep]
-			if !ok || !d.IsTerminal() {
+			switch {
+			case !ok || !d.IsTerminal():
 				waiting = append(waiting, dep)
+			case dagState.afterBPHolds(d):
+				gated = append(gated, dep) // done, but its after-breakpoint gates this step
 			}
+		}
+		for _, dep := range s.Deps {
+			classify(dep)
 		}
 		for _, dep := range s.OptionalDeps {
-			d, ok := stepByID[dep]
-			if !ok || !d.IsTerminal() {
-				waiting = append(waiting, dep)
-			}
+			classify(dep)
 		}
-		if len(waiting) > 0 {
-			dbg.Blockers = append(dbg.Blockers, StepBlocker{StepID: s.StepID, WaitingOn: waiting})
+		if len(waiting) > 0 || len(gated) > 0 {
+			dbg.Blockers = append(dbg.Blockers, StepBlocker{StepID: s.StepID, WaitingOn: waiting, GatedBy: gated})
 		}
 	}
 	return dbg, nil
+}
+
+// breakpointNotes builds the per-step BPNote annotations from computed
+// breakpoint infos (e.g. "bp:blocked[X]", "bp:holding[X]→{b,c}", "bp:released").
+func breakpointNotes(infos []BreakpointInfo) map[string]string {
+	notes := map[string]string{}
+	for _, bp := range infos {
+		var note string
+		switch {
+		case bp.State == BPStateReleased:
+			note = "bp:released"
+		case bp.State == BPStateBlocked && bp.Position == BPPositionBefore:
+			note = "bp:blocked[" + strings.Join(bp.Labels, ",") + "]"
+		case bp.State == BPStateBlocked && bp.Position == BPPositionAfter:
+			note = "bp:holding[" + strings.Join(bp.Labels, ",") + "]→{" + strings.Join(bp.Holding, ",") + "}"
+		default:
+			continue // declared but not hit — keep step rows quiet
+		}
+		if prev := notes[bp.StepID]; prev != "" {
+			note = prev + " " + note
+		}
+		notes[bp.StepID] = note
+	}
+	return notes
 }
 
 // DebugPrint writes a human-readable report of the DAG to w.
@@ -137,8 +173,12 @@ func WriteDebug(w io.Writer, dbg DAGDebug) error {
 	if !dbg.Meta.PausedAt.IsZero() {
 		pausedStr = fmt.Sprintf("  paused %s ago", humanDuration(time.Since(dbg.Meta.PausedAt)))
 	}
-	if _, err := fmt.Fprintf(w, "DAG %s  [%s]%s%s%s\n",
-		dbg.Meta.ID, statusHeaderLabel(dbg.Meta.Status), ageStr, pausedStr, totalStr); err != nil {
+	bpStr := ""
+	if n := CountBlocked(dbg.Breakpoints); n > 0 {
+		bpStr = fmt.Sprintf("  ⦿ %d at breakpoint", n)
+	}
+	if _, err := fmt.Fprintf(w, "DAG %s  [%s]%s%s%s%s\n",
+		dbg.Meta.ID, statusHeaderLabel(dbg.Meta.Status), ageStr, pausedStr, totalStr, bpStr); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(w, "  steps: %d done, %d failed, %d skipped, %d canceled, %d pending, %d running\n\n",
@@ -161,14 +201,53 @@ func WriteDebug(w io.Writer, dbg DAGDebug) error {
 	}
 
 	if len(dbg.Blockers) == 0 {
-		_, err := fmt.Fprintln(w, "\n  blockers: none")
+		if _, err := fmt.Fprintln(w, "\n  blockers: none"); err != nil {
+			return err
+		}
+	} else {
+		if _, err := fmt.Fprintln(w, "\n  blockers:"); err != nil {
+			return err
+		}
+		for _, b := range dbg.Blockers {
+			var parts []string
+			if len(b.WaitingOn) > 0 {
+				parts = append(parts, fmt.Sprintf("waiting on: %v", b.WaitingOn))
+			}
+			if len(b.GatedBy) > 0 {
+				parts = append(parts, fmt.Sprintf("gated by after-bp: %v", b.GatedBy))
+			}
+			if _, err := fmt.Fprintf(w, "    %s %s\n", b.StepID, strings.Join(parts, "  ")); err != nil {
+				return err
+			}
+		}
+	}
+
+	if len(dbg.Breakpoints) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(w, "\n  breakpoints:"); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(w, "\n  blockers:"); err != nil {
-		return err
-	}
-	for _, b := range dbg.Blockers {
-		if _, err := fmt.Fprintf(w, "    %s waiting on: %v\n", b.StepID, b.WaitingOn); err != nil {
+	for _, bp := range dbg.Breakpoints {
+		armed := "inactive"
+		if bp.Armed {
+			armed = "armed"
+		}
+		stateStr := ""
+		switch bp.State {
+		case BPStateBlocked:
+			stateStr = "  ⦿ blocked"
+			if !bp.BlockedSince.IsZero() {
+				stateStr += fmt.Sprintf(" %s ago", humanDuration(time.Since(bp.BlockedSince)))
+			}
+			if len(bp.Holding) > 0 {
+				stateStr += fmt.Sprintf("  holding %v", bp.Holding)
+			}
+		case BPStateReleased:
+			stateStr = "  released"
+		}
+		if _, err := fmt.Fprintf(w, "    %s %s [%s]  %s%s\n",
+			bp.StepID, bp.Position, strings.Join(bp.Labels, ","), armed, stateStr); err != nil {
 			return err
 		}
 	}
@@ -252,6 +331,9 @@ func stepAnnotation(s StepDebug) string {
 	}
 	if s.ErrorKind != "" {
 		parts = append(parts, "kind="+s.ErrorKind)
+	}
+	if s.BPNote != "" {
+		parts = append(parts, s.BPNote)
 	}
 	switch s.Status {
 	case StatusSkipped:

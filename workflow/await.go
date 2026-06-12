@@ -20,7 +20,10 @@ import (
 // Note: if the DAG is paused, a pending step will never produce a result until
 // the DAG is resumed — Await blocks until ctx expiry in that case. Callers that
 // need to distinguish "paused" from "slow" should check the DAG status via
-// Store.GetMeta before (or while) awaiting.
+// Store.GetMeta before (or while) awaiting. Similarly, a step blocked at an
+// active breakpoint (or gated by an upstream BreakAfter) stays pending and
+// produces no result until ResumeBreakpoint releases it — use ListBreakpoints
+// or Debug to distinguish "blocked at breakpoint" from "slow".
 //
 // Await is a thin wrapper over AwaitByID; prefer AwaitByID when the caller
 // does not own the *Step handle (e.g., a different process resuming a DAG).
@@ -95,7 +98,9 @@ func AwaitByID[T any](ctx context.Context, wf *Workflow, dagID, stepID string) (
 }
 
 // DAGInfo returns the current meta + step states for introspection. Useful in
-// tests and for admin UIs.
+// tests and for admin UIs. A DAG whose only remaining work is blocked at
+// breakpoints still reports DAGStatusRunning — see ListBreakpoints for the
+// blocked view.
 func DAGInfo(ctx context.Context, wf *Workflow, dagID string) (DAGMeta, []StepRecord, error) {
 	meta, _, err := wf.Store.GetMeta(ctx, dagID)
 	if err != nil {

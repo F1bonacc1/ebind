@@ -1,7 +1,18 @@
 // Command ebctl-playground runs a long-lived ebind deployment that exercises
 // every code path ebctl cares about: parallel DAG branches, retries, DLQ
-// entries, cascade-skips, cancellations. A new DAG is submitted every
-// -interval. Point ebctl at the advertised NATS URL to poke around.
+// entries, cascade-skips, cancellations, and step breakpoints. A new DAG is
+// submitted every -interval. Point ebctl at the advertised NATS URL to poke
+// around.
+//
+// Breakpoints: every -bp-every'th DAG (default: every 2nd, starting with the
+// first) is submitted with three breakpoints armed:
+//
+//	validate  BreakAfter("AfterValidate", "Checkpoint") — validate completes,
+//	          then holds all three transform branches; resumable via either label
+//	publish   BreakBefore("BeforePublish") — aggregate result inspectable
+//	          before the side-effecting publish step runs
+//	notify    BreakBefore("BeforeNotify") — blocks the independent metrics
+//	          line while the main line keeps flowing
 //
 // Typical session:
 //
@@ -10,7 +21,12 @@
 //
 //	# terminal 2
 //	./bin/ebctl dag ls
+//	./bin/ebctl dag ls --bp-blocked
 //	./bin/ebctl dag get <dag-id>
+//	./bin/ebctl dag bp ls <dag-id>
+//	./bin/ebctl dag bp resume <dag-id> Checkpoint
+//	./bin/ebctl dag bp resume <dag-id> BeforePublish
+//	./bin/ebctl dag bp resume <dag-id> BeforeNotify
 //	./bin/ebctl dag watch
 //	./bin/ebctl dlq ls
 //	./bin/ebctl dlq show <seq>
@@ -29,6 +45,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -144,6 +161,7 @@ type config struct {
 	interval   time.Duration
 	submitOnce bool
 	storeDir   string
+	bpEvery    int
 }
 
 func main() {
@@ -152,6 +170,7 @@ func main() {
 	flag.DurationVar(&cfg.interval, "interval", 30*time.Second, "interval between DAG submissions")
 	flag.BoolVar(&cfg.submitOnce, "once", false, "submit a single DAG and keep the server running")
 	flag.StringVar(&cfg.storeDir, "store-dir", "", "persistent JetStream store (default: tempdir, wiped on exit)")
+	flag.IntVar(&cfg.bpEvery, "bp-every", 2, "arm breakpoints on every Nth DAG, starting with the first (0 = never)")
 	flag.Parse()
 
 	if err := run(cfg); err != nil {
@@ -252,14 +271,21 @@ func run(cfg config) error {
 
 	var submitted atomic.Uint64
 	submit := func() {
-		id, err := submitDAG(ctx, wf)
+		n := submitted.Add(1)
+		armBPs := cfg.bpEvery > 0 && (n-1)%uint64(cfg.bpEvery) == 0
+		id, err := submitDAG(ctx, wf, armBPs)
 		if err != nil {
 			log.Printf("submit: %v", err)
 			return
 		}
-		n := submitted.Add(1)
-		log.Printf("submitted DAG #%d id=%s", n, id)
-		log.Printf("  try:  ebctl -s %s dag get %s", node.ClientURL(), id)
+		if armBPs {
+			log.Printf("submitted DAG #%d id=%s  ⦿ breakpoints armed: %s", n, id, strings.Join(armedBPLabels, ", "))
+			log.Printf("  watch:  ebctl -s %s dag bp ls %s", node.ClientURL(), id)
+			log.Printf("  resume: ebctl -s %s dag bp resume %s Checkpoint", node.ClientURL(), id)
+		} else {
+			log.Printf("submitted DAG #%d id=%s", n, id)
+			log.Printf("  try:  ebctl -s %s dag get %s", node.ClientURL(), id)
+		}
 	}
 
 	submit()
@@ -284,9 +310,16 @@ shutdown:
 	return nil
 }
 
+// armedBPLabels is the active set passed at Submit when a DAG is chosen to
+// stop at its breakpoints. Note "Checkpoint" arms validate's after-BP via its
+// SECOND label — resuming works through either one ("any label" semantics).
+var armedBPLabels = []string{"Checkpoint", "BeforePublish", "BeforeNotify"}
+
 // submitDAG builds and submits the complex DAG described in the package doc.
 // Returns the DAG's generated ID so the caller can surface it in logs.
-func submitDAG(ctx context.Context, wf *workflow.Workflow) (string, error) {
+// Breakpoint labels are always declared on the steps (inert by default);
+// armBPs decides at submit time whether this execution stops at them.
+func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs bool) (string, error) {
 	// Fast-giving-up retry policy — transform-b goes to DLQ after 3 attempts
 	// so the user sees DLQ entries within ~10s rather than after a minute.
 	quickRetry := task.RetryPolicy{
@@ -300,7 +333,12 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow) (string, error) {
 	dag := workflow.New(workflow.WithDAGID(dagID), workflow.WithRetry(quickRetry))
 
 	ingest := dag.Step("ingest", Ingest, "api.example.com")
-	validate := dag.Step("validate", Validate, ingest.Ref())
+	// After-BP with two labels: when armed, validate completes (its result is
+	// readable via `dag step result`) but all three transforms are held until
+	// `dag bp resume <id> Checkpoint` (or AfterValidate — any label works).
+	validate := dag.StepOpts("validate", Validate,
+		[]workflow.StepOption{workflow.BreakAfter("AfterValidate", "Checkpoint")},
+		ingest.Ref())
 
 	// Fan out: three parallel transforms.
 	tA := dag.Step("transform-a", TransformA, validate.Ref())
@@ -314,11 +352,18 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow) (string, error) {
 		tC.Ref(),
 	)
 
-	_ = dag.Step("publish", Publish, agg.Ref())
+	// Before-BP: when armed, the line stops with publish pending — inspect
+	// aggregate's output before the "side-effecting" terminal step runs.
+	_ = dag.StepOpts("publish", Publish,
+		[]workflow.StepOption{workflow.BreakBefore("BeforePublish")},
+		agg.Ref())
 
 	// Independent parallel chain. Nice second root for `ebctl dag tree`.
+	// Its before-BP shows one line blocked while the other keeps running.
 	metrics := dag.Step("metrics", Metrics)
-	_ = dag.Step("notify", Notify, metrics.Ref())
+	_ = dag.StepOpts("notify", Notify,
+		[]workflow.StepOption{workflow.BreakBefore("BeforeNotify")},
+		metrics.Ref())
 
 	// Cascade-skip chain — flaky fails with no fallback, so dependent is
 	// skipped (visible as ⊘ in dag get). Uses NoRetryPolicy so the demo
@@ -328,7 +373,11 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow) (string, error) {
 	)
 	_ = dag.Step("dependent-skip", Dependent, flaky.Ref())
 
-	if err := dag.Submit(ctx, wf); err != nil {
+	var opts []workflow.SubmitOption
+	if armBPs {
+		opts = append(opts, workflow.WithActiveBreakpoints(armedBPLabels...))
+	}
+	if err := dag.Submit(ctx, wf, opts...); err != nil {
 		return "", err
 	}
 	return dag.ID(), nil

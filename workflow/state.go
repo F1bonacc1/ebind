@@ -19,6 +19,26 @@ const (
 	DAGStatusPaused   DAGStatus = "paused"
 )
 
+// BPState is the per-position breakpoint lifecycle persisted on StepRecord.
+// "" (zero) = breakpoint not yet hit; blocked = advisory "currently stopped
+// here" marker written by the scheduler for observability; released = a
+// ResumeBreakpoint passed this breakpoint instance. The gate logic only ever
+// reads `released` — the blocked mark is never load-bearing.
+type BPState string
+
+const (
+	BPStateBlocked  BPState = "blocked"
+	BPStateReleased BPState = "released"
+)
+
+// BPPosition distinguishes before-execution vs after-execution breakpoints.
+type BPPosition string
+
+const (
+	BPPositionBefore BPPosition = "before"
+	BPPositionAfter  BPPosition = "after"
+)
+
 // DAGMeta is the meta record stored in the state store (key: <dag_id>/meta).
 type DAGMeta struct {
 	ID            string            `json:"id"`
@@ -27,6 +47,9 @@ type DAGMeta struct {
 	DefaultPolicy *task.RetryPolicy `json:"default_policy,omitempty"`
 	PausedAt      time.Time         `json:"paused_at,omitempty"`
 	TerminalSteps []string          `json:"terminal_steps,omitempty"`
+	// ActiveBreakpoints is the set of armed breakpoint labels, fixed at Submit
+	// (WithActiveBreakpoints). Immutable for the DAG's lifetime.
+	ActiveBreakpoints []string `json:"active_breakpoints,omitempty"`
 }
 
 // StepRecord is stored per-step (key: <dag_id>/step/<step_id>).
@@ -50,9 +73,14 @@ type StepRecord struct {
 	ErrorKind    string            `json:"error_kind,omitempty"`
 	ErrorMessage string            `json:"error_message,omitempty"`
 	Optional     bool              `json:"optional,omitempty"`
-	Held         bool              `json:"held,omitempty"`    // held by Pause(); prevents enqueue
-	HeldAt       time.Time         `json:"held_at,omitempty"` // when the hold was applied; age-gates orphan repair
-	Policy       *task.RetryPolicy `json:"policy,omitempty"`  // per-step override
+	Held         bool              `json:"held,omitempty"`         // held by Pause(); prevents enqueue
+	HeldAt       time.Time         `json:"held_at,omitempty"`      // when the hold was applied; age-gates orphan repair
+	BreakBefore  []string          `json:"break_before,omitempty"` // breakpoint labels gating execution start (immutable)
+	BreakAfter   []string          `json:"break_after,omitempty"`  // breakpoint labels gating direct dependents after done (immutable)
+	BPBefore     BPState           `json:"bp_before,omitempty"`    // ""→blocked(advisory)→released(monotonic)
+	BPAfter      BPState           `json:"bp_after,omitempty"`
+	BPBlockedAt  time.Time         `json:"bp_blocked_at,omitempty"` // advisory; when the blocked mark was written
+	Policy       *task.RetryPolicy `json:"policy,omitempty"`        // per-step override
 	Placement    *PlacementSpec    `json:"placement,omitempty"`
 	WorkerID     string            `json:"worker_id,omitempty"`
 	AddedAt      time.Time         `json:"added_at"`
@@ -75,13 +103,73 @@ type DAGState struct {
 // ReadyToRun returns step IDs whose deps are all `done` (or satisfied-via-default)
 // and whose status is `pending` and not held. Used after MarkDone/MarkFailed to
 // find next work. Held steps are excluded — they are reserved by Pause().
+// Steps blocked at an armed before-breakpoint are excluded until released.
 func (s *DAGState) ReadyToRun() []string {
 	var out []string
 	for id, step := range s.Steps {
-		if step.Status != StatusPending || step.Held {
+		if step.Status != StatusPending || step.Held || s.beforeBPBlocks(step) {
 			continue
 		}
 		if s.depsSatisfied(step) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// breakpointArmed reports whether any of the step's breakpoint labels is in
+// the DAG's active set.
+func breakpointArmed(labels, active []string) bool {
+	for _, l := range labels {
+		if stringSliceContains(active, l) {
+			return true
+		}
+	}
+	return false
+}
+
+// beforeBPBlocks: this step must not be enqueued — its before-breakpoint is
+// armed and not yet released. Deliberately never consults the advisory
+// BPStateBlocked mark; the gate is computed from immutable config (labels ×
+// active set) plus the monotonic released flag, so racing schedulers can only
+// err toward "still blocked".
+func (s *DAGState) beforeBPBlocks(step StepRecord) bool {
+	return len(step.BreakBefore) > 0 && step.BPBefore != BPStateReleased &&
+		breakpointArmed(step.BreakBefore, s.Meta.ActiveBreakpoints)
+}
+
+// afterBPHolds: this done step's after-breakpoint is armed and not released,
+// so its direct dependents must not start. Gates only StatusDone — failed/
+// skipped/canceled parents propagate normally (cascade-skip or RefOrDefault).
+func (s *DAGState) afterBPHolds(step StepRecord) bool {
+	return step.Status == StatusDone && len(step.BreakAfter) > 0 &&
+		step.BPAfter != BPStateReleased &&
+		breakpointArmed(step.BreakAfter, s.Meta.ActiveBreakpoints)
+}
+
+// BlockedAtBefore returns IDs of pending steps currently stopped AT their
+// before-breakpoint: deps satisfied (including upstream after-gates) and the
+// gate armed. A step behind an unfinished or after-gated dep is not yet
+// "stopped here" — it hasn't arrived at its own breakpoint.
+func (s *DAGState) BlockedAtBefore() []string {
+	var out []string
+	for id, step := range s.Steps {
+		if step.Status != StatusPending || !s.beforeBPBlocks(step) {
+			continue
+		}
+		if s.depsSatisfied(step) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// HoldingAtAfter returns IDs of done steps whose after-breakpoint gate is
+// currently active (holding their direct dependents).
+func (s *DAGState) HoldingAtAfter() []string {
+	var out []string
+	for id, step := range s.Steps {
+		if s.afterBPHolds(step) {
 			out = append(out, id)
 		}
 	}
@@ -138,19 +226,20 @@ func (s *DAGState) CanResume() bool {
 	return s.Meta.Status == DAGStatusPaused || s.Meta.Status == DAGStatusPausing
 }
 
-// depsSatisfied: all deps (required + optional) are terminal (done/failed/skipped).
-// A failed/skipped required dep is fine for scheduling here — the scheduler's
-// ResolveArgs + cascadeSkipFrom decide whether to cascade or substitute default.
+// depsSatisfied: all deps (required + optional) are terminal (done/failed/skipped)
+// and none is holding at an armed after-breakpoint. A failed/skipped required dep
+// is fine for scheduling here — the scheduler's ResolveArgs + cascadeSkipFrom
+// decide whether to cascade or substitute default.
 func (s *DAGState) depsSatisfied(step StepRecord) bool {
 	for _, dep := range step.Deps {
 		d, ok := s.Steps[dep]
-		if !ok || !d.IsTerminal() {
+		if !ok || !d.IsTerminal() || s.afterBPHolds(d) {
 			return false
 		}
 	}
 	for _, dep := range step.OptionalDeps {
 		d, ok := s.Steps[dep]
-		if !ok || !d.IsTerminal() {
+		if !ok || !d.IsTerminal() || s.afterBPHolds(d) {
 			return false
 		}
 	}

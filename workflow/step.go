@@ -18,6 +18,14 @@ type Step struct {
 	// afterAnyDeps: explicit optional temporal deps (from AfterAny()). Step waits
 	// for each to be terminal but runs regardless of their outcome.
 	afterAnyDeps []string
+
+	// breakBefore/breakAfter: breakpoint labels (from BreakBefore()/BreakAfter()).
+	// hasBreakBefore/hasBreakAfter record that the option was used, so a
+	// zero-label call can be rejected at Submit/StepOpts validation.
+	breakBefore    []string
+	breakAfter     []string
+	hasBreakBefore bool
+	hasBreakAfter  bool
 }
 
 // ID returns the stable step ID within its DAG.
@@ -81,5 +89,30 @@ func AfterAny(steps ...*Step) StepOption {
 			}
 			s.afterAnyDeps = append(s.afterAnyDeps, up.id)
 		}
+	}
+}
+
+// BreakBefore declares a breakpoint that fires before this step executes: when
+// armed, the step stays pending and is never enqueued until ResumeBreakpoint
+// releases it. At least one label is required (validated at Submit / dynamic
+// StepOpts). Inactive by default — armed only when one of its labels is in the
+// DAG's active set (WithActiveBreakpoints). Independent parallel branches keep
+// running while this step is blocked.
+func BreakBefore(labels ...string) StepOption {
+	return func(s *Step) {
+		s.breakBefore = append(s.breakBefore, labels...)
+		s.hasBreakBefore = true
+	}
+}
+
+// BreakAfter declares a breakpoint that fires after this step completes
+// successfully: the step runs and its result is persisted, but its direct
+// dependents (Ref, After, AfterAny) are held until ResumeBreakpoint releases
+// the gate. Fires only on success — a failed/skipped step propagates normally.
+// Same label/arming rules as BreakBefore.
+func BreakAfter(labels ...string) StepOption {
+	return func(s *Step) {
+		s.breakAfter = append(s.breakAfter, labels...)
+		s.hasBreakAfter = true
 	}
 }

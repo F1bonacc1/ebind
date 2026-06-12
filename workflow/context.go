@@ -54,7 +54,8 @@ func (c *ContextDAG) Step(id string, fn any, args ...any) (*Step, error) {
 	return c.StepOpts(id, fn, nil, args...)
 }
 
-// StepOpts adds a step with StepOption support (Optional, WithStepRetry, After, AfterAny).
+// StepOpts adds a step with StepOption support (Optional, WithStepRetry, After,
+// AfterAny, BreakBefore, BreakAfter).
 // The new step implicitly depends on the currently-running step, plus any explicit
 // Refs in args and any explicit After()/AfterAny() upstream steps.
 func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any) (*Step, error) {
@@ -73,6 +74,9 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 	s := &Step{id: id, fn: fn, args: args}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if err := validateStepBreakpoints(s); err != nil {
+		return nil, err
 	}
 	// Implicit parent dep is required (cascade-skip if parent fails) — consistent
 	// with the expectation that dynamic work should not run if the handler failed.
@@ -104,6 +108,8 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 		OptionalDeps: s.optionalDeps(),
 		Status:       StatusPending,
 		Optional:     s.optional,
+		BreakBefore:  s.breakBefore,
+		BreakAfter:   s.breakAfter,
 		Policy:       s.policy,
 		Placement:    placement,
 		AddedAt:      time.Now().UTC(),
@@ -122,9 +128,9 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 		return nil, fmt.Errorf("workflow: dynamic step %q: %w", id, err)
 	}
 	// Publish step-added event so scheduler re-evaluates readiness.
-	ev := Event{Kind: EventStepAdded, DAGID: c.dagID, StepID: id}
-	data, _ := MarshalEvent(ev)
-	_ = c.wf.Bus.Publish(context.Background(), EventSubject(ev), data)
+	// Best-effort: the leader sweep backstops a lost publish.
+	_ = publishEvent(context.Background(), c.wf.Bus,
+		Event{Kind: EventStepAdded, DAGID: c.dagID, StepID: id})
 	return s, nil
 }
 

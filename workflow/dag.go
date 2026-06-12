@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -24,6 +25,31 @@ func WithRetry(p task.RetryPolicy) DAGOption {
 
 // WithDAGID pins an explicit DAG ID (otherwise a uuid is generated).
 func WithDAGID(id string) DAGOption { return func(d *DAG) { d.id = id } }
+
+// SubmitOption configures a single Submit call — run-time decisions that are
+// not part of the DAG's structure.
+type SubmitOption func(*submitOptions)
+
+type submitOptions struct {
+	activeBreakpoints []string
+}
+
+// WithActiveBreakpoints arms the given breakpoint labels for this execution.
+// A step breakpoint (BreakBefore/BreakAfter) whose label set intersects this
+// set is active; everything else runs straight through. Labels matching no
+// step are allowed — dynamically added steps may introduce them later. The
+// armed set is immutable for the DAG's lifetime.
+//
+// This is a SubmitOption, not a DAGOption, so a statically defined DAG can
+// decide at run time which breakpoints to arm:
+//
+//	dag := buildPipeline()                                  // BP config lives on the steps
+//	err := dag.Submit(ctx, wf, workflow.WithActiveBreakpoints("BeforeUpload"))
+func WithActiveBreakpoints(labels ...string) SubmitOption {
+	return func(o *submitOptions) {
+		o.activeBreakpoints = append(o.activeBreakpoints, labels...)
+	}
+}
 
 // DAG is the user-facing workflow builder. Not safe for concurrent Step() calls.
 // Submit() is one-shot.
@@ -184,6 +210,41 @@ func marshalArgs(args []any) (json.RawMessage, error) {
 // handling (e.g. future type-aware encoding).
 func marshalAny(v any) ([]byte, error) { return json.Marshal(v) }
 
+// validateStepBreakpoints rejects BreakBefore()/BreakAfter() used with zero
+// labels or with an empty-string label. Shared by DAG.Submit and the dynamic
+// ContextDAG.StepOpts path.
+func validateStepBreakpoints(s *Step) error {
+	if s.hasBreakBefore && len(s.breakBefore) == 0 {
+		return fmt.Errorf("workflow: step %q: BreakBefore requires at least one label", s.id)
+	}
+	if s.hasBreakAfter && len(s.breakAfter) == 0 {
+		return fmt.Errorf("workflow: step %q: BreakAfter requires at least one label", s.id)
+	}
+	if slices.Contains(s.breakBefore, "") {
+		return fmt.Errorf("workflow: step %q: BreakBefore label must be non-empty", s.id)
+	}
+	if slices.Contains(s.breakAfter, "") {
+		return fmt.Errorf("workflow: step %q: BreakAfter label must be non-empty", s.id)
+	}
+	return nil
+}
+
+// dedupeStrings returns ss with duplicates removed, order preserved.
+func dedupeStrings(ss []string) []string {
+	if len(ss) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(ss))
+	var out []string
+	for _, s := range ss {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // detectCycles runs a DFS-based cycle detector over the step graph.
 // Walks the full dep closure (Ref-derived + After + AfterAny).
 func (d *DAG) detectCycles() error {
@@ -225,7 +286,14 @@ func (d *DAG) detectCycles() error {
 // Submit validates the DAG, persists meta + step records to the store, and
 // enqueues root steps (those with no deps). Idempotent: re-submitting the same
 // DAG ID returns ErrStaleRevision for the meta write.
-func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
+//
+// Run-time decisions are passed as SubmitOptions — e.g.
+// WithActiveBreakpoints arms step breakpoints for this execution.
+func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) error {
+	var so submitOptions
+	for _, opt := range opts {
+		opt(&so)
+	}
 	d.mu.Lock()
 	if d.submitted {
 		d.mu.Unlock()
@@ -244,6 +312,14 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 			d.mu.Unlock()
 			return fmt.Errorf("workflow: step %q uses ColocateHere outside a running handler", s.id)
 		}
+		if err := validateStepBreakpoints(s); err != nil {
+			d.mu.Unlock()
+			return err
+		}
+	}
+	if slices.Contains(so.activeBreakpoints, "") {
+		d.mu.Unlock()
+		return fmt.Errorf("workflow: WithActiveBreakpoints label must be non-empty")
 	}
 	d.submitted = true
 	d.mu.Unlock()
@@ -260,10 +336,11 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 
 	// Persist meta.
 	meta := DAGMeta{
-		ID:            d.id,
-		Status:        DAGStatusRunning,
-		CreatedAt:     time.Now().UTC(),
-		DefaultPolicy: d.defaultPolicy,
+		ID:                d.id,
+		Status:            DAGStatusRunning,
+		CreatedAt:         time.Now().UTC(),
+		DefaultPolicy:     d.defaultPolicy,
+		ActiveBreakpoints: dedupeStrings(so.activeBreakpoints),
 	}
 	if err := wf.Store.PutMeta(ctx, d.id, meta, 0); err != nil {
 		return fmt.Errorf("workflow: put meta: %w", err)
@@ -290,6 +367,8 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 			OptionalDeps: s.optionalDeps(),
 			Status:       StatusPending,
 			Optional:     s.optional,
+			BreakBefore:  s.breakBefore,
+			BreakAfter:   s.breakAfter,
 			Policy:       s.policy,
 			Placement:    placement,
 			AddedAt:      time.Now().UTC(),
@@ -324,6 +403,21 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 				// A concurrent writer (scheduler sweep, Cancel, Pause) already
 				// owns this root's lifecycle; it has enqueued the step or made
 				// it ineligible. Either way Submit must not enqueue it again.
+				recs[s.id] = cur
+				break
+			}
+			if (&DAGState{Meta: meta}).beforeBPBlocks(cur) {
+				// Root blocked at an armed before-breakpoint: leave it pending.
+				// Write the advisory blocked mark here since no scheduler event
+				// fires for a never-enqueued root (best-effort — the mark is
+				// never load-bearing, only the computed gate is). The CAS winner
+				// also announces the informational bp_hit for live watchers.
+				cur.BPBefore = BPStateBlocked
+				cur.BPBlockedAt = time.Now().UTC()
+				if err := wf.Store.PutStep(ctx, d.id, s.id, cur, rev); err == nil {
+					_ = publishEvent(ctx, wf.Bus, Event{Kind: EventBPHit, DAGID: d.id,
+						StepID: s.id, BPPosition: BPPositionBefore, BPLabels: cur.BreakBefore})
+				}
 				recs[s.id] = cur
 				break
 			}

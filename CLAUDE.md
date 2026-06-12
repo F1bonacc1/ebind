@@ -100,6 +100,7 @@ workflow/
   step.go                Step + StepOption
   dag.go                 DAG builder, Submit, cycle detection
   scheduler.go           handleEvent + watchLeadership + sweep
+  breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint
   hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
   context.go             FromContext — dynamic step addition
   await.go               Await[T] via KV WatchResult + DAGInfo
@@ -126,8 +127,9 @@ cmd/ebctl/               operator CLI (cobra)
   - `workflow/state_test.go`, `workflow/ref_test.go`, `workflow/dag_test.go`
 - **Unit with fakes** — MemStore + MemBus + captureEnq:
   - `workflow/scheduler_test.go`, `workflow/store_test.go`
+  - `workflow/breakpoint_test.go` (pure gate-predicate tests + fakes-driven scheduler/resume tests)
 - **Integration** — real in-process NATS via `embed.StartNode`:
-  - `worker/worker_test.go`, `workflow/integration_test.go`
+  - `worker/worker_test.go`, `workflow/integration_test.go`, `workflow/breakpoint_integration_test.go`
 - **Cluster integration** — 3-node in-process cluster:
   - `embed/cluster_test.go`
 - **Cluster chaos e2e** (build tag `e2e`, excluded from `make test`) — every supported operation on a 3-node cluster at R=3, with node kill + restart injected mid-workflow:
@@ -158,6 +160,26 @@ Within one scheduler instance, `mu` serializes event handling. Across instances,
 
 ### Sweep on leader acquisition
 When `IsLeader()` flips false→true, the scheduler sweeps all running DAGs and re-enqueues any stranded ready steps. Edge-triggered, not level-triggered. Defaults: 5s poll, 60s sweep timeout. Overlap-guarded.
+
+### Breakpoints are computed gates; `Held` and BP fences are independent
+Per-step breakpoints (`BreakBefore`/`BreakAfter` StepOptions, armed via
+`WithActiveBreakpoints` at submit) gate scheduling inside the pure layer:
+`ReadyToRun` refuses a pending step whose before-BP is armed, `depsSatisfied`
+refuses dependents of a done step whose after-BP is armed. The gate is computed
+from immutable config (labels × `DAGMeta.ActiveBreakpoints`) plus the monotonic
+`BPBefore`/`BPAfter = released` flag written only by `ResumeBreakpoint` — the
+persisted `blocked` marks (`bp_before`/`bp_after`/`bp_blocked_at`) are advisory
+observability only, never load-bearing. Resume is debugger "continue": the label
+stays armed; each call releases only what is currently stopped. The pause `Held`
+fence and BP state are separate fields by design — DAG `Resume` and the
+orphan-hold sweep touch only `Held`/`HeldAt`, `ResumeBreakpoint` touches only BP
+state; the two fences compose. Never merge them.
+
+Breakpoint transitions are announced as **informational** `bp_hit`/`bp_resumed`
+events (published best-effort by the advisory-mark CAS winner and by
+`ResumeBreakpoint`; rendered live by `ebctl dag watch`). Schedulers Ack-drop
+them — nothing load-bearing may ever depend on their delivery; the durable
+truth is the step record (`dag bp ls`).
 
 ### Failed-step error message persistence
 On terminal failure the worker's `StepHook.OnStepFailed` writes both `error_kind` and `error_message` (the handler's `err.Error()`) into the step record, and carries them on the completion event so the scheduler's in-memory `MarkFailed` stays consistent. The message is truncated to `Workflow.MaxStepErrorBytes` (default `DefaultMaxStepErrorBytes` = 4096; **negative ⇒ store kind only**, the compliance opt-out). The step record is the durable, DAG-lifetime source for *why* a step failed (`ebctl dag step get`); the full untruncated `TaskError` also lives in `EBIND_DLQ` (7d) and `EBIND_RESP` (short). The hook persists the record *before* the DLQ publish, so a step showing `failed` always has its error available. Only terminal failures are recorded — mid-retry attempts write nothing (use `worker.Log` middleware to capture interim errors).

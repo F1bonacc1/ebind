@@ -127,6 +127,7 @@ func (s *Scheduler) sweep(ctx context.Context) error {
 			s.mu.Lock()
 			ready := state.ReadyToRun()
 			err = s.enqueueReady(ctx, state, ready)
+			s.markBlockedBreakpoints(ctx, state)
 			s.mu.Unlock()
 			_ = err
 
@@ -230,6 +231,9 @@ func (s *Scheduler) handleEvent(ctx context.Context, ev Event) error {
 		return s.onStepAdded(ctx, state)
 	case EventResumed:
 		return s.onResumed(ctx, state)
+	case EventBPHit, EventBPResumed:
+		// Informational only (ebctl dag watch); nothing to schedule. Ack.
+		return nil
 	}
 	return nil
 }
@@ -282,6 +286,8 @@ func (s *Scheduler) onCompleted(ctx context.Context, state *DAGState, ev Event) 
 	if err := s.enqueueReady(ctx, state, newlyReady); err != nil {
 		return err
 	}
+	// Advisory observability marks for steps now stopped at a breakpoint.
+	s.markBlockedBreakpoints(ctx, state)
 
 	// ----- pausing→paused auto-transition (SG-04) -----
 	if state.Meta.Status == DAGStatusPausing {
@@ -327,6 +333,8 @@ func (s *Scheduler) onStepAdded(ctx context.Context, state *DAGState) error {
 	if err := s.enqueueReady(ctx, state, state.ReadyToRun()); err != nil {
 		return err
 	}
+	// Advisory observability marks for steps now stopped at a breakpoint.
+	s.markBlockedBreakpoints(ctx, state)
 	// If this is a resume and all steps are already terminal, finalize.
 	if state.AllStepsTerminal() {
 		return s.finalizeDAG(ctx, state)
@@ -369,9 +377,9 @@ func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []s
 			// Cascade-skip required-ref dependent.
 			_ = s.persistStatus(ctx, state.Meta.ID, id, StatusSkipped)
 			// Publish a synthetic skipped event so dependents can also advance.
-			ev := Event{Kind: EventCompleted, DAGID: state.Meta.ID, StepID: id, Status: StatusSkipped}
-			data, _ := MarshalEvent(ev)
-			_ = s.wf.Bus.Publish(ctx, EventSubject(ev), data)
+			// Best-effort: the leader sweep backstops a lost publish.
+			_ = publishEvent(ctx, s.wf.Bus,
+				Event{Kind: EventCompleted, DAGID: state.Meta.ID, StepID: id, Status: StatusSkipped})
 			continue
 		}
 		if err := enqueueStep(ctx, s.wf.Enq, rec, state.Steps, results, statuses); err != nil {
@@ -431,6 +439,67 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 		}
 	}
 	return ErrStaleRevision
+}
+
+// markBlockedBreakpoints CAS-writes advisory BPBefore/BPAfter=blocked (+
+// BPBlockedAt) marks for steps currently stopped at an armed breakpoint, so
+// the raw step record is self-describing for operators (ebctl). The marks are
+// NEVER read by the gate logic (beforeBPBlocks/afterBPHolds compute from
+// immutable config + the monotonic released flag), so losing a CAS race or
+// crashing before writing them cannot affect correctness. Best-effort: gives
+// up silently after a few stale retries.
+func (s *Scheduler) markBlockedBreakpoints(ctx context.Context, state *DAGState) {
+	now := time.Now().UTC()
+	mark := func(stepID string, pos BPPosition) {
+		for attempt := 0; attempt < 3; attempt++ {
+			rec, rev, err := s.wf.Store.GetStep(ctx, state.Meta.ID, stepID)
+			if err != nil {
+				return
+			}
+			// Re-verify on the fresh read: never clobber a released flag, and
+			// only mark records still in the position's expected status.
+			var labels []string
+			switch pos {
+			case BPPositionBefore:
+				if rec.Status != StatusPending || rec.BPBefore != "" {
+					return
+				}
+				rec.BPBefore = BPStateBlocked
+				labels = rec.BreakBefore
+			case BPPositionAfter:
+				if rec.Status != StatusDone || rec.BPAfter != "" {
+					return
+				}
+				rec.BPAfter = BPStateBlocked
+				labels = rec.BreakAfter
+			}
+			if rec.BPBlockedAt.IsZero() {
+				rec.BPBlockedAt = now
+			}
+			err = s.wf.Store.PutStep(ctx, state.Meta.ID, stepID, rec, rev)
+			if err == nil {
+				// The CAS winner announces the hit, so racing schedulers
+				// produce exactly one bp_hit per breakpoint instance.
+				// Informational — delivery is best-effort (see EventBPHit).
+				_ = publishEvent(ctx, s.wf.Bus, Event{Kind: EventBPHit,
+					DAGID: state.Meta.ID, StepID: stepID, BPPosition: pos, BPLabels: labels})
+				return
+			}
+			if !errors.Is(err, ErrStaleRevision) {
+				return
+			}
+		}
+	}
+	for _, id := range state.BlockedAtBefore() {
+		if state.Steps[id].BPBefore == "" {
+			mark(id, BPPositionBefore)
+		}
+	}
+	for _, id := range state.HoldingAtAfter() {
+		if state.Steps[id].BPAfter == "" {
+			mark(id, BPPositionAfter)
+		}
+	}
 }
 
 // heldOrphanAge is how old a step hold must be before the sweep treats it as

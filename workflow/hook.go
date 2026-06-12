@@ -33,9 +33,8 @@ func (h *StepHook) OnStepDone(ctx context.Context, t *task.Task, result []byte) 
 	if err := h.store.PutResult(ctx, t.DAGID, t.StepID, result); err != nil {
 		return err
 	}
-	ev := Event{Kind: EventCompleted, DAGID: t.DAGID, StepID: t.StepID, Status: StatusDone}
-	data, _ := MarshalEvent(ev)
-	return h.bus.Publish(ctx, EventSubject(ev), data)
+	return publishEvent(ctx, h.bus,
+		Event{Kind: EventCompleted, DAGID: t.DAGID, StepID: t.StepID, Status: StatusDone})
 }
 
 // OnStepFailed marks the step as failed and publishes a `completed` event with
@@ -48,9 +47,8 @@ func (h *StepHook) OnStepFailed(ctx context.Context, t *task.Task, taskErr *task
 	if err := h.casUpdateStatus(ctx, t, StatusFailed, taskErr.Kind, msg); err != nil {
 		return err
 	}
-	ev := Event{Kind: EventCompleted, DAGID: t.DAGID, StepID: t.StepID, Status: StatusFailed, ErrorKind: taskErr.Kind, ErrorMessage: msg}
-	data, _ := MarshalEvent(ev)
-	return h.bus.Publish(ctx, EventSubject(ev), data)
+	return publishEvent(ctx, h.bus, Event{Kind: EventCompleted, DAGID: t.DAGID,
+		StepID: t.StepID, Status: StatusFailed, ErrorKind: taskErr.Kind, ErrorMessage: msg})
 }
 
 // casUpdateStatus retries on stale revision (another writer won the race).
