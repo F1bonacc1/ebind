@@ -228,7 +228,8 @@ func releaseBP(ctx context.Context, wf *Workflow, dagID, stepID string, pos BPPo
 			rec.BPAfter = BPStateReleased
 		}
 		rec.BPBlockedAt = time.Time{}
-		if err := wf.Store.PutStep(ctx, dagID, stepID, rec, rev); err != nil {
+		_, err = wf.Store.PutStep(ctx, dagID, stepID, rec, rev)
+		if err != nil {
 			if errors.Is(err, ErrStaleRevision) {
 				continue
 			}

@@ -271,8 +271,8 @@ func TestDebug_Blockers_GatedByAfterBP(t *testing.T) {
 	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
 	ctx := context.Background()
 	_ = store.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusRunning, ActiveBreakpoints: []string{"X"}}, 0)
-	_ = store.PutStep(ctx, "d", "a", StepRecord{DAGID: "d", StepID: "a", Status: StatusDone, BreakAfter: []string{"X"}}, 0)
-	_ = store.PutStep(ctx, "d", "b", StepRecord{DAGID: "d", StepID: "b", Status: StatusPending,
+	_, _ = store.PutStep(ctx, "d", "a", StepRecord{DAGID: "d", StepID: "a", Status: StatusDone, BreakAfter: []string{"X"}}, 0)
+	_, _ = store.PutStep(ctx, "d", "b", StepRecord{DAGID: "d", StepID: "b", Status: StatusPending,
 		Deps: []string{"a"}, ArgsJSON: json.RawMessage(`[]`)}, 0)
 
 	dbg, err := Debug(ctx, wf, "d")
@@ -582,7 +582,7 @@ func TestResumeBreakpoint_LabelStaysArmed_DynamicStepBlocksAgain(t *testing.T) {
 		DAGID: dag.ID(), StepID: "dyn", FnName: "noopA", Status: StatusPending,
 		ArgsJSON: json.RawMessage(`[7]`), BreakBefore: []string{"X"}, AddedAt: time.Now().UTC(),
 	}
-	if err := wf.Store.PutStep(ctx, dag.ID(), "dyn", rec, 0); err != nil {
+	if _, err := wf.Store.PutStep(ctx, dag.ID(), "dyn", rec, 0); err != nil {
 		t.Fatal(err)
 	}
 	ev := Event{Kind: EventStepAdded, DAGID: dag.ID(), StepID: "dyn"}
@@ -677,7 +677,7 @@ func TestResumeBreakpoint_CrashBetweenCASAndPublish_RetryConverges(t *testing.T)
 		t.Fatal(err)
 	}
 	rec.BPBefore = BPStateReleased
-	if err := wf.Store.PutStep(ctx, dag.ID(), "a", rec, rev); err != nil {
+	if _, err := wf.Store.PutStep(ctx, dag.ID(), "a", rec, rev); err != nil {
 		t.Fatal(err)
 	}
 
@@ -986,7 +986,7 @@ func TestSweep_DoesNotEnqueueOrReleaseBPBlocked_EvenWhenOld(t *testing.T) {
 	// heldOrphanAge. The orphan-hold repair must not touch it.
 	dagID := "bp-sweep"
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning, ActiveBreakpoints: []string{"X"}}, 0)
-	_ = store.PutStep(ctx, dagID, "a", StepRecord{
+	_, _ = store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending,
 		ArgsJSON: json.RawMessage(`[1]`), BreakBefore: []string{"X"},
 		BPBefore: BPStateBlocked, BPBlockedAt: time.Now().Add(-24 * time.Hour).UTC(),
@@ -1012,7 +1012,7 @@ func TestScheduler_MarkBlocked_StaleSnapshot_DoesNotClobberRelease(t *testing.T)
 
 	dagID := "stale-mark"
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning, ActiveBreakpoints: []string{"X"}}, 0)
-	_ = store.PutStep(ctx, dagID, "a", StepRecord{
+	_, _ = store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending,
 		ArgsJSON: json.RawMessage(`[1]`), BreakBefore: []string{"X"},
 	}, 0)

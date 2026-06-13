@@ -476,7 +476,7 @@ func (s *Scheduler) markBlockedBreakpoints(ctx context.Context, state *DAGState)
 			if rec.BPBlockedAt.IsZero() {
 				rec.BPBlockedAt = now
 			}
-			err = s.wf.Store.PutStep(ctx, state.Meta.ID, stepID, rec, rev)
+			_, err = s.wf.Store.PutStep(ctx, state.Meta.ID, stepID, rec, rev)
 			if err == nil {
 				// The CAS winner announces the hit, so racing schedulers
 				// produce exactly one bp_hit per breakpoint instance.

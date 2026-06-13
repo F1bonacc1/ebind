@@ -422,7 +422,7 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 				// also announces the informational bp_hit for live watchers.
 				cur.BPBefore = BPStateBlocked
 				cur.BPBlockedAt = time.Now().UTC()
-        _, err := wf.Store.PutStep(ctx, d.id, s.id, cur, rev);
+				_, err := wf.Store.PutStep(ctx, d.id, s.id, cur, rev)
 				if err == nil {
 					_ = publishEvent(ctx, wf.Bus, Event{Kind: EventBPHit, DAGID: d.id,
 						StepID: s.id, BPPosition: BPPositionBefore, BPLabels: cur.BreakBefore})
