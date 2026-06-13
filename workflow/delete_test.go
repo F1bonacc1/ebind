@@ -19,7 +19,7 @@ func TestDeleteDAG_RemovesAllRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"a", "b", "c"} {
-		if err := store.PutStep(ctx, dagID, id, StepRecord{DAGID: dagID, StepID: id, Status: StatusDone}, 0); err != nil {
+		if _, err := store.PutStep(ctx, dagID, id, StepRecord{DAGID: dagID, StepID: id, Status: StatusDone}, 0); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.PutResult(ctx, dagID, id, []byte(`"ok"`)); err != nil {

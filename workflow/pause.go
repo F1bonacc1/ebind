@@ -99,7 +99,7 @@ func fencePendingSteps(ctx context.Context, store StateStore, dagID string) (boo
 			}
 			rec.Held = true
 			rec.HeldAt = time.Now().UTC()
-			if err := store.PutStep(ctx, dagID, snap.StepID, rec, rev); err != nil {
+			if _, err := store.PutStep(ctx, dagID, snap.StepID, rec, rev); err != nil {
 				if errors.Is(err, ErrStaleRevision) {
 					changed = true // concurrent writer; re-observe next pass
 					continue
@@ -193,7 +193,7 @@ func releaseHeldSteps(ctx context.Context, wf *Workflow, dagID string) error {
 			}
 			cur.Held = false
 			cur.HeldAt = time.Time{}
-			if err := wf.Store.PutStep(ctx, dagID, rec.StepID, cur, rev); err != nil {
+			if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, cur, rev); err != nil {
 				if errors.Is(err, ErrStaleRevision) {
 					continue
 				}

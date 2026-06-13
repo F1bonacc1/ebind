@@ -57,7 +57,7 @@ func TestDagLsRmAndDlqFlow(t *testing.T) {
 	}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := wf.Store.PutStep(ctx, dagID, "a", workflow.StepRecord{
+	if _, err := wf.Store.PutStep(ctx, dagID, "a", workflow.StepRecord{
 		DAGID: dagID, StepID: "a", Status: workflow.StatusDone,
 		AddedAt: time.Now().UTC(), FnName: "test.noop",
 	}, 0); err != nil {

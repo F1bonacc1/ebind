@@ -49,7 +49,7 @@ func (s *MemStore) GetStep(_ context.Context, dagID, stepID string) (StepRecord,
 	return e.rec, e.rev, nil
 }
 
-func (s *MemStore) PutStep(_ context.Context, dagID, stepID string, rec StepRecord, expectedRev uint64) error {
+func (s *MemStore) PutStep(_ context.Context, dagID, stepID string, rec StepRecord, expectedRev uint64) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	bucket, ok := s.steps[dagID]
@@ -60,16 +60,17 @@ func (s *MemStore) PutStep(_ context.Context, dagID, stepID string, rec StepReco
 	existing, exists := bucket[stepID]
 	if expectedRev == 0 {
 		if exists {
-			return ErrStaleRevision
+			return 0, ErrStaleRevision
 		}
 		bucket[stepID] = memEntry{rec: rec, rev: 1}
-		return nil
+		return 1, nil
 	}
 	if !exists || existing.rev != expectedRev {
-		return ErrStaleRevision
+		return 0, ErrStaleRevision
 	}
-	bucket[stepID] = memEntry{rec: rec, rev: existing.rev + 1}
-	return nil
+	newRev := existing.rev + 1
+	bucket[stepID] = memEntry{rec: rec, rev: newRev}
+	return newRev, nil
 }
 
 func (s *MemStore) ListSteps(_ context.Context, dagID string) ([]StepRecord, error) {

@@ -112,7 +112,7 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 	// or redelivered because a concurrent subscriber joined the consumer during
 	// a claim flip — StepOpts may run again with the same id. Treat an existing
 	// matching record as success so dynamic-step creation is idempotent.
-	if err := c.wf.Store.PutStep(context.Background(), c.dagID, id, rec, 0); err != nil {
+	if _, err := c.wf.Store.PutStep(context.Background(), c.dagID, id, rec, 0); err != nil {
 		if errors.Is(err, ErrStaleRevision) {
 			existing, _, getErr := c.wf.Store.GetStep(context.Background(), c.dagID, id)
 			if getErr == nil && existing.FnName == rec.FnName {

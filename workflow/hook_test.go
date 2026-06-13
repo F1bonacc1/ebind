@@ -14,7 +14,7 @@ import (
 func seedRunningStep(t *testing.T, store StateStore, dagID, stepID string) {
 	t.Helper()
 	rec := StepRecord{DAGID: dagID, StepID: stepID, Status: StatusRunning}
-	if err := store.PutStep(context.Background(), dagID, stepID, rec, 0); err != nil {
+	if _, err := store.PutStep(context.Background(), dagID, stepID, rec, 0); err != nil {
 		t.Fatalf("seed step: %v", err)
 	}
 }
