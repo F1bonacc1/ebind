@@ -10,7 +10,12 @@ import "context"
 // through StateStore, EventBus, and Enqueuer. Tests use store_mem.go fakes.
 type StateStore interface {
 	GetStep(ctx context.Context, dagID, stepID string) (StepRecord, uint64, error)
-	PutStep(ctx context.Context, dagID, stepID string, rec StepRecord, expectedRev uint64) error
+	// PutStep writes rec and returns the new revision. On a clustered KV the
+	// returned revision lets a caller CAS-update the record again without a
+	// read-back — a read-back can be served a stale value by a lagging replica
+	// (NATS KV Get uses direct get), so avoiding it removes a read-your-writes
+	// race. On error the returned revision is 0.
+	PutStep(ctx context.Context, dagID, stepID string, rec StepRecord, expectedRev uint64) (uint64, error)
 	ListSteps(ctx context.Context, dagID string) ([]StepRecord, error)
 
 	GetResult(ctx context.Context, dagID, stepID string) ([]byte, error)

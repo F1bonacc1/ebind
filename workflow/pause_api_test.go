@@ -22,7 +22,7 @@ func TestPause_RunningDAG_NoInFlight(t *testing.T) {
 	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`),
 	}, 0); err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestPause_RunningDAG_WithInFlight(t *testing.T) {
 	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", Status: StatusRunning, ArgsJSON: json.RawMessage(`[]`),
 	}, 0); err != nil {
 		t.Fatal(err)

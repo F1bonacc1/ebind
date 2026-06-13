@@ -96,7 +96,7 @@ func emulateHook(t *testing.T, wf *Workflow, dagID, stepID string, result []byte
 	}
 	if te == nil {
 		rec.Status = StatusDone
-		if err := wf.Store.PutStep(ctx, dagID, stepID, rec, rev); err != nil {
+		if _, err := wf.Store.PutStep(ctx, dagID, stepID, rec, rev); err != nil {
 			t.Fatal(err)
 		}
 		_ = wf.Store.PutResult(ctx, dagID, stepID, result)
@@ -104,7 +104,7 @@ func emulateHook(t *testing.T, wf *Workflow, dagID, stepID string, result []byte
 	} else {
 		rec.Status = StatusFailed
 		rec.ErrorKind = te.Kind
-		if err := wf.Store.PutStep(ctx, dagID, stepID, rec, rev); err != nil {
+		if _, err := wf.Store.PutStep(ctx, dagID, stepID, rec, rev); err != nil {
 			t.Fatal(err)
 		}
 		publishCompletion(t, wf, dagID, stepID, StatusFailed, te.Kind)
@@ -271,11 +271,11 @@ func TestScheduler_Sweep_OnLeaderAcquire_EnqueuesStranded(t *testing.T) {
 	// Seed state: a done, b pending ready.
 	dagID := "stranded-dag"
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0)
-	_ = store.PutStep(ctx, dagID, "a", StepRecord{DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusDone, ArgsJSON: json.RawMessage(`[]`)}, 0)
+	_, _ = store.PutStep(ctx, dagID, "a", StepRecord{DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusDone, ArgsJSON: json.RawMessage(`[]`)}, 0)
 	_ = store.PutResult(ctx, dagID, "a", json.RawMessage(`42`))
 	refA, _ := json.Marshal(Ref{StepID: "a", Mode: RefModeRequired})
 	bArgs, _ := json.Marshal([]json.RawMessage{refA})
-	_ = store.PutStep(ctx, dagID, "b", StepRecord{DAGID: dagID, StepID: "b", FnName: "noopA", Status: StatusPending, Deps: []string{"a"}, ArgsJSON: bArgs}, 0)
+	_, _ = store.PutStep(ctx, dagID, "b", StepRecord{DAGID: dagID, StepID: "b", FnName: "noopA", Status: StatusPending, Deps: []string{"a"}, ArgsJSON: bArgs}, 0)
 
 	startScheduler(t, wf, ctx)
 
@@ -317,7 +317,7 @@ func TestScheduler_Sweep_EdgeTriggered_NoDuplicateRuns(t *testing.T) {
 
 	dagID := "d"
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0)
-	_ = store.PutStep(ctx, dagID, "a", StepRecord{DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`)}, 0)
+	_, _ = store.PutStep(ctx, dagID, "a", StepRecord{DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`)}, 0)
 
 	startScheduler(t, wf, ctx)
 	elector.set(true)
@@ -343,7 +343,7 @@ func TestScheduler_Sweep_TriggersAgainAfterReAcquire(t *testing.T) {
 
 	dagID := "d"
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0)
-	_ = store.PutStep(ctx, dagID, "a", StepRecord{DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`)}, 0)
+	_, _ = store.PutStep(ctx, dagID, "a", StepRecord{DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`)}, 0)
 
 	startScheduler(t, wf, ctx)
 
@@ -357,7 +357,7 @@ func TestScheduler_Sweep_TriggersAgainAfterReAcquire(t *testing.T) {
 	// Add another stranded step while non-leader.
 	elector.set(false)
 	time.Sleep(100 * time.Millisecond)
-	_ = store.PutStep(ctx, dagID, "b", StepRecord{DAGID: dagID, StepID: "b", FnName: "noopA", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`)}, 0)
+	_, _ = store.PutStep(ctx, dagID, "b", StepRecord{DAGID: dagID, StepID: "b", FnName: "noopA", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`)}, 0)
 
 	// Re-acquire: second sweep should pick up both a (if it failed to mark Running) and b.
 	elector.set(true)
@@ -388,7 +388,7 @@ func TestScheduler_Cancel_StaleSnapshot_DoesNotEnqueue(t *testing.T) {
 	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusDone,
 		ArgsJSON: json.RawMessage(`[]`),
 	}, 0); err != nil {
@@ -398,7 +398,7 @@ func TestScheduler_Cancel_StaleSnapshot_DoesNotEnqueue(t *testing.T) {
 
 	refA, _ := json.Marshal(Ref{StepID: "a", Mode: RefModeRequired})
 	bArgs, _ := json.Marshal([]json.RawMessage{refA})
-	if err := store.PutStep(ctx, dagID, "b", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "b", StepRecord{
 		DAGID: dagID, StepID: "b", FnName: "noopA", Status: StatusPending,
 		Deps: []string{"a"}, ArgsJSON: bArgs,
 	}, 0); err != nil {
@@ -631,7 +631,7 @@ func TestScheduler_Pause_StepAddedDuringPause(t *testing.T) {
 	}
 
 	// Simulate adding a dynamic step b (no deps, ready to run).
-	if err := wf.Store.PutStep(ctx, dag.ID(), "b", StepRecord{
+	if _, err := wf.Store.PutStep(ctx, dag.ID(), "b", StepRecord{
 		DAGID: dag.ID(), StepID: "b", FnName: "noopA",
 		Status: StatusPending, ArgsJSON: json.RawMessage(`[1]`),
 	}, 0); err != nil {
@@ -684,7 +684,7 @@ func TestScheduler_Sweep_HandlesPausingDAG(t *testing.T) {
 	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusPausing}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", FnName: "noopA",
 		Status: StatusDone, ArgsJSON: json.RawMessage(`[]`),
 	}, 0); err != nil {
@@ -743,7 +743,7 @@ func TestScheduler_Sweep_SkipsPausedDAG(t *testing.T) {
 	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusPaused}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", FnName: "noopA",
 		Status: StatusPending, ArgsJSON: json.RawMessage(`[1]`),
 	}, 0); err != nil {
@@ -791,13 +791,13 @@ func TestScheduler_Sweep_AutoFinalizesPausedDAG(t *testing.T) {
 	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusPaused}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", FnName: "noopA",
 		Status: StatusDone, ArgsJSON: json.RawMessage(`[]`),
 	}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "b", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "b", StepRecord{
 		DAGID: dagID, StepID: "b", FnName: "noopA",
 		Status: StatusDone, ArgsJSON: json.RawMessage(`[]`),
 	}, 0); err != nil {

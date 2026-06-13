@@ -430,7 +430,7 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 		if status == StatusRunning && rec.StartedAt.IsZero() {
 			rec.StartedAt = time.Now().UTC()
 		}
-		err = s.wf.Store.PutStep(ctx, dagID, stepID, rec, rev)
+		_, err = s.wf.Store.PutStep(ctx, dagID, stepID, rec, rev)
 		if err == nil {
 			return nil
 		}
@@ -529,7 +529,7 @@ func (s *Scheduler) releaseOrphanedHolds(ctx context.Context, dagID string, stat
 		}
 		rec.Held = false
 		rec.HeldAt = time.Time{}
-		if err := s.wf.Store.PutStep(ctx, dagID, id, rec, rev); err == nil {
+		if _, err := s.wf.Store.PutStep(ctx, dagID, id, rec, rev); err == nil {
 			released = true
 		}
 	}

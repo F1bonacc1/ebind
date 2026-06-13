@@ -10,7 +10,7 @@ import (
 
 func putStep(t *testing.T, store *workflow.MemStore, rec workflow.StepRecord) {
 	t.Helper()
-	if err := store.PutStep(context.Background(), rec.DAGID, rec.StepID, rec, 0); err != nil {
+	if _, err := store.PutStep(context.Background(), rec.DAGID, rec.StepID, rec, 0); err != nil {
 		t.Fatalf("put step: %v", err)
 	}
 }

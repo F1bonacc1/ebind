@@ -103,7 +103,7 @@ func TestPauseFence_PersistStatusRefusesHeld(t *testing.T) {
 	dagID := "fence-dag"
 
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusPaused}, 0)
-	_ = store.PutStep(ctx, dagID, "a", StepRecord{
+	_, _ = store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", Status: StatusPending, Held: true, ArgsJSON: json.RawMessage(`[]`),
 	}, 0)
 
@@ -132,7 +132,7 @@ func TestResume_AllTerminalPaused_Finalizes(t *testing.T) {
 
 	dagID := "terminal-paused"
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusPaused, PausedAt: time.Now().UTC()}, 0)
-	_ = store.PutStep(ctx, dagID, "a", StepRecord{
+	_, _ = store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", Status: StatusDone, ArgsJSON: json.RawMessage(`[]`),
 	}, 0)
 	_ = store.PutResult(ctx, dagID, "a", json.RawMessage(`1`))
@@ -166,7 +166,7 @@ func TestResume_Idempotent_RunningMeta(t *testing.T) {
 
 	// Simulate the partial-failure state: meta already running, step still held.
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0)
-	_ = store.PutStep(ctx, dagID, "a", StepRecord{
+	_, _ = store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", Status: StatusPending, Held: true, ArgsJSON: json.RawMessage(`[]`),
 	}, 0)
 
@@ -222,10 +222,10 @@ func TestResume_ReappliesCascade_AfterDeps(t *testing.T) {
 	_ = store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusPaused, PausedAt: time.Now().UTC()}, 0)
 	// a failed while paused (its event was gated). b depends on a via After()
 	// only — empty args, Deps contains a.
-	_ = store.PutStep(ctx, dagID, "a", StepRecord{
+	_, _ = store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", Status: StatusFailed, ErrorKind: "handler", ArgsJSON: json.RawMessage(`[]`),
 	}, 0)
-	_ = store.PutStep(ctx, dagID, "b", StepRecord{
+	_, _ = store.PutStep(ctx, dagID, "b", StepRecord{
 		DAGID: dagID, StepID: "b", Status: StatusPending, Deps: []string{"a"}, ArgsJSON: json.RawMessage(`[]`),
 	}, 0)
 

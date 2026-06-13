@@ -21,7 +21,7 @@ func (s *injectOnListStore) ListSteps(ctx context.Context, dagID string) ([]Step
 	steps, err := s.StateStore.ListSteps(ctx, dagID)
 	if err == nil && !s.injected && dagID == s.dagID {
 		s.injected = true
-		_ = s.PutStep(ctx, dagID, s.stepID, StepRecord{
+		_, _ = s.PutStep(ctx, dagID, s.stepID, StepRecord{
 			DAGID: dagID, StepID: s.stepID, Status: StatusPending, ArgsJSON: json.RawMessage(`[]`),
 		}, 0)
 	}
@@ -41,7 +41,7 @@ func TestPauseFence_DynamicAddDuringFence(t *testing.T) {
 	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", Status: StatusPending, ArgsJSON: json.RawMessage(`[]`),
 	}, 0); err != nil {
 		t.Fatal(err)
@@ -95,7 +95,7 @@ func TestSweep_ReleasesOrphanedHolds(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simulate the crash leftover: pending step held long ago, meta running.
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending,
 		Held: true, HeldAt: time.Now().UTC().Add(-10 * time.Minute),
 		ArgsJSON: json.RawMessage(`[1]`),
@@ -142,7 +142,7 @@ func TestSweep_KeepsFreshHolds(t *testing.T) {
 	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending,
 		Held: true, HeldAt: time.Now().UTC(),
 		ArgsJSON: json.RawMessage(`[1]`),
@@ -186,7 +186,7 @@ func TestSweep_PeriodicWhileLeader(t *testing.T) {
 	if err := store.PutMeta(ctx, dagID, DAGMeta{ID: dagID, Status: DAGStatusRunning}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutStep(ctx, dagID, "a", StepRecord{
+	if _, err := store.PutStep(ctx, dagID, "a", StepRecord{
 		DAGID: dagID, StepID: "a", FnName: "noopA", Status: StatusPending,
 		ArgsJSON: json.RawMessage(`[1]`),
 	}, 0); err != nil {

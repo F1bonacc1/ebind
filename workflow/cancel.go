@@ -46,7 +46,7 @@ func Cancel(ctx context.Context, wf *Workflow, dagID string) error {
 			}
 			rec.Status = StatusCanceled
 			rec.FinishedAt = time.Now().UTC()
-			if err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, rev); err != nil {
+			if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, rev); err != nil {
 				if errors.Is(err, ErrStaleRevision) {
 					continue
 				}

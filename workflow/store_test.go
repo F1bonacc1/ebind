@@ -42,7 +42,7 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		s := newStore(t)
 		ctx := context.Background()
 		rec := StepRecord{DAGID: "d", StepID: "a", FnName: "X", Status: StatusPending}
-		if err := s.PutStep(ctx, "d", "a", rec, 0); err != nil {
+		if _, err := s.PutStep(ctx, "d", "a", rec, 0); err != nil {
 			t.Fatal(err)
 		}
 		got, rev, err := s.GetStep(ctx, "d", "a")
@@ -53,8 +53,50 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 			t.Errorf("got %+v", got)
 		}
 		rec.Status = StatusRunning
-		if err := s.PutStep(ctx, "d", "a", rec, rev); err != nil {
+		if _, err := s.PutStep(ctx, "d", "a", rec, rev); err != nil {
 			t.Fatal(err)
+		}
+	})
+
+	t.Run("Step_PutReturnsUsableRevision", func(t *testing.T) {
+		// The revision PutStep returns must be directly usable for a follow-up
+		// CAS without a GetStep read-back. Submit relies on this to mark a root
+		// Running straight from the create revision, avoiding a direct-get read
+		// that a lagging replica can answer with a stale "not found". See
+		// workflow/dag.go Submit.
+		s := newStore(t)
+		ctx := context.Background()
+		rec := StepRecord{DAGID: "d", StepID: "a", FnName: "X", Status: StatusPending}
+		rev, err := s.PutStep(ctx, "d", "a", rec, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rev == 0 {
+			t.Fatalf("create returned revision 0, want non-zero")
+		}
+		// CAS straight from the returned create revision — no read-back.
+		rec.Status = StatusRunning
+		rev2, err := s.PutStep(ctx, "d", "a", rec, rev)
+		if err != nil {
+			t.Fatalf("CAS from returned create revision: %v", err)
+		}
+		if rev2 == 0 || rev2 == rev {
+			t.Fatalf("update revision: got %d (prev %d), want a new non-zero revision", rev2, rev)
+		}
+		// The revision PutStep reported must match what GetStep observes.
+		got, grev, err := s.GetStep(ctx, "d", "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if grev != rev2 {
+			t.Errorf("revision mismatch: PutStep reported %d, GetStep sees %d", rev2, grev)
+		}
+		if got.Status != StatusRunning {
+			t.Errorf("status: got %v, want Running", got.Status)
+		}
+		// The superseded create revision must now be stale.
+		if _, err := s.PutStep(ctx, "d", "a", rec, rev); !errors.Is(err, ErrStaleRevision) {
+			t.Errorf("CAS with superseded revision: got %v, want ErrStaleRevision", err)
 		}
 	})
 
@@ -62,8 +104,8 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		s := newStore(t)
 		ctx := context.Background()
 		rec := StepRecord{DAGID: "d", StepID: "a", Status: StatusPending}
-		_ = s.PutStep(ctx, "d", "a", rec, 0)
-		if err := s.PutStep(ctx, "d", "a", rec, 999); !errors.Is(err, ErrStaleRevision) {
+		_, _ = s.PutStep(ctx, "d", "a", rec, 0)
+		if _, err := s.PutStep(ctx, "d", "a", rec, 999); !errors.Is(err, ErrStaleRevision) {
 			t.Errorf("stale CAS: %v", err)
 		}
 	})
@@ -71,8 +113,8 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 	t.Run("ListSteps", func(t *testing.T) {
 		s := newStore(t)
 		ctx := context.Background()
-		_ = s.PutStep(ctx, "d", "a", StepRecord{StepID: "a"}, 0)
-		_ = s.PutStep(ctx, "d", "b", StepRecord{StepID: "b"}, 0)
+		_, _ = s.PutStep(ctx, "d", "a", StepRecord{StepID: "a"}, 0)
+		_, _ = s.PutStep(ctx, "d", "b", StepRecord{StepID: "b"}, 0)
 		steps, err := s.ListSteps(ctx, "d")
 		if err != nil {
 			t.Fatal(err)
@@ -142,7 +184,7 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		s := newStore(t)
 		ctx := context.Background()
 		_ = s.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusDone}, 0)
-		_ = s.PutStep(ctx, "d", "a", StepRecord{StepID: "a"}, 0)
+		_, _ = s.PutStep(ctx, "d", "a", StepRecord{StepID: "a"}, 0)
 		_ = s.PutResult(ctx, "d", "a", []byte(`42`))
 
 		if err := s.DeleteResult(ctx, "d", "a"); err != nil {
@@ -193,7 +235,7 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		s := newStore(t)
 		ctx := context.Background()
 		rec := StepRecord{StepID: "a", Attempt: 0}
-		_ = s.PutStep(ctx, "d", "a", rec, 0)
+		_, _ = s.PutStep(ctx, "d", "a", rec, 0)
 
 		var wg sync.WaitGroup
 		var successes, failures int
@@ -204,7 +246,7 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 				defer wg.Done()
 				got, rev, _ := s.GetStep(ctx, "d", "a")
 				got.Attempt++
-				err := s.PutStep(ctx, "d", "a", got, rev)
+				_, err := s.PutStep(ctx, "d", "a", got, rev)
 				muCounts.Lock()
 				if err == nil {
 					successes++
