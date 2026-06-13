@@ -93,23 +93,23 @@ func (s *NatsStore) GetStep(ctx context.Context, dagID, stepID string) (StepReco
 	return rec, entry.Revision(), nil
 }
 
-func (s *NatsStore) PutStep(ctx context.Context, dagID, stepID string, rec StepRecord, expectedRev uint64) error {
+func (s *NatsStore) PutStep(ctx context.Context, dagID, stepID string, rec StepRecord, expectedRev uint64) (uint64, error) {
 	data, err := json.Marshal(rec)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if expectedRev == 0 {
-		_, err := s.kv.Create(ctx, stepKey(dagID, stepID), data)
+		rev, err := s.kv.Create(ctx, stepKey(dagID, stepID), data)
 		if err != nil && (errors.Is(err, jetstream.ErrKeyExists) || strings.Contains(err.Error(), "wrong last sequence")) {
-			return ErrStaleRevision
+			return 0, ErrStaleRevision
 		}
-		return err
+		return rev, err
 	}
-	_, err = s.kv.Update(ctx, stepKey(dagID, stepID), data, expectedRev)
+	rev, err := s.kv.Update(ctx, stepKey(dagID, stepID), data, expectedRev)
 	if err != nil && strings.Contains(err.Error(), "wrong last sequence") {
-		return ErrStaleRevision
+		return 0, ErrStaleRevision
 	}
-	return err
+	return rev, err
 }
 
 func (s *NatsStore) ListDAGs(ctx context.Context) ([]DAGMeta, error) {

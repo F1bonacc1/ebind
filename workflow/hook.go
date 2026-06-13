@@ -68,7 +68,7 @@ func (h *StepHook) casUpdateStatus(ctx context.Context, t *task.Task, status Ste
 		rec.ErrorMessage = errMsg
 		rec.WorkerID = t.WorkerID
 		rec.FinishedAt = time.Now().UTC()
-		err = h.store.PutStep(ctx, t.DAGID, t.StepID, rec, rev)
+		_, err = h.store.PutStep(ctx, t.DAGID, t.StepID, rec, rev)
 		if err == nil {
 			return nil
 		}

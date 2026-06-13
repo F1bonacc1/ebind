@@ -13,7 +13,7 @@ func TestAwaitByID_ImmediateResult(t *testing.T) {
 	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
 	ctx := context.Background()
 	_ = store.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusDone}, 0)
-	_ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusDone}, 0)
+	_, _ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusDone}, 0)
 	_ = store.PutResult(ctx, "d", "a", []byte(`"hello"`))
 
 	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -33,14 +33,14 @@ func TestAwaitByID_AsyncResult(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = store.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusRunning}, 0)
-	_ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusRunning}, 0)
+	_, _ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusRunning}, 0)
 
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		// Update step to Done then write result to simulate hook ordering.
 		rec, rev, _ := store.GetStep(ctx, "d", "a")
 		rec.Status = StatusDone
-		_ = store.PutStep(ctx, "d", "a", rec, rev)
+		_, _ = store.PutStep(ctx, "d", "a", rec, rev)
 		_ = store.PutResult(ctx, "d", "a", []byte(`42`))
 	}()
 
@@ -58,7 +58,7 @@ func TestAwaitByID_Failed(t *testing.T) {
 	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
 	ctx := context.Background()
 	_ = store.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusFailed}, 0)
-	_ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusFailed, ErrorKind: "boom"}, 0)
+	_, _ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusFailed, ErrorKind: "boom"}, 0)
 
 	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -73,7 +73,7 @@ func TestAwaitByID_Skipped(t *testing.T) {
 	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
 	ctx := context.Background()
 	_ = store.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusFailed}, 0)
-	_ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusSkipped}, 0)
+	_, _ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusSkipped}, 0)
 
 	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -88,7 +88,7 @@ func TestAwaitByID_Canceled(t *testing.T) {
 	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
 	ctx := context.Background()
 	_ = store.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusCanceled}, 0)
-	_ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusCanceled}, 0)
+	_, _ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusCanceled}, 0)
 
 	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -103,7 +103,7 @@ func TestAwaitByID_ContextCancel(t *testing.T) {
 	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
 	ctx := context.Background()
 	_ = store.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusRunning}, 0)
-	_ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusRunning}, 0)
+	_, _ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusRunning}, 0)
 
 	ctx2, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
 	defer cancel()
@@ -119,7 +119,7 @@ func TestAwait_Wrapper(t *testing.T) {
 	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
 	ctx := context.Background()
 	_ = store.PutMeta(ctx, "d", DAGMeta{ID: "d", Status: DAGStatusDone}, 0)
-	_ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusDone}, 0)
+	_, _ = store.PutStep(ctx, "d", "a", StepRecord{StepID: "a", Status: StatusDone}, 0)
 	_ = store.PutResult(ctx, "d", "a", []byte(`7`))
 
 	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)

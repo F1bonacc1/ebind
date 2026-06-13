@@ -24,7 +24,7 @@ func seedDAG(t *testing.T, steps ...StepRecord) (*Workflow, string) {
 	}
 	for _, s := range steps {
 		s.DAGID = dagID
-		if err := store.PutStep(ctx, dagID, s.StepID, s, 0); err != nil {
+		if _, err := store.PutStep(ctx, dagID, s.StepID, s, 0); err != nil {
 			t.Fatal(err)
 		}
 	}

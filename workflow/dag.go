@@ -269,8 +269,10 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 		return fmt.Errorf("workflow: put meta: %w", err)
 	}
 
-	// Persist step records.
+	// Persist step records. createdRev keeps the revision each create returned
+	// so roots can be CAS-advanced below without a stale-prone read-back.
 	recs := make(map[string]StepRecord, len(d.steps))
+	createdRev := make(map[string]uint64, len(d.steps))
 	for _, s := range d.steps {
 		argsJSON, err := marshalArgs(s.args)
 		if err != nil {
@@ -294,10 +296,12 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 			Placement:    placement,
 			AddedAt:      time.Now().UTC(),
 		}
-		if err := wf.Store.PutStep(ctx, d.id, s.id, rec, 0); err != nil {
+		rev, err := wf.Store.PutStep(ctx, d.id, s.id, rec, 0)
+		if err != nil {
 			return fmt.Errorf("workflow: put step %q: %w", s.id, err)
 		}
 		recs[s.id] = rec
+		createdRev[s.id] = rev
 	}
 
 	// Enqueue roots — steps with no required AND no optional deps. Dependent
@@ -307,19 +311,23 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 	// every step in the system has a consistent lifecycle. Dependent steps
 	// receive the same transition via Scheduler.enqueueReady/persistStatus.
 	//
-	// A scheduler sweep can list this DAG between the step persist above and
-	// the CAS below, claim a ready root itself, and win the race — that is the
-	// documented one-wins-other-retries model, so a stale revision here means
-	// re-read and reassess, not fail the Submit.
+	// We CAS straight from the create revision captured above — no read-back.
+	// A GetStep here is a NATS KV direct get, which a lagging replica can answer
+	// with a stale "step not found" in the window right after the create commits
+	// at quorum (notably just after a killed node restarts and rejoins the
+	// direct-get pool), spuriously failing the Submit. Marking the root Running
+	// from the known create revision sidesteps that read entirely.
+	//
+	// Only on a real CAS conflict — a scheduler sweep can list this DAG between
+	// the persist above and the CAS here and claim a ready root first, the
+	// documented one-wins-other-retries model — do we re-read to reassess, by
+	// which point the key provably exists.
 	for _, s := range d.steps {
 		if len(s.allDeps()) != 0 {
 			continue
 		}
+		cur, rev := recs[s.id], createdRev[s.id]
 		for attempt := 0; ; attempt++ {
-			cur, rev, err := wf.Store.GetStep(ctx, d.id, s.id)
-			if err != nil {
-				return fmt.Errorf("workflow: get root %q: %w", s.id, err)
-			}
 			if cur.Status != StatusPending || cur.Held {
 				// A concurrent writer (scheduler sweep, Cancel, Pause) already
 				// owns this root's lifecycle; it has enqueued the step or made
@@ -327,18 +335,25 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow) error {
 				recs[s.id] = cur
 				break
 			}
-			cur.Status = StatusRunning
-			cur.StartedAt = time.Now().UTC()
-			err = wf.Store.PutStep(ctx, d.id, s.id, cur, rev)
+			next := cur
+			next.Status = StatusRunning
+			next.StartedAt = time.Now().UTC()
+			_, err := wf.Store.PutStep(ctx, d.id, s.id, next, rev)
 			if err == nil {
-				recs[s.id] = cur
-				if err := enqueueStep(ctx, wf.Enq, cur, recs, nil, nil); err != nil {
+				recs[s.id] = next
+				if err := enqueueStep(ctx, wf.Enq, next, recs, nil, nil); err != nil {
 					return fmt.Errorf("workflow: enqueue root %q: %w", s.id, err)
 				}
 				break
 			}
 			if !errors.Is(err, ErrStaleRevision) || attempt >= 4 {
 				return fmt.Errorf("workflow: mark root running %q: %w", s.id, err)
+			}
+			// Lost the race: another writer advanced this root. Re-read fresh
+			// state + revision and reassess on the next iteration.
+			cur, rev, err = wf.Store.GetStep(ctx, d.id, s.id)
+			if err != nil {
+				return fmt.Errorf("workflow: get root %q: %w", s.id, err)
 			}
 		}
 	}
