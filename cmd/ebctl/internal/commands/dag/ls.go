@@ -17,6 +17,7 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 	var statusFilter string
 	var since time.Duration
 	var limit int
+	var bpBlockedOnly bool
 
 	cmd := &cobra.Command{
 		Use:   "ls",
@@ -39,12 +40,26 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 			if since > 0 {
 				cutoff = time.Now().Add(-since)
 			}
+			// blockedCounts is filled only when --bp-blocked filtering needs it;
+			// the pretty path reuses it to avoid a second ListSteps round trip.
+			blockedCounts := map[string]int{}
 			for _, m := range metas {
 				if statusFilter != "" && !strings.EqualFold(string(m.Status), statusFilter) {
 					continue
 				}
 				if !cutoff.IsZero() && m.CreatedAt.Before(cutoff) {
 					continue
+				}
+				if bpBlockedOnly {
+					steps, err := wf.Store.ListSteps(ctx, m.ID)
+					if err != nil {
+						continue
+					}
+					n := blockedBPCount(m, steps)
+					if n == 0 {
+						continue
+					}
+					blockedCounts[m.ID] = n
 				}
 				filtered = append(filtered, m)
 			}
@@ -78,6 +93,13 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 				stepSum := "?"
 				if err == nil {
 					stepSum = stepsSummary(steps)
+					n, counted := blockedCounts[m.ID]
+					if !counted {
+						n = blockedBPCount(m, steps)
+					}
+					if n > 0 {
+						stepSum += fmt.Sprintf(" ⦿%d", n)
+					}
 				}
 				rows = append(rows, []string{
 					m.ID,
@@ -93,7 +115,13 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 	cmd.Flags().StringVar(&statusFilter, "status", "", "filter by status: running|done|failed|canceled|pausing|paused")
 	cmd.Flags().DurationVar(&since, "since", 0, "only DAGs created within this duration (e.g. 1h)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max rows (0 = unlimited)")
+	cmd.Flags().BoolVar(&bpBlockedOnly, "bp-blocked", false, "only DAGs with at least one step blocked at a breakpoint")
 	return cmd
+}
+
+// blockedBPCount counts breakpoints currently stopping work in a DAG.
+func blockedBPCount(meta workflow.DAGMeta, steps []workflow.StepRecord) int {
+	return workflow.CountBlocked(workflow.ComputeBreakpoints(meta, steps))
 }
 
 func stepsSummary(steps []workflow.StepRecord) string {

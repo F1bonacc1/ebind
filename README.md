@@ -136,6 +136,40 @@ Key behaviors:
 - `workflow.Optional()` - `enrich`'s failure does not fail the DAG.
 - `workflow.WithRetry(policy)` - per-DAG default retry; `workflow.WithStepRetry(policy)` overrides per-step.
 - From inside a handler, `workflow.FromContext(ctx).Step(...)` adds more steps dynamically.
+- `workflow.Pause` / `workflow.Resume` - graceful whole-DAG pause: in-flight steps drain, pending steps are fenced.
+- `workflow.BreakBefore("label")` / `workflow.BreakAfter("label")` - per-step breakpoints (see below).
+
+### Step breakpoints
+
+Stop a DAG line at a specific step to inspect intermediate state, then continue - debugger semantics for workflows:
+
+```go
+// Breakpoint labels are part of the DAG's structure...
+dag := workflow.New()
+parse  := dag.Step("parse", Parse, download.Ref())
+upload := dag.StepOpts("upload", Upload,
+    []workflow.StepOption{workflow.BreakBefore("BeforeUpload")}, parse.Ref())
+
+// ...but which ones are ARMED is decided when you run it.
+_ = dag.Submit(ctx, wf, workflow.WithActiveBreakpoints("BeforeUpload"))
+
+// The line stops with `upload` pending (never dispatched); parallel branches keep running.
+// Inspect whatever you need, then continue:
+n, _ := workflow.ResumeBreakpoint(ctx, wf, dag.ID(), "BeforeUpload")
+```
+
+- `BreakBefore(labels...)` stops before the step executes (it stays `pending`); `BreakAfter(labels...)` lets the step complete - result persisted - but holds its direct dependents.
+- Breakpoints are **inactive by default**. `WithActiveBreakpoints(labels...)` is a `Submit` option, so a statically defined DAG decides at run time which breakpoints to arm; a breakpoint with several labels is armed (and resumable) by any one of them.
+- `ResumeBreakpoint` is "continue", not "disable": the label stays armed, so a later step (including dynamically added ones) carrying it stops again.
+- Blocked state lives in NATS KV - it survives restarts, and any process (or `ebctl`) can list and resume:
+
+```sh
+ebctl dag bp ls <dag-id>              # STEP | POS | LABELS | ARMED | STATE | SINCE | HOLDING
+ebctl dag bp resume <dag-id> <label>  # release the blocked line(s); label stays armed
+ebctl dag watch                       # live feed includes bp_hit / bp_resumed events
+```
+
+See [`examples/15-workflow-breakpoints`](./examples/15-workflow-breakpoints) for a runnable two-stop walkthrough.
 
 ### Resuming `Await` from another instance
 

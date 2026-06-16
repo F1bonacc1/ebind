@@ -81,20 +81,29 @@ func renderTree(w io.Writer, meta workflow.DAGMeta, steps []workflow.StepRecord)
 	}
 	sort.Strings(roots)
 
+	// Steps currently stopped at (or holding via) an active breakpoint get a
+	// ⦿bp suffix. Computed live so it doesn't depend on advisory marks.
+	bpBlocked := map[string]bool{}
+	for _, bp := range workflow.ComputeBreakpoints(meta, steps) {
+		if bp.State == workflow.BPStateBlocked {
+			bpBlocked[bp.StepID] = true
+		}
+	}
+
 	fmt.Fprintf(w, "DAG %s [%s]\n", meta.ID, meta.Status)
 	seen := map[string]bool{}
 	for _, r := range roots {
-		writeNode(w, r, byID, children, seen, "", true)
+		writeNode(w, r, byID, children, bpBlocked, seen, "", true)
 	}
 	// Surface any nodes missed by cycles / orphans.
 	for _, s := range steps {
 		if !seen[s.StepID] {
-			writeNode(w, s.StepID, byID, children, seen, "", true)
+			writeNode(w, s.StepID, byID, children, bpBlocked, seen, "", true)
 		}
 	}
 }
 
-func writeNode(w io.Writer, id string, byID map[string]workflow.StepRecord, children map[string][]string, seen map[string]bool, prefix string, last bool) {
+func writeNode(w io.Writer, id string, byID map[string]workflow.StepRecord, children map[string][]string, bpBlocked map[string]bool, seen map[string]bool, prefix string, last bool) {
 	if seen[id] {
 		return
 	}
@@ -104,7 +113,11 @@ func writeNode(w io.Writer, id string, byID map[string]workflow.StepRecord, chil
 		connector = "└─"
 	}
 	rec := byID[id]
-	fmt.Fprintf(w, "%s%s %s %s [%s]\n", prefix, connector, glyph(rec.Status), id, rec.Status)
+	bpSuffix := ""
+	if bpBlocked[id] {
+		bpSuffix = " ⦿bp"
+	}
+	fmt.Fprintf(w, "%s%s %s %s [%s]%s\n", prefix, connector, glyph(rec.Status), id, rec.Status, bpSuffix)
 	childPrefix := prefix
 	if last {
 		childPrefix += "   "
@@ -113,7 +126,7 @@ func writeNode(w io.Writer, id string, byID map[string]workflow.StepRecord, chil
 	}
 	kids := children[id]
 	for i, k := range kids {
-		writeNode(w, k, byID, children, seen, childPrefix, i == len(kids)-1)
+		writeNode(w, k, byID, children, bpBlocked, seen, childPrefix, i == len(kids)-1)
 	}
 }
 

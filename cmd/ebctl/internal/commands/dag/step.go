@@ -69,6 +69,12 @@ func newStepGetCmd(c *cli.Context) *cobra.Command {
 			if len(rec.OptionalDeps) > 0 {
 				fmt.Fprintf(w, "  optional:     %v\n", rec.OptionalDeps)
 			}
+			if len(rec.BreakBefore) > 0 {
+				fmt.Fprintf(w, "  break_before: %v%s\n", rec.BreakBefore, bpStateSuffix(rec.BPBefore, rec.BPBlockedAt))
+			}
+			if len(rec.BreakAfter) > 0 {
+				fmt.Fprintf(w, "  break_after:  %v%s\n", rec.BreakAfter, bpStateSuffix(rec.BPAfter, rec.BPBlockedAt))
+			}
 			if len(rec.ArgsJSON) > 0 {
 				fmt.Fprintf(w, "  args:         %s\n", string(rec.ArgsJSON))
 			}

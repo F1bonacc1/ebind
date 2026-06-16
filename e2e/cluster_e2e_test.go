@@ -30,6 +30,8 @@ import (
 //	gate2 → Pause/Resume the DAG while degraded
 //	       → restart the killed follower, verify it rejoins and serves clients
 //	gate3 → kill the JetStream meta-leader, then finish the DAG across the failover
+//	       → stop a fresh DAG at step breakpoints, kill a follower while blocked,
+//	         resume both lines on the degraded cluster
 //
 // Phases run sequentially against one shared cluster; a phase failure skips the rest.
 func TestClusterE2E(t *testing.T) {
@@ -516,7 +518,110 @@ func TestClusterE2E(t *testing.T) {
 		}
 	})
 
-	phase("07_FinalVerification", func(t *testing.T) {
+	phase("07_BreakpointsDegraded", func(t *testing.T) {
+		pctx, pcancel := context.WithTimeout(ctx, 150*time.Second)
+		defer pcancel()
+
+		// Both breakpoint flavors armed at submit. A blocked step is never
+		// dispatched, so the breakpoints themselves are the deterministic
+		// failure-injection window — no gate handlers needed.
+		bdag := workflow.New(workflow.WithDAGID("e2e-bp"))
+		r1 := bdag.Step("r1", eAdd, 1, 2) // = 3
+		mid := bdag.StepOpts("mid", eDouble, []workflow.StepOption{
+			workflow.BreakBefore("BeforeMid"),
+		}, r1.Ref()) // blocked before execution
+		_ = bdag.Step("tail", eInc, mid.Ref()) // = 7 after release
+		r2 := bdag.StepOpts("r2", eAdd, []workflow.StepOption{
+			workflow.BreakAfter("AfterRoot", "AltLabel"),
+		}, 10, 10) // = 20; completes, then gates dep2
+		_ = bdag.Step("dep2", eDouble, r2.Ref()) // = 40 after release
+		_ = bdag.Step("free", eInc, 100)         // parallel line, never blocked → 101
+		if err := bdag.Submit(pctx, h.wf,
+			workflow.WithActiveBreakpoints("BeforeMid", "AfterRoot")); err != nil {
+			t.Fatal(err)
+		}
+
+		// The unblocked parallel line and the after-BP step itself both finish
+		// while the gates hold; r2's result is durable and readable.
+		if got, err := workflow.AwaitByID[int](pctx, h.wf, "e2e-bp", "free"); err != nil || got != 101 {
+			t.Fatalf("free: got %d, %v; want 101", got, err)
+		}
+		if got, err := workflow.AwaitByID[int](pctx, h.wf, "e2e-bp", "r2"); err != nil || got != 20 {
+			t.Fatalf("r2: got %d, %v; want 20 (after-BP step completes)", got, err)
+		}
+		// countBlocked retries transient read errors (returns -1 only after the
+		// deadline) so one-shot assertions stay strict without flaking during
+		// degraded-cluster windows.
+		countBlocked := func() int {
+			deadline := time.Now().Add(15 * time.Second)
+			for {
+				infos, err := workflow.ListBreakpoints(ctx, h.wf, "e2e-bp")
+				if err == nil {
+					return workflow.CountBlocked(infos)
+				}
+				if time.Now().After(deadline) {
+					return -1
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		waitFor(t, 30*time.Second, "both breakpoints blocked", func() bool {
+			return countBlocked() == 2
+		})
+		for _, id := range []string{"mid", "dep2"} {
+			if st := h.stepStatus(pctx, "e2e-bp", id); st != workflow.StatusPending {
+				t.Fatalf("step %s: status=%s, want pending while blocked", id, st)
+			}
+		}
+
+		// Chaos: kill a follower while both lines are stopped. Blocked state is
+		// replicated in KV at R=3, so the surviving quorum must still see it.
+		victim := h.followerIndex()
+		if victim < 0 {
+			t.Fatal("no follower to kill")
+		}
+		t.Logf("killing follower node %d while breakpoints hold", victim)
+		h.cluster.ShutdownNode(victim)
+		h.waitStreamLeadersSettled(t, 30*time.Second)
+
+		if n := countBlocked(); n != 2 {
+			t.Fatalf("blocked breakpoints on degraded cluster: got %d, want 2", n)
+		}
+		if st := h.dagStatus(pctx, "e2e-bp"); st != workflow.DAGStatusRunning {
+			t.Fatalf("bp DAG status: got %s, want running (blocked ≠ terminal)", st)
+		}
+
+		// Both resumes land on the 2-node cluster. r2's multi-label breakpoint
+		// is released via its second label.
+		if n, err := workflow.ResumeBreakpoint(pctx, h.wf, "e2e-bp", "BeforeMid"); err != nil || n != 1 {
+			t.Fatalf("resume BeforeMid: n=%d err=%v", n, err)
+		}
+		if n, err := workflow.ResumeBreakpoint(pctx, h.wf, "e2e-bp", "AltLabel"); err != nil || n != 1 {
+			t.Fatalf("resume AltLabel: n=%d err=%v", n, err)
+		}
+		if got, err := workflow.AwaitByID[int](pctx, h.wf, "e2e-bp", "tail"); err != nil || got != 7 {
+			t.Fatalf("tail: got %d, %v; want 7", got, err)
+		}
+		if got, err := workflow.AwaitByID[int](pctx, h.wf, "e2e-bp", "dep2"); err != nil || got != 40 {
+			t.Fatalf("dep2: got %d, %v; want 40 (real upstream result, not default)", got, err)
+		}
+		waitFor(t, 30*time.Second, "bp DAG done", func() bool {
+			return h.dagStatus(ctx, "e2e-bp") == workflow.DAGStatusDone
+		})
+
+		// Restore the full cluster for the final verification phase.
+		if err := h.cluster.RestartNode(victim); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.cluster.WaitReady(30 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.cluster.WaitNodeHealthy(victim, 60*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	phase("08_FinalVerification", func(t *testing.T) {
 		pctx, pcancel := context.WithTimeout(ctx, 120*time.Second)
 		defer pcancel()
 

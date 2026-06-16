@@ -100,6 +100,7 @@ workflow/
   step.go                Step + StepOption
   dag.go                 DAG builder, Submit, cycle detection
   scheduler.go           handleEvent + watchLeadership + sweep
+  breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint
   hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
   context.go             FromContext — dynamic step addition
   await.go               Await[T] via KV WatchResult + DAGInfo
@@ -126,8 +127,9 @@ cmd/ebctl/               operator CLI (cobra)
   - `workflow/state_test.go`, `workflow/ref_test.go`, `workflow/dag_test.go`
 - **Unit with fakes** — MemStore + MemBus + captureEnq:
   - `workflow/scheduler_test.go`, `workflow/store_test.go`
+  - `workflow/breakpoint_test.go` (pure gate-predicate tests + fakes-driven scheduler/resume tests)
 - **Integration** — real in-process NATS via `embed.StartNode`:
-  - `worker/worker_test.go`, `workflow/integration_test.go`
+  - `worker/worker_test.go`, `workflow/integration_test.go`, `workflow/breakpoint_integration_test.go`
 - **Cluster integration** — 3-node in-process cluster:
   - `embed/cluster_test.go`
 - **Cluster chaos e2e** (build tag `e2e`, excluded from `make test`) — every supported operation on a 3-node cluster at R=3, with node kill + restart injected mid-workflow:
@@ -158,6 +160,26 @@ Within one scheduler instance, `mu` serializes event handling. Across instances,
 
 ### Sweep on leader acquisition
 When `IsLeader()` flips false→true, the scheduler sweeps all running DAGs and re-enqueues any stranded ready steps. Edge-triggered, not level-triggered. Defaults: 5s poll, 60s sweep timeout. Overlap-guarded.
+
+### Breakpoints are computed gates; `Held` and BP fences are independent
+Per-step breakpoints (`BreakBefore`/`BreakAfter` StepOptions, armed via
+`WithActiveBreakpoints` at submit) gate scheduling inside the pure layer:
+`ReadyToRun` refuses a pending step whose before-BP is armed, `depsSatisfied`
+refuses dependents of a done step whose after-BP is armed. The gate is computed
+from immutable config (labels × `DAGMeta.ActiveBreakpoints`) plus the monotonic
+`BPBefore`/`BPAfter = released` flag written only by `ResumeBreakpoint` — the
+persisted `blocked` marks (`bp_before`/`bp_after`/`bp_blocked_at`) are advisory
+observability only, never load-bearing. Resume is debugger "continue": the label
+stays armed; each call releases only what is currently stopped. The pause `Held`
+fence and BP state are separate fields by design — DAG `Resume` and the
+orphan-hold sweep touch only `Held`/`HeldAt`, `ResumeBreakpoint` touches only BP
+state; the two fences compose. Never merge them.
+
+Breakpoint transitions are announced as **informational** `bp_hit`/`bp_resumed`
+events (published best-effort by the advisory-mark CAS winner and by
+`ResumeBreakpoint`; rendered live by `ebctl dag watch`). Schedulers Ack-drop
+them — nothing load-bearing may ever depend on their delivery; the durable
+truth is the step record (`dag bp ls`).
 
 ### KV reads are direct-get — no read-your-writes
 NATS JetStream KV `Get` is a *direct get*: hardcoded `AllowDirect: true` on the bucket stream, served by any in-sync replica via a queue group, not just the leader. A `Create`/`Update` commits at quorum (leader + 1 of 2 followers); the third replica applies a beat later. So a `Get` issued immediately after a write can be answered by a lagging replica and return a stale value — including `ErrKeyNotFound`/`ErrStepNotFound` for a key that definitely exists. The window is widest right after a node restart (the rejoined replica is back in the direct-get pool but a hair behind). **Never read-back-after-write to recover a revision** — `StateStore.PutStep`/`PutMeta` should return the new revision (as `kv.Create`/`kv.Update` do) and callers CAS from it directly. Writes/CAS are strongly consistent (leader-served, quorum); only this relaxed read path needs care. See `workflow/dag.go::Submit` and the `Step_PutReturnsUsableRevision` store contract.
