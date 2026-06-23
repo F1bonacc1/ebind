@@ -176,6 +176,57 @@ func (c *captureHook) OnStepFailed(_ context.Context, t *task.Task, _ *task.Task
 	return nil
 }
 
+// flakyDoneHook fails OnStepDone a fixed number of times before succeeding,
+// simulating a completion-persist failure (e.g. a stale-revision CAS on a
+// freshly-formed cluster). It also counts total OnStepDone invocations.
+type flakyDoneHook struct {
+	failsLeft atomic.Int32
+	calls     atomic.Int32
+	succeeded atomic.Int32
+}
+
+func (h *flakyDoneHook) OnStepDone(_ context.Context, _ *task.Task, _ []byte) error {
+	h.calls.Add(1)
+	if h.failsLeft.Add(-1) >= 0 {
+		return errors.New("transient completion-persist failure")
+	}
+	h.succeeded.Add(1)
+	return nil
+}
+func (h *flakyDoneHook) OnStepFailed(_ context.Context, _ *task.Task, _ *task.TaskError) error {
+	return nil
+}
+
+// TestWorker_StepHook_OnDoneError_Redelivers verifies the worker does NOT ack a
+// message when OnStepDone fails: it must redeliver so the (idempotent) handler
+// re-runs and the completion is retried, rather than silently dropping the
+// completion and stranding the step. Regression test for the lost-completion
+// bug where the hook error was discarded and the message acked anyway.
+func TestWorker_StepHook_OnDoneError_Redelivers(t *testing.T) {
+	hook := &flakyDoneHook{}
+	hook.failsLeft.Store(1) // fail the completion-persist once, then succeed
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1, MaxDeliver: 5, StepHook: hook})
+	task.MustRegister(h.Reg, echo)
+
+	fut, err := client.Enqueue(h.Client, echo, "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	// The response is published only after OnStepDone succeeds, so a resolved
+	// future proves the completion was eventually persisted (not dropped).
+	if _, err := client.Await[string](ctx, fut); err != nil {
+		t.Fatalf("future never resolved — completion was dropped instead of retried: %v", err)
+	}
+	if hook.succeeded.Load() != 1 {
+		t.Errorf("succeeded=%d, want 1 (completion eventually persisted)", hook.succeeded.Load())
+	}
+	if got := hook.calls.Load(); got < 2 {
+		t.Errorf("OnStepDone calls=%d, want >=2 (message redelivered after first failure)", got)
+	}
+}
+
 func TestWorker_StepHook_OnSuccess(t *testing.T) {
 	hook := &captureHook{}
 	h := testutil.SingleNode(t, worker.Options{Concurrency: 1, StepHook: hook})

@@ -433,20 +433,36 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 			return
 		}
 		resp.Error = te
+		// Persist the terminal failure status BEFORE acking/terminating and
+		// before publishing the response/DLQ. If the status write fails (e.g. a
+		// stale-revision CAS on a freshly-formed cluster), do NOT Term — that
+		// would drop the only signal the scheduler has and strand the step in
+		// "running" forever. Redeliver instead so the failure is retried.
+		if w.opts.StepHook != nil {
+			if hookErr := w.opts.StepHook.OnStepFailed(ctx, &t, te); hookErr != nil {
+				_ = msg.NakWithDelay(w.delayFor(&t))
+				return
+			}
+		}
 		w.publishResponse(ctx, &t, &resp)
 		w.publishDLQ(ctx, &t, te)
-		if w.opts.StepHook != nil {
-			_ = w.opts.StepHook.OnStepFailed(ctx, &t, te)
-		}
 		_ = msg.Term()
 		return
 	}
 
 	resp.Result = result
-	w.publishResponse(ctx, &t, &resp)
+	// Persist the completion (step -> done + result + completed event) BEFORE
+	// acking. The hook's CAS can fail on a stale direct-get read while the
+	// cluster is still converging; acking anyway would silently lose the
+	// completion and leave the step stranded in "running". Redeliver instead so
+	// the (idempotent) handler re-runs and the completion is retried.
 	if w.opts.StepHook != nil {
-		_ = w.opts.StepHook.OnStepDone(ctx, &t, result)
+		if hookErr := w.opts.StepHook.OnStepDone(ctx, &t, result); hookErr != nil {
+			_ = msg.NakWithDelay(w.delayFor(&t))
+			return
+		}
 	}
+	w.publishResponse(ctx, &t, &resp)
 	_ = msg.Ack()
 }
 

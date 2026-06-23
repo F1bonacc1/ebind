@@ -114,6 +114,69 @@ func TestStepHook_OnStepFailed_DisabledMessage(t *testing.T) {
 	}
 }
 
+// laggingGetStore wraps a StateStore and makes the first staleReads GetStep
+// calls return a wrong (stale) revision, simulating a JetStream KV direct-get
+// served by a replica that lags the quorum leader. The CAS PutStep then fails
+// with ErrStaleRevision until the "replica" converges.
+type laggingGetStore struct {
+	StateStore
+	staleReads int
+}
+
+func (s *laggingGetStore) GetStep(ctx context.Context, dagID, stepID string) (StepRecord, uint64, error) {
+	rec, rev, err := s.StateStore.GetStep(ctx, dagID, stepID)
+	if err != nil {
+		return rec, rev, err
+	}
+	if s.staleReads > 0 {
+		s.staleReads--
+		return rec, rev + 1000, nil // wrong revision → CAS rejected
+	}
+	return rec, rev, nil
+}
+
+// TestStepHook_OnStepDone_RetriesPastStaleReads proves the completion is NOT
+// lost when early direct-get reads are stale: casUpdateStatus backs off and
+// re-reads until the replica converges, then the CAS commits and the step is
+// marked done. Regression test for the dropped-completion root cause.
+func TestStepHook_OnStepDone_RetriesPastStaleReads(t *testing.T) {
+	orig := casStaleRetryBackoff
+	casStaleRetryBackoff = time.Millisecond
+	defer func() { casStaleRetryBackoff = orig }()
+
+	mem := NewMemStore()
+	seedRunningStep(t, mem, "dag1", "s1")
+	store := &laggingGetStore{StateStore: mem, staleReads: 2}
+	hook := (&Workflow{Store: store, Bus: NewMemBus()}).Hook()
+
+	if err := hook.OnStepDone(context.Background(), &task.Task{DAGID: "dag1", StepID: "s1"}, []byte("ok")); err != nil {
+		t.Fatalf("OnStepDone should succeed once stale reads converge, got: %v", err)
+	}
+	rec, _, _ := mem.GetStep(context.Background(), "dag1", "s1")
+	if rec.Status != StatusDone {
+		t.Errorf("status = %s, want done", rec.Status)
+	}
+}
+
+// TestStepHook_OnStepDone_FailsWhenPersistentlyStale verifies that if the CAS
+// can never commit (reads never converge), the hook surfaces an error rather
+// than silently succeeding — the worker relies on this error to redeliver
+// instead of acking and dropping the completion.
+func TestStepHook_OnStepDone_FailsWhenPersistentlyStale(t *testing.T) {
+	orig := casStaleRetryBackoff
+	casStaleRetryBackoff = time.Millisecond
+	defer func() { casStaleRetryBackoff = orig }()
+
+	mem := NewMemStore()
+	seedRunningStep(t, mem, "dag1", "s1")
+	store := &laggingGetStore{StateStore: mem, staleReads: 1000}
+	hook := (&Workflow{Store: store, Bus: NewMemBus()}).Hook()
+
+	if err := hook.OnStepDone(context.Background(), &task.Task{DAGID: "dag1", StepID: "s1"}, []byte("ok")); err == nil {
+		t.Fatal("OnStepDone must return an error when the CAS never commits")
+	}
+}
+
 func TestTruncateErrorMessage(t *testing.T) {
 	cases := []struct {
 		name string

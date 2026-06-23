@@ -51,9 +51,22 @@ func (h *StepHook) OnStepFailed(ctx context.Context, t *task.Task, taskErr *task
 		StepID: t.StepID, Status: StatusFailed, ErrorKind: taskErr.Kind, ErrorMessage: msg})
 }
 
-// casUpdateStatus retries on stale revision (another writer won the race).
+// casStaleRetryBackoff is the base delay between stale-revision CAS retries.
+// It grows linearly per attempt. A non-zero delay is essential: GetStep is a
+// JetStream KV direct-get that can be served by a replica lagging the quorum
+// leader (the window is widest right after a node restart / fresh cluster
+// formation). With no delay, all retries re-read the SAME stale revision and
+// the CAS can never succeed, so a legitimate completion is dropped. Backing off
+// lets the lagging replica catch up so a subsequent GetStep returns the
+// committed revision and the CAS commits.
+var casStaleRetryBackoff = 50 * time.Millisecond
+
+// casUpdateStatus retries on stale revision (another writer won the race, or a
+// direct-get read lagged the quorum). It backs off between attempts so a lagging
+// replica can converge rather than spinning on the same stale snapshot.
 func (h *StepHook) casUpdateStatus(ctx context.Context, t *task.Task, status StepStatus, errKind, errMsg string) error {
-	for attempt := 0; attempt < 5; attempt++ {
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		rec, rev, err := h.store.GetStep(ctx, t.DAGID, t.StepID)
 		if err != nil {
 			return err
@@ -72,6 +85,14 @@ func (h *StepHook) casUpdateStatus(ctx context.Context, t *task.Task, status Ste
 		}
 		if !errors.Is(err, ErrStaleRevision) {
 			return err
+		}
+		// Stale revision — let the lagging replica converge before re-reading.
+		if attempt < maxAttempts-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(casStaleRetryBackoff * time.Duration(attempt+1)):
+			}
 		}
 	}
 	return ErrStaleRevision
