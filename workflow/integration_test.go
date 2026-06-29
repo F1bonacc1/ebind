@@ -1531,50 +1531,37 @@ func TestIntegration_Labels_QueryByLabel(t *testing.T) {
 	d2 := submit("billing")
 	d3 := submit("reports")
 
-	has := func(metas []workflow.DAGMeta, id string) bool {
-		for _, m := range metas {
-			if m.ID == id {
-				return true
+	// ListDAGs is backed by NATS kv.ListKeys + per-key direct Get, both
+	// eventually consistent: a DAG created microseconds ago can be transiently
+	// omitted from the listing until the key propagates. The feature targets
+	// settled history where this never bites, but querying immediately after
+	// creation (as this test does) races that window — so poll until the query
+	// matches, like the other JetStream-backed integration tests here.
+	assertQuery := func(name string, want []string, labels ...string) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		var got []string
+		for time.Now().Before(deadline) {
+			metas, err := workflow.ListDAGsByLabels(ctx, h.wf, labels...)
+			if err != nil {
+				t.Fatal(err)
 			}
+			got = got[:0]
+			for _, m := range metas {
+				got = append(got, m.ID)
+			}
+			if sameStringSet(got, want) {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		return false
+		t.Errorf("%s query = %v, want set %v", name, got, want)
 	}
 
-	// "billing" returns d1 and d2 but not d3.
-	billing, err := workflow.ListDAGsByLabels(ctx, h.wf, "billing")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(billing) != 2 || !has(billing, d1) || !has(billing, d2) || has(billing, d3) {
-		t.Errorf("billing query = %+v, want {%s,%s}", billing, d1, d2)
-	}
-
-	// "billing"+"nightly" (AND) returns only d1.
-	both, err := workflow.ListDAGsByLabels(ctx, h.wf, "billing", "nightly")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(both) != 1 || !has(both, d1) {
-		t.Errorf("billing+nightly query = %+v, want {%s}", both, d1)
-	}
-
-	// "reports" returns only d3.
-	reports, err := workflow.ListDAGsByLabels(ctx, h.wf, "reports")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reports) != 1 || !has(reports, d3) {
-		t.Errorf("reports query = %+v, want {%s}", reports, d3)
-	}
-
-	// No labels returns all three.
-	all, err := workflow.ListDAGsByLabels(ctx, h.wf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(all) != 3 {
-		t.Errorf("unfiltered query returned %d, want 3", len(all))
-	}
+	assertQuery("billing", []string{d1, d2}, "billing")              // both billing DAGs, not reports
+	assertQuery("billing+nightly", []string{d1}, "billing", "nightly") // AND: only d1
+	assertQuery("reports", []string{d3}, "reports")                  // only d3
+	assertQuery("all", []string{d1, d2, d3})                         // no filter: every DAG
 
 	// Labels are persisted on the meta record (immutable, survives to Debug).
 	dbg, err := workflow.Debug(ctx, h.wf, d1)
@@ -1584,4 +1571,22 @@ func TestIntegration_Labels_QueryByLabel(t *testing.T) {
 	if len(dbg.Meta.Labels) != 2 {
 		t.Errorf("d1 meta labels = %v, want 2", dbg.Meta.Labels)
 	}
+}
+
+// sameStringSet reports whether a and b contain the same elements (ignoring
+// order and assuming no duplicates).
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		set[s] = struct{}{}
+	}
+	for _, s := range b {
+		if _, ok := set[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
