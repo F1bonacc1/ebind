@@ -1558,10 +1558,10 @@ func TestIntegration_Labels_QueryByLabel(t *testing.T) {
 		t.Errorf("%s query = %v, want set %v", name, got, want)
 	}
 
-	assertQuery("billing", []string{d1, d2}, "billing")              // both billing DAGs, not reports
+	assertQuery("billing", []string{d1, d2}, "billing")                // both billing DAGs, not reports
 	assertQuery("billing+nightly", []string{d1}, "billing", "nightly") // AND: only d1
-	assertQuery("reports", []string{d3}, "reports")                  // only d3
-	assertQuery("all", []string{d1, d2, d3})                         // no filter: every DAG
+	assertQuery("reports", []string{d3}, "reports")                    // only d3
+	assertQuery("all", []string{d1, d2, d3})                           // no filter: every DAG
 
 	// Labels are persisted on the meta record (immutable, survives to Debug).
 	dbg, err := workflow.Debug(ctx, h.wf, d1)
