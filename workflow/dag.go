@@ -26,6 +26,14 @@ func WithRetry(p task.RetryPolicy) DAGOption {
 // WithDAGID pins an explicit DAG ID (otherwise a uuid is generated).
 func WithDAGID(id string) DAGOption { return func(d *DAG) { d.id = id } }
 
+// WithLabels attaches immutable string tags to the workflow, fixed at creation
+// and persisted at Submit. Labels group workflows by topic so the history can be
+// queried by tag with ListDAGsByLabels or `ebctl dag ls --label`. Duplicate
+// labels are collapsed; an empty-string label is rejected at Submit.
+func WithLabels(labels ...string) DAGOption {
+	return func(d *DAG) { d.labels = append(d.labels, labels...) }
+}
+
 // SubmitOption configures a single Submit call — run-time decisions that are
 // not part of the DAG's structure.
 type SubmitOption func(*submitOptions)
@@ -58,6 +66,7 @@ type DAG struct {
 	steps         []*Step
 	stepMap       map[string]*Step
 	defaultPolicy *task.RetryPolicy
+	labels        []string   // immutable topic tags (WithLabels)
 	mu            sync.Mutex // guards dynamic AddStep post-Submit
 	submitted     bool
 }
@@ -321,6 +330,10 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 		d.mu.Unlock()
 		return fmt.Errorf("workflow: WithActiveBreakpoints label must be non-empty")
 	}
+	if slices.Contains(d.labels, "") {
+		d.mu.Unlock()
+		return fmt.Errorf("workflow: WithLabels label must be non-empty")
+	}
 	d.submitted = true
 	d.mu.Unlock()
 
@@ -341,6 +354,7 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 		CreatedAt:         time.Now().UTC(),
 		DefaultPolicy:     d.defaultPolicy,
 		ActiveBreakpoints: dedupeStrings(so.activeBreakpoints),
+		Labels:            dedupeStrings(d.labels),
 	}
 	if err := wf.Store.PutMeta(ctx, d.id, meta, 0); err != nil {
 		return fmt.Errorf("workflow: put meta: %w", err)

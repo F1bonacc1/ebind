@@ -181,9 +181,17 @@ func WriteDebug(w io.Writer, dbg DAGDebug) error {
 		dbg.Meta.ID, statusHeaderLabel(dbg.Meta.Status), ageStr, pausedStr, totalStr, bpStr); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(w, "  steps: %d done, %d failed, %d skipped, %d canceled, %d pending, %d running\n\n",
+	if _, err := fmt.Fprintf(w, "  steps: %d done, %d failed, %d skipped, %d canceled, %d pending, %d running\n",
 		dbg.Counts[StatusDone], dbg.Counts[StatusFailed], dbg.Counts[StatusSkipped], dbg.Counts[StatusCanceled],
 		dbg.Counts[StatusPending], dbg.Counts[StatusRunning]); err != nil {
+		return err
+	}
+	if len(dbg.Meta.Labels) > 0 {
+		if _, err := fmt.Fprintf(w, "  labels: %s\n", strings.Join(dbg.Meta.Labels, ", ")); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
 		return err
 	}
 

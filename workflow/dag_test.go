@@ -89,6 +89,56 @@ func TestDAG_Submit_PersistsMetaAndSteps(t *testing.T) {
 	}
 }
 
+func TestDAG_Submit_PersistsDedupedLabels(t *testing.T) {
+	store := NewMemStore()
+	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
+	dag := New(WithLabels("billing", "nightly"), WithLabels("billing")) // dup across calls
+	dag.Step("a", noopA, 42)
+
+	if err := dag.Submit(context.Background(), wf); err != nil {
+		t.Fatal(err)
+	}
+	meta, _, err := store.GetMeta(context.Background(), dag.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"billing", "nightly"}
+	if len(meta.Labels) != len(want) {
+		t.Fatalf("labels=%v, want %v", meta.Labels, want)
+	}
+	for i := range want {
+		if meta.Labels[i] != want[i] {
+			t.Fatalf("labels=%v, want %v", meta.Labels, want)
+		}
+	}
+}
+
+func TestDAG_Submit_NoLabels_NilLabels(t *testing.T) {
+	store := NewMemStore()
+	wf := NewWorkflow(store, NewMemBus(), &captureEnq{})
+	dag := New()
+	dag.Step("a", noopA, 42)
+
+	if err := dag.Submit(context.Background(), wf); err != nil {
+		t.Fatal(err)
+	}
+	meta, _, _ := store.GetMeta(context.Background(), dag.ID())
+	if meta.Labels != nil {
+		t.Errorf("labels=%v, want nil", meta.Labels)
+	}
+}
+
+func TestDAG_Submit_EmptyLabel_Rejected(t *testing.T) {
+	wf := NewWorkflow(NewMemStore(), NewMemBus(), &captureEnq{})
+	dag := New(WithLabels("billing", ""))
+	dag.Step("a", noopA, 42)
+
+	err := dag.Submit(context.Background(), wf)
+	if err == nil || !strings.Contains(err.Error(), "non-empty") {
+		t.Errorf("want non-empty label error, got %v", err)
+	}
+}
+
 func TestDAG_Submit_EnqueuesRoots_Only(t *testing.T) {
 	enq := &captureEnq{}
 	wf := NewWorkflow(NewMemStore(), NewMemBus(), enq)

@@ -1507,3 +1507,81 @@ func TestPauseResume_Race_ResumeAndComplete(t *testing.T) {
 	}
 	t.Logf("Step c result: %s", string(res))
 }
+
+func TestIntegration_Labels_QueryByLabel(t *testing.T) {
+	h := setup(t)
+	task.MustRegister(h.reg, hAdd)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Three labeled workflows: two "billing" (one also "nightly"), one "reports".
+	submit := func(labels ...string) string {
+		dag := workflow.New(workflow.WithLabels(labels...))
+		s := dag.Step("a", hAdd, 2, 3)
+		if err := dag.Submit(ctx, h.wf); err != nil {
+			t.Fatalf("submit %v: %v", labels, err)
+		}
+		if _, err := workflow.Await[int](ctx, h.wf, dag.ID(), s); err != nil {
+			t.Fatalf("await %v: %v", labels, err)
+		}
+		return dag.ID()
+	}
+	d1 := submit("billing", "nightly")
+	d2 := submit("billing")
+	d3 := submit("reports")
+
+	has := func(metas []workflow.DAGMeta, id string) bool {
+		for _, m := range metas {
+			if m.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	// "billing" returns d1 and d2 but not d3.
+	billing, err := workflow.ListDAGsByLabels(ctx, h.wf, "billing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(billing) != 2 || !has(billing, d1) || !has(billing, d2) || has(billing, d3) {
+		t.Errorf("billing query = %+v, want {%s,%s}", billing, d1, d2)
+	}
+
+	// "billing"+"nightly" (AND) returns only d1.
+	both, err := workflow.ListDAGsByLabels(ctx, h.wf, "billing", "nightly")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(both) != 1 || !has(both, d1) {
+		t.Errorf("billing+nightly query = %+v, want {%s}", both, d1)
+	}
+
+	// "reports" returns only d3.
+	reports, err := workflow.ListDAGsByLabels(ctx, h.wf, "reports")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 || !has(reports, d3) {
+		t.Errorf("reports query = %+v, want {%s}", reports, d3)
+	}
+
+	// No labels returns all three.
+	all, err := workflow.ListDAGsByLabels(ctx, h.wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Errorf("unfiltered query returned %d, want 3", len(all))
+	}
+
+	// Labels are persisted on the meta record (immutable, survives to Debug).
+	dbg, err := workflow.Debug(ctx, h.wf, d1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dbg.Meta.Labels) != 2 {
+		t.Errorf("d1 meta labels = %v, want 2", dbg.Meta.Labels)
+	}
+}
