@@ -50,6 +50,10 @@ type DAGMeta struct {
 	// ActiveBreakpoints is the set of armed breakpoint labels, fixed at Submit
 	// (WithActiveBreakpoints). Immutable for the DAG's lifetime.
 	ActiveBreakpoints []string `json:"active_breakpoints,omitempty"`
+	// Labels are immutable string tags attached at New (WithLabels) and persisted
+	// at Submit. Used to query workflow history by topic (ListDAGsByLabels /
+	// `ebctl dag ls --label`). Fixed for the DAG's lifetime.
+	Labels []string `json:"labels,omitempty"`
 }
 
 // StepRecord is stored per-step (key: <dag_id>/step/<step_id>).

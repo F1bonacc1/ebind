@@ -14,6 +14,12 @@
 //	notify    BreakBefore("BeforeNotify") — blocks the independent metrics
 //	          line while the main line keeps flowing
 //
+// Labels: every DAG is tagged "pipeline" plus a rotating topic
+// (billing/reports/analytics), and breakpoint-armed DAGs additionally carry
+// "breakpoints" — so `dag ls --label pipeline` returns all of them,
+// `--label breakpoints` returns only the stopped ones, and `--label billing`
+// returns just that topic's subset (AND semantics across repeated --label).
+//
 // Typical session:
 //
 //	# terminal 1
@@ -22,6 +28,9 @@
 //	# terminal 2
 //	./bin/ebctl dag ls
 //	./bin/ebctl dag ls --bp-blocked
+//	./bin/ebctl dag ls --label pipeline
+//	./bin/ebctl dag ls --label breakpoints
+//	./bin/ebctl dag ls --label billing
 //	./bin/ebctl dag get <dag-id>
 //	./bin/ebctl dag bp ls <dag-id>
 //	./bin/ebctl dag bp resume <dag-id> Checkpoint
@@ -273,7 +282,8 @@ func run(cfg config) error {
 	submit := func() {
 		n := submitted.Add(1)
 		armBPs := cfg.bpEvery > 0 && (n-1)%uint64(cfg.bpEvery) == 0
-		id, err := submitDAG(ctx, wf, armBPs)
+		labels := dagLabels(n, armBPs)
+		id, err := submitDAG(ctx, wf, armBPs, labels)
 		if err != nil {
 			log.Printf("submit: %v", err)
 			return
@@ -286,6 +296,8 @@ func run(cfg config) error {
 			log.Printf("submitted DAG #%d id=%s", n, id)
 			log.Printf("  try:  ebctl -s %s dag get %s", node.ClientURL(), id)
 		}
+		log.Printf("  labels: [%s] — e.g. ebctl -s %s dag ls --label %s",
+			strings.Join(labels, ","), node.ClientURL(), labels[len(labels)-1])
 	}
 
 	submit()
@@ -315,11 +327,26 @@ shutdown:
 // SECOND label — resuming works through either one ("any label" semantics).
 var armedBPLabels = []string{"Checkpoint", "BeforePublish", "BeforeNotify"}
 
+// topicPool rotates a topic tag across submissions so `dag ls --label <topic>`
+// returns a subset rather than everything.
+var topicPool = []string{"billing", "reports", "analytics"}
+
+// dagLabels builds the immutable WithLabels set for the Nth DAG: a constant
+// "pipeline" tag (matches every playground DAG), a rotating topic, and
+// "breakpoints" when this run is armed to stop.
+func dagLabels(n uint64, armBPs bool) []string {
+	labels := []string{"pipeline", topicPool[(n-1)%uint64(len(topicPool))]}
+	if armBPs {
+		labels = append(labels, "breakpoints")
+	}
+	return labels
+}
+
 // submitDAG builds and submits the complex DAG described in the package doc.
 // Returns the DAG's generated ID so the caller can surface it in logs.
 // Breakpoint labels are always declared on the steps (inert by default);
 // armBPs decides at submit time whether this execution stops at them.
-func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs bool) (string, error) {
+func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs bool, labels []string) (string, error) {
 	// Fast-giving-up retry policy — transform-b goes to DLQ after 3 attempts
 	// so the user sees DLQ entries within ~10s rather than after a minute.
 	quickRetry := task.RetryPolicy{
@@ -330,7 +357,11 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs bool) (string,
 	}
 
 	dagID := "pipeline-" + uuid.NewString()[:8]
-	dag := workflow.New(workflow.WithDAGID(dagID), workflow.WithRetry(quickRetry))
+	dag := workflow.New(
+		workflow.WithDAGID(dagID),
+		workflow.WithRetry(quickRetry),
+		workflow.WithLabels(labels...),
+	)
 
 	ingest := dag.Step("ingest", Ingest, "api.example.com")
 	// After-BP with two labels: when armed, validate completes (its result is

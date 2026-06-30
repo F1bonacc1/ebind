@@ -1507,3 +1507,86 @@ func TestPauseResume_Race_ResumeAndComplete(t *testing.T) {
 	}
 	t.Logf("Step c result: %s", string(res))
 }
+
+func TestIntegration_Labels_QueryByLabel(t *testing.T) {
+	h := setup(t)
+	task.MustRegister(h.reg, hAdd)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Three labeled workflows: two "billing" (one also "nightly"), one "reports".
+	submit := func(labels ...string) string {
+		dag := workflow.New(workflow.WithLabels(labels...))
+		s := dag.Step("a", hAdd, 2, 3)
+		if err := dag.Submit(ctx, h.wf); err != nil {
+			t.Fatalf("submit %v: %v", labels, err)
+		}
+		if _, err := workflow.Await[int](ctx, h.wf, dag.ID(), s); err != nil {
+			t.Fatalf("await %v: %v", labels, err)
+		}
+		return dag.ID()
+	}
+	d1 := submit("billing", "nightly")
+	d2 := submit("billing")
+	d3 := submit("reports")
+
+	// ListDAGs is backed by NATS kv.ListKeys + per-key direct Get, both
+	// eventually consistent: a DAG created microseconds ago can be transiently
+	// omitted from the listing until the key propagates. The feature targets
+	// settled history where this never bites, but querying immediately after
+	// creation (as this test does) races that window — so poll until the query
+	// matches, like the other JetStream-backed integration tests here.
+	assertQuery := func(name string, want []string, labels ...string) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		var got []string
+		for time.Now().Before(deadline) {
+			metas, err := workflow.ListDAGsByLabels(ctx, h.wf, labels...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = got[:0]
+			for _, m := range metas {
+				got = append(got, m.ID)
+			}
+			if sameStringSet(got, want) {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Errorf("%s query = %v, want set %v", name, got, want)
+	}
+
+	assertQuery("billing", []string{d1, d2}, "billing")                // both billing DAGs, not reports
+	assertQuery("billing+nightly", []string{d1}, "billing", "nightly") // AND: only d1
+	assertQuery("reports", []string{d3}, "reports")                    // only d3
+	assertQuery("all", []string{d1, d2, d3})                           // no filter: every DAG
+
+	// Labels are persisted on the meta record (immutable, survives to Debug).
+	dbg, err := workflow.Debug(ctx, h.wf, d1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dbg.Meta.Labels) != 2 {
+		t.Errorf("d1 meta labels = %v, want 2", dbg.Meta.Labels)
+	}
+}
+
+// sameStringSet reports whether a and b contain the same elements (ignoring
+// order and assuming no duplicates).
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		set[s] = struct{}{}
+	}
+	for _, s := range b {
+		if _, ok := set[s]; !ok {
+			return false
+		}
+	}
+	return true
+}

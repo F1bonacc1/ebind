@@ -29,7 +29,7 @@ See `task/registry.go::Register` and `task/registry.go::Describe`.
 ### 2. State lives in NATS KV; streams carry events and tasks
 
 **KV bucket `ebind-dags`** (workflow only):
-- `<dag_id>/meta` — DAG-level metadata (status, default policy)
+- `<dag_id>/meta` — DAG-level metadata (status, default policy, immutable Labels)
 - `<dag_id>/step/<step_id>` — StepRecord (fn name, unresolved Refs in args, deps, status, retry policy, and on failure `error_kind` + `error_message`)
 - `<dag_id>/result/<step_id>` — raw result bytes
 
@@ -104,6 +104,7 @@ workflow/
   hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
   context.go             FromContext — dynamic step addition
   await.go               Await[T] via KV WatchResult + DAGInfo
+  query.go               ListDAGsByLabels + MatchesLabels — query history by immutable label
 
 internal/testutil/
   harness.go             SingleNode helper

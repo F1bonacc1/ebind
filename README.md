@@ -135,6 +135,7 @@ Key behaviors:
 - `b.RefOrDefault(v)` - `combine` runs with `v` substituted if `enrich` fails or is skipped.
 - `workflow.Optional()` - `enrich`'s failure does not fail the DAG.
 - `workflow.WithRetry(policy)` - per-DAG default retry; `workflow.WithStepRetry(policy)` overrides per-step.
+- `workflow.WithLabels("billing", "nightly")` - immutable topic tags for querying workflow history (see below).
 - From inside a handler, `workflow.FromContext(ctx).Step(...)` adds more steps dynamically.
 - `workflow.Pause` / `workflow.Resume` - graceful whole-DAG pause: in-flight steps drain, pending steps are fenced.
 - `workflow.BreakBefore("label")` / `workflow.BreakAfter("label")` - per-step breakpoints (see below).
@@ -188,6 +189,35 @@ result, err := workflow.AwaitByID[Profile](ctx, wfB, dagID, stepID)
 ```
 
 `AwaitByID` uses NATS KV `IncludeHistory()` under the hood, so late subscribers still receive results that were written before they started watching. See [`examples/11-workflow-resume`](./examples/11-workflow-resume) for a runnable two-invocation demo.
+
+### Labeling & querying workflow history
+
+Attach immutable string tags at creation to group workflows by topic, then retrieve only the relevant ones from the history:
+
+```go
+// Labels are fixed at New and persisted at Submit - immutable for the DAG's lifetime.
+dag := workflow.New(workflow.WithLabels("billing", "nightly"))
+// ... add steps ...
+_ = dag.Submit(ctx, wf)
+
+// Query the history by label (AND semantics: a DAG must carry all given labels),
+// newest-first. No labels returns every DAG.
+billing, _ := workflow.ListDAGsByLabels(ctx, wf, "billing")            // every "billing" workflow
+both, _    := workflow.ListDAGsByLabels(ctx, wf, "billing", "nightly") // only those carrying both
+```
+
+- Labels are plain string tags - a workflow carries a set of them; a label is shared across many workflows.
+- `ListDAGsByLabels` is a client-side filter over the full DAG history (the same scan `ebctl dag ls` performs), so it needs no secondary index and survives in NATS KV for the DAG's lifetime.
+- `ebctl` exposes the same query and surfaces labels in listings:
+
+```sh
+ebctl dag ls --label billing               # only workflows tagged "billing"
+ebctl dag ls --label billing --label nightly   # AND: carry both labels
+ebctl dag ls                               # LABELS column shown for every DAG
+ebctl dag get <dag-id>                      # includes a `labels:` line
+```
+
+See [`examples/16-workflow-labels`](./examples/16-workflow-labels) for a runnable submit-then-query walkthrough.
 
 ## Inspecting failures
 

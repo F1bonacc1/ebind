@@ -18,6 +18,7 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 	var since time.Duration
 	var limit int
 	var bpBlockedOnly bool
+	var labelFilter []string
 
 	cmd := &cobra.Command{
 		Use:   "ls",
@@ -50,6 +51,9 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 				if !cutoff.IsZero() && m.CreatedAt.Before(cutoff) {
 					continue
 				}
+				if len(labelFilter) > 0 && !workflow.MatchesLabels(m, labelFilter) {
+					continue
+				}
 				if bpBlockedOnly {
 					steps, err := wf.Store.ListSteps(ctx, m.ID)
 					if err != nil {
@@ -75,10 +79,11 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 					ID        string             `json:"id"`
 					Status    workflow.DAGStatus `json:"status"`
 					CreatedAt time.Time          `json:"created_at"`
+					Labels    []string           `json:"labels,omitempty"`
 				}
 				rows := make([]row, 0, len(filtered))
 				for _, m := range filtered {
-					rows = append(rows, row{m.ID, m.Status, m.CreatedAt})
+					rows = append(rows, row{m.ID, m.Status, m.CreatedAt, m.Labels})
 				}
 				return c.Printer.Value(cmd.OutOrStdout(), rows)
 			}
@@ -86,7 +91,7 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 			// Pretty: include step counts. One ListSteps call per DAG; acceptable
 			// for ls (small N typical). Users who want raw, fast listing pass
 			// `-o json`, which skips the extra round trips.
-			headers := []string{"ID", "STATUS", "STEPS", "AGE", "CREATED"}
+			headers := []string{"ID", "STATUS", "STEPS", "LABELS", "AGE", "CREATED"}
 			rows := make([][]string, 0, len(filtered))
 			for _, m := range filtered {
 				steps, err := wf.Store.ListSteps(ctx, m.ID)
@@ -101,10 +106,15 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 						stepSum += fmt.Sprintf(" ⦿%d", n)
 					}
 				}
+				labels := "-"
+				if len(m.Labels) > 0 {
+					labels = strings.Join(m.Labels, ",")
+				}
 				rows = append(rows, []string{
 					m.ID,
 					string(m.Status),
 					stepSum,
+					labels,
 					format.Age(m.CreatedAt),
 					m.CreatedAt.UTC().Format(time.RFC3339),
 				})
@@ -116,6 +126,7 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 	cmd.Flags().DurationVar(&since, "since", 0, "only DAGs created within this duration (e.g. 1h)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max rows (0 = unlimited)")
 	cmd.Flags().BoolVar(&bpBlockedOnly, "bp-blocked", false, "only DAGs with at least one step blocked at a breakpoint")
+	cmd.Flags().StringArrayVar(&labelFilter, "label", nil, "only DAGs carrying all of these labels (repeatable)")
 	return cmd
 }
 
