@@ -32,12 +32,13 @@ See `task/registry.go::Register` and `task/registry.go::Describe`.
 - `<dag_id>/meta` — DAG-level metadata (status, default policy, immutable Labels)
 - `<dag_id>/step/<step_id>` — StepRecord (fn name, unresolved Refs in args, deps, status, retry policy, and on failure `error_kind` + `error_message`)
 - `<dag_id>/result/<step_id>` — raw result bytes
+- `<dag_id>/signal/<base64url(name)>` — SignalRecord (raw name + payload + delivered_at); name is base64url-encoded ONLY in the key (arbitrary user text vs. KV charset + scan-collision safety) — never decode the key, the record carries the name
 
 **JetStream streams:**
 - `EBIND_TASKS` (WorkQueuePolicy) — task envelopes consumed by workers.
 - `EBIND_RESP` (LimitsPolicy, short MaxAge) — per-client response envelopes for Future resolution.
 - `EBIND_DLQ` (LimitsPolicy) — failed/dead-lettered tasks.
-- `EBIND_DAG_EVENTS` (WorkQueuePolicy) — scheduler events (`DAG.<id>.completed.<step>`, `DAG.<id>.step-added.<step>`).
+- `EBIND_DAG_EVENTS` (WorkQueuePolicy) — scheduler events (`DAG.<id>.completed.<step>`, `DAG.<id>.step-added.<step>`, `DAG.<id>.signal.<base64url(name)>`).
 
 **All state mutations use CAS** (`KV.Update(key, val, expectedRevision)`). Two writers racing on the same key: one wins, the other retries. This is the foundation that lets the scheduler run in every worker without an explicit "leader" for correctness — KV CAS + JetStream queue semantics + msg-id dedupe give at-most-once effects. The `LeaderElector` is defense-in-depth for failover windows, not a correctness requirement.
 
@@ -101,6 +102,7 @@ workflow/
   dag.go                 DAG builder, Submit, cycle detection
   scheduler.go           handleEvent + watchLeadership + sweep
   breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint
+  signal.go              external signals: Signal (deliver), ComputeSignals/ListSignalInfo (observability)
   hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
   context.go             FromContext — dynamic step addition
   await.go               Await[T] via KV WatchResult + DAGInfo
@@ -129,8 +131,9 @@ cmd/ebctl/               operator CLI (cobra)
 - **Unit with fakes** — MemStore + MemBus + captureEnq:
   - `workflow/scheduler_test.go`, `workflow/store_test.go`
   - `workflow/breakpoint_test.go` (pure gate-predicate tests + fakes-driven scheduler/resume tests)
+  - `workflow/signal_test.go` (pure gate/ResolveArgs tests + fakes-driven Signal/scheduler tests)
 - **Integration** — real in-process NATS via `embed.StartNode`:
-  - `worker/worker_test.go`, `workflow/integration_test.go`, `workflow/breakpoint_integration_test.go`
+  - `worker/worker_test.go`, `workflow/integration_test.go`, `workflow/breakpoint_integration_test.go`, `workflow/signal_integration_test.go`
 - **Cluster integration** — 3-node in-process cluster:
   - `embed/cluster_test.go`
 - **Cluster chaos e2e** (build tag `e2e`, excluded from `make test`) — every supported operation on a 3-node cluster at R=3, with node kill + restart injected mid-workflow:
@@ -151,7 +154,7 @@ make cover             # HTML coverage
 `task.Task.Attempt` is NOT persisted into the envelope. The worker derives the true attempt count from `msg.Metadata().NumDelivered`. Never trust `t.Attempt` as a "set by the producer" value — it's set by the worker on ingestion.
 
 ### Consumer MaxDeliver vs task-level MaximumAttempts
-The NATS consumer has a hard cap (`worker.Options.MaxDeliver`, default 5). A task's `RetryPolicy.MaximumAttempts` can tighten this but cannot exceed it — the consumer stops redelivering regardless. For DAG workflows that want long retry chains, increase `worker.Options.MaxDeliver` at the worker level.
+`worker.Options.MaxDeliver` defaults to -1 (unlimited at the NATS layer), so the worker's RetryPolicy is authoritative: per-task `RetryPolicy.MaximumAttempts` (or `Options.DefaultRetryPolicy`, default 5 attempts) decides when a task terminates (Term + DLQ). Setting a positive `MaxDeliver` adds an infrastructure-level cap that overrides an over-generous RetryPolicy — the consumer stops redelivering regardless of what the policy wants.
 
 ### Dedupe window
 JetStream dedupe uses `Nats-Msg-Id`. For ad-hoc `client.Enqueue`, the ID is the task's uuid. For DAG steps enqueued by the scheduler, the ID is `<dag_id>:<step_id>` — this protects against duplicate-enqueues during scheduler races. The default dedupe window is **5 minutes**; long-polling tests should keep that in mind.
@@ -181,6 +184,27 @@ events (published best-effort by the advisory-mark CAS winner and by
 `ResumeBreakpoint`; rendered live by `ebctl dag watch`). Schedulers Ack-drop
 them — nothing load-bearing may ever depend on their delivery; the durable
 truth is the step record (`dag bp ls`).
+
+### Signals are the third fence; the record is the truth, the event is a wake-up
+A step's `WaitSignals` (from `WaitForSignal` options ∪ `SignalRef` args, fixed
+at Submit/StepOpts) gates it in the pure layer: `ReadyToRun` refuses a pending
+step until every name has a durable `SignalRecord`. The gate is computed from
+immutable config × the monotonic signal records — there are no advisory marks
+at all. `Signal()` is CAS-first-publish-second: `kv.Create` the record (
+first-wins, immutable — duplicates return `(false, nil)`), then ALWAYS publish
+the `EventSignal` wake-up, even on duplicate, so a crash between write and
+publish converges on retry; a lost publish is recovered by the leader sweep
+(records are loaded by `loadState`, so `ReadyToRun` sees them). **First-wins
+immutability is load-bearing**: duplicate step enqueues are collapsed by
+msg-id dedupe, which requires every enqueue attempt to resolve the identical
+payload — never add signal-overwrite semantics without redesigning that. A
+`SigRef` arg is NOT a step dependency (distinct `__ebind_signal__` marker;
+excluded from deps/cycles/cascade). The signal gate, the `Held` fence, and the
+BP gates are three independent fences that compose — no release path touches
+another fence's state. Terminal DAGs: `Signal` no-ops without writing;
+`DeleteDAG` must delete signal records (a re-created pinned `WithDAGID` DAG
+would inherit them). Roots get a signals snapshot at Submit (`dag.go`) since
+they bypass the scheduler gate.
 
 ### KV reads are direct-get — no read-your-writes
 NATS JetStream KV `Get` is a *direct get*: hardcoded `AllowDirect: true` on the bucket stream, served by any in-sync replica via a queue group, not just the leader. A `Create`/`Update` commits at quorum (leader + 1 of 2 followers); the third replica applies a beat later. So a `Get` issued immediately after a write can be answered by a lagging replica and return a stale value — including `ErrKeyNotFound`/`ErrStepNotFound` for a key that definitely exists. The window is widest right after a node restart (the rejoined replica is back in the direct-get pool but a hair behind). **Never read-back-after-write to recover a revision** — `StateStore.PutStep`/`PutMeta` should return the new revision (as `kv.Create`/`kv.Update` do) and callers CAS from it directly. Writes/CAS are strongly consistent (leader-served, quorum); only this relaxed read path needs care. See `workflow/dag.go::Submit` and the `Step_PutReturnsUsableRevision` store contract.

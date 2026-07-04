@@ -78,6 +78,9 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 	if err := validateStepBreakpoints(s); err != nil {
 		return nil, err
 	}
+	if err := validateStepSignals(s); err != nil {
+		return nil, err
+	}
 	// Implicit parent dep is required (cascade-skip if parent fails) — consistent
 	// with the expectation that dynamic work should not run if the handler failed.
 	if c.parentStep != "" {
@@ -110,6 +113,7 @@ func (c *ContextDAG) StepOpts(id string, fn any, opts []StepOption, args ...any)
 		Optional:     s.optional,
 		BreakBefore:  s.breakBefore,
 		BreakAfter:   s.breakAfter,
+		WaitSignals:  s.waitSignalNames(),
 		Policy:       s.policy,
 		Placement:    placement,
 		AddedAt:      time.Now().UTC(),

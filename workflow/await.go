@@ -23,7 +23,9 @@ import (
 // Store.GetMeta before (or while) awaiting. Similarly, a step blocked at an
 // active breakpoint (or gated by an upstream BreakAfter) stays pending and
 // produces no result until ResumeBreakpoint releases it — use ListBreakpoints
-// or Debug to distinguish "blocked at breakpoint" from "slow".
+// or Debug to distinguish "blocked at breakpoint" from "slow". A step waiting
+// on an undelivered signal likewise stays pending until Signal delivers it —
+// use ListSignalInfo or Debug to see which names it waits for.
 //
 // Await is a thin wrapper over AwaitByID; prefer AwaitByID when the caller
 // does not own the *Step handle (e.g., a different process resuming a DAG).

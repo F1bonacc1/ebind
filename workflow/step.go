@@ -26,6 +26,13 @@ type Step struct {
 	breakAfter     []string
 	hasBreakBefore bool
 	hasBreakAfter  bool
+
+	// waitSignals: external signal names (from WaitForSignal()). hasWaitSignals
+	// records that the option was used, so a zero-name call can be rejected at
+	// Submit/StepOpts validation. SignalRef() args contribute additional names
+	// via stepSignalArgs at record-build time.
+	waitSignals    []string
+	hasWaitSignals bool
 }
 
 // ID returns the stable step ID within its DAG.
@@ -89,6 +96,20 @@ func AfterAny(steps ...*Step) StepOption {
 			}
 			s.afterAnyDeps = append(s.afterAnyDeps, up.id)
 		}
+	}
+}
+
+// WaitForSignal declares that this step additionally waits for every named
+// external signal to be delivered (workflow.Signal) before it can start.
+// Composes with deps, Pause holds, and breakpoints — each gate is released
+// independently. At least one name is required (validated at Submit / dynamic
+// StepOpts). Signals are buffered: one delivered before this step exists or
+// becomes dep-satisfied is not lost. To also receive a signal's payload as a
+// handler argument, use a SignalRef() arg instead (it implies the wait).
+func WaitForSignal(names ...string) StepOption {
+	return func(s *Step) {
+		s.waitSignals = append(s.waitSignals, names...)
+		s.hasWaitSignals = true
 	}
 }
 

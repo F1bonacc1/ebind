@@ -35,6 +35,7 @@ go run ./examples/07-workflow-fanout
 | 14 | [`14-workflow-pause-resume`](./14-workflow-pause-resume) | Pause a DAG gracefully: in-flight steps drain, pending steps are fenced; `Resume` continues where it left off |
 | 15 | [`15-workflow-breakpoints`](./15-workflow-breakpoints) | Step breakpoints: `BreakBefore`/`BreakAfter` labels armed via `WithActiveBreakpoints`; inspect state, then `ResumeBreakpoint` to continue |
 | 16 | [`16-workflow-labels`](./16-workflow-labels) | Immutable `WithLabels` topic tags; query history by label with `ListDAGsByLabels` (AND semantics) — mirrors `ebctl dag ls --label` |
+| 17 | [`17-workflow-signals`](./17-workflow-signals) | External signals: `SignalRef`/`WaitForSignal` gate a step on a human approval; `workflow.Signal` delivers a payload the handler consumes (one-shot, buffered, first-wins) |
 
 ## Reading order
 
@@ -43,7 +44,7 @@ If you're new to ebind, walk the examples in order — each adds one concept on 
 1. **01 → 03**: basic task queue mechanics
 2. **04**: HA deployment topology
 3. **05**: extending the worker pipeline
-4. **06 → 16**: workflow layer, from simple linear to dynamic placement, cancellation, pause/resume, step breakpoints, and querying history by label
+4. **06 → 17**: workflow layer, from simple linear to dynamic placement, cancellation, pause/resume, step breakpoints, querying history by label, and human-in-the-loop signals
 
 ## Common shape
 

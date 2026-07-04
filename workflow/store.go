@@ -38,4 +38,14 @@ type StateStore interface {
 	// Implementations should close the channel on cancel or immediately if the result
 	// already exists (sending the existing value first).
 	WatchResult(ctx context.Context, dagID, stepID string) (<-chan []byte, error)
+
+	// GetSignal returns the delivered signal record, or ErrSignalNotFound.
+	GetSignal(ctx context.Context, dagID, name string) (SignalRecord, error)
+	// PutSignal creates the record — first-wins: signal records are immutable
+	// and there is no update path. Returns ErrStaleRevision if the signal was
+	// already delivered.
+	PutSignal(ctx context.Context, dagID string, rec SignalRecord) error
+	ListSignals(ctx context.Context, dagID string) ([]SignalRecord, error)
+	// DeleteSignal removes a record; missing keys are not errors.
+	DeleteSignal(ctx context.Context, dagID, name string) error
 }

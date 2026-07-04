@@ -75,6 +75,9 @@ func newStepGetCmd(c *cli.Context) *cobra.Command {
 			if len(rec.BreakAfter) > 0 {
 				fmt.Fprintf(w, "  break_after:  %v%s\n", rec.BreakAfter, bpStateSuffix(rec.BPAfter, rec.BPBlockedAt))
 			}
+			if len(rec.WaitSignals) > 0 {
+				fmt.Fprintf(w, "  wait_signals: %v\n", rec.WaitSignals)
+			}
 			if len(rec.ArgsJSON) > 0 {
 				fmt.Fprintf(w, "  args:         %s\n", string(rec.ArgsJSON))
 			}

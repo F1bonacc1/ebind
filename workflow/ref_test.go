@@ -44,7 +44,7 @@ func TestResolveArgs_Literals(t *testing.T) {
 		json.RawMessage(`42`),
 		json.RawMessage(`"x"`),
 	}
-	out, skip, err := ResolveArgs(args, nil, nil)
+	out, skip, err := ResolveArgs(args, nil, nil, nil)
 	if err != nil || skip {
 		t.Fatalf("got err=%v skip=%v", err, skip)
 	}
@@ -59,7 +59,7 @@ func TestResolveArgs_Required_Success(t *testing.T) {
 	results := map[string]json.RawMessage{"up": json.RawMessage(`"hello"`)}
 	statuses := map[string]StepStatus{"up": StatusDone}
 
-	out, skip, err := ResolveArgs(args, results, statuses)
+	out, skip, err := ResolveArgs(args, results, statuses, nil)
 	if err != nil || skip {
 		t.Fatalf("err=%v skip=%v", err, skip)
 	}
@@ -72,7 +72,7 @@ func TestResolveArgs_Required_UpstreamFailed_Cascades(t *testing.T) {
 	ref, _ := json.Marshal(Ref{StepID: "up", Mode: RefModeRequired})
 	args := []json.RawMessage{ref}
 	statuses := map[string]StepStatus{"up": StatusFailed}
-	_, skip, err := ResolveArgs(args, nil, statuses)
+	_, skip, err := ResolveArgs(args, nil, statuses, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestResolveArgs_OrDefault_UpstreamFailed_Substitutes(t *testing.T) {
 	ref, _ := json.Marshal(Ref{StepID: "up", Mode: RefModeOrDefault, Default: json.RawMessage(`99`)})
 	args := []json.RawMessage{ref}
 	statuses := map[string]StepStatus{"up": StatusFailed}
-	out, skip, err := ResolveArgs(args, nil, statuses)
+	out, skip, err := ResolveArgs(args, nil, statuses, nil)
 	if err != nil || skip {
 		t.Fatalf("err=%v skip=%v", err, skip)
 	}
@@ -98,7 +98,7 @@ func TestResolveArgs_OrDefault_NoDefault_NullFallback(t *testing.T) {
 	ref, _ := json.Marshal(Ref{StepID: "up", Mode: RefModeOrDefault})
 	args := []json.RawMessage{ref}
 	statuses := map[string]StepStatus{"up": StatusSkipped}
-	out, _, err := ResolveArgs(args, nil, statuses)
+	out, _, err := ResolveArgs(args, nil, statuses, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestResolveArgs_UpstreamDoneButMissingResult(t *testing.T) {
 	ref, _ := json.Marshal(Ref{StepID: "up", Mode: RefModeRequired})
 	args := []json.RawMessage{ref}
 	statuses := map[string]StepStatus{"up": StatusDone}
-	_, _, err := ResolveArgs(args, nil, statuses)
+	_, _, err := ResolveArgs(args, nil, statuses, nil)
 	if err == nil {
 		t.Error("want error for done-but-no-result")
 	}
@@ -121,7 +121,7 @@ func TestResolveArgs_UpstreamNotTerminal(t *testing.T) {
 	ref, _ := json.Marshal(Ref{StepID: "up", Mode: RefModeRequired})
 	args := []json.RawMessage{ref}
 	statuses := map[string]StepStatus{"up": StatusRunning}
-	_, _, err := ResolveArgs(args, nil, statuses)
+	_, _, err := ResolveArgs(args, nil, statuses, nil)
 	if err == nil {
 		t.Error("want error for non-terminal upstream")
 	}
@@ -138,7 +138,7 @@ func TestResolveArgs_MixedLiteralsAndRefs(t *testing.T) {
 	}
 	results := map[string]json.RawMessage{"a": json.RawMessage(`42`)}
 	statuses := map[string]StepStatus{"a": StatusDone, "b": StatusFailed}
-	out, skip, err := ResolveArgs(args, results, statuses)
+	out, skip, err := ResolveArgs(args, results, statuses, nil)
 	if err != nil || skip {
 		t.Fatalf("err=%v skip=%v", err, skip)
 	}

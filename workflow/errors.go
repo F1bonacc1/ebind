@@ -22,6 +22,10 @@ var ErrDAGCanceled = errors.New("workflow: DAG canceled")
 // ErrStepNotFound is returned when a step ID is not registered in the DAG.
 var ErrStepNotFound = errors.New("workflow: step not found")
 
+// ErrSignalNotFound is returned by GetSignal when the named signal has not
+// been delivered to the DAG.
+var ErrSignalNotFound = errors.New("workflow: signal not found")
+
 // ErrCycle is returned by DAG.Submit if the graph contains a cycle.
 var ErrCycle = errors.New("workflow: cycle detected")
 

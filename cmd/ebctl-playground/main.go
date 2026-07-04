@@ -14,11 +14,20 @@
 //	notify    BreakBefore("BeforeNotify") — blocks the independent metrics
 //	          line while the main line keeps flowing
 //
+// Signals: every -signal-every'th DAG (default: every 3rd, starting with the
+// first) appends a human-in-the-loop "release" step that waits for the
+// "approval" signal and consumes its payload as a typed argument. Those DAGs
+// stay running (⚑ in `dag get`) until the operator delivers it:
+//
+//	ebctl dag signal ls <dag-id>
+//	ebctl dag signal <dag-id> approval '{"approver":"you","note":"lgtm"}'
+//
 // Labels: every DAG is tagged "pipeline" plus a rotating topic
-// (billing/reports/analytics), and breakpoint-armed DAGs additionally carry
-// "breakpoints" — so `dag ls --label pipeline` returns all of them,
-// `--label breakpoints` returns only the stopped ones, and `--label billing`
-// returns just that topic's subset (AND semantics across repeated --label).
+// (billing/reports/analytics); breakpoint-armed DAGs additionally carry
+// "breakpoints" and signal-gated ones "signals" — so `dag ls --label pipeline`
+// returns all of them, `--label breakpoints` only the stopped ones,
+// `--label signals` only the ones awaiting approval, and `--label billing`
+// just that topic's subset (AND semantics across repeated --label).
 //
 // Typical session:
 //
@@ -36,6 +45,10 @@
 //	./bin/ebctl dag bp resume <dag-id> Checkpoint
 //	./bin/ebctl dag bp resume <dag-id> BeforePublish
 //	./bin/ebctl dag bp resume <dag-id> BeforeNotify
+//	./bin/ebctl dag ls --sig-waiting
+//	./bin/ebctl dag ls --label signals
+//	./bin/ebctl dag signal ls <dag-id>
+//	./bin/ebctl dag signal <dag-id> approval '{"approver":"you"}'
 //	./bin/ebctl dag watch
 //	./bin/ebctl dlq ls
 //	./bin/ebctl dlq show <seq>
@@ -140,6 +153,24 @@ func Notify(ctx context.Context, metric int) (string, error) {
 	return fmt.Sprintf("notified %d", metric), nil
 }
 
+// Approval is the payload the operator delivers with `ebctl dag signal`.
+type Approval struct {
+	Approver string `json:"approver"`
+	Note     string `json:"note,omitempty"`
+}
+
+// Release: human-in-the-loop terminal step — waits for the "approval" signal
+// (implied by its SignalRef arg) and consumes the payload the operator sent.
+func Release(ctx context.Context, ap Approval, published string) (string, error) {
+	who := ap.Approver
+	if who == "" {
+		who = "someone" // signal delivered with no payload
+	}
+	log.Printf("  [release] approved by %s (%s) — releasing %q", who, ap.Note, published)
+	sleep(ctx, 1*time.Second)
+	return fmt.Sprintf("released by %s: %s", who, published), nil
+}
+
 // Flaky + Dependent: a chain that fails WITHOUT a RefOrDefault fallback, so
 // Dependent gets cascade-skipped. Good for showing "skipped" rows in
 // `ebctl dag get`.
@@ -166,11 +197,12 @@ func sleep(ctx context.Context, d time.Duration) {
 // Runner
 
 type config struct {
-	port       int
-	interval   time.Duration
-	submitOnce bool
-	storeDir   string
-	bpEvery    int
+	port        int
+	interval    time.Duration
+	submitOnce  bool
+	storeDir    string
+	bpEvery     int
+	signalEvery int
 }
 
 func main() {
@@ -180,6 +212,7 @@ func main() {
 	flag.BoolVar(&cfg.submitOnce, "once", false, "submit a single DAG and keep the server running")
 	flag.StringVar(&cfg.storeDir, "store-dir", "", "persistent JetStream store (default: tempdir, wiped on exit)")
 	flag.IntVar(&cfg.bpEvery, "bp-every", 2, "arm breakpoints on every Nth DAG, starting with the first (0 = never)")
+	flag.IntVar(&cfg.signalEvery, "signal-every", 3, "add a signal-gated release step to every Nth DAG, starting with the first (0 = never)")
 	flag.Parse()
 
 	if err := run(cfg); err != nil {
@@ -250,7 +283,7 @@ func run(cfg config) error {
 	for _, fn := range []any{
 		Ingest, Validate,
 		TransformA, TransformB, TransformC,
-		Aggregate, Publish,
+		Aggregate, Publish, Release,
 		Metrics, Notify,
 		Flaky, Dependent,
 	} {
@@ -282,8 +315,9 @@ func run(cfg config) error {
 	submit := func() {
 		n := submitted.Add(1)
 		armBPs := cfg.bpEvery > 0 && (n-1)%uint64(cfg.bpEvery) == 0
-		labels := dagLabels(n, armBPs)
-		id, err := submitDAG(ctx, wf, armBPs, labels)
+		withSignal := cfg.signalEvery > 0 && (n-1)%uint64(cfg.signalEvery) == 0
+		labels := dagLabels(n, armBPs, withSignal)
+		id, err := submitDAG(ctx, wf, armBPs, withSignal, labels)
 		if err != nil {
 			log.Printf("submit: %v", err)
 			return
@@ -295,6 +329,11 @@ func run(cfg config) error {
 		} else {
 			log.Printf("submitted DAG #%d id=%s", n, id)
 			log.Printf("  try:  ebctl -s %s dag get %s", node.ClientURL(), id)
+		}
+		if withSignal {
+			log.Printf("  ⚑ release waits for the \"approval\" signal:")
+			log.Printf("  inspect: ebctl -s %s dag signal ls %s", node.ClientURL(), id)
+			log.Printf("  approve: ebctl -s %s dag signal %s approval '{\"approver\":\"you\",\"note\":\"lgtm\"}'", node.ClientURL(), id)
 		}
 		log.Printf("  labels: [%s] — e.g. ebctl -s %s dag ls --label %s",
 			strings.Join(labels, ","), node.ClientURL(), labels[len(labels)-1])
@@ -332,12 +371,16 @@ var armedBPLabels = []string{"Checkpoint", "BeforePublish", "BeforeNotify"}
 var topicPool = []string{"billing", "reports", "analytics"}
 
 // dagLabels builds the immutable WithLabels set for the Nth DAG: a constant
-// "pipeline" tag (matches every playground DAG), a rotating topic, and
-// "breakpoints" when this run is armed to stop.
-func dagLabels(n uint64, armBPs bool) []string {
+// "pipeline" tag (matches every playground DAG), a rotating topic,
+// "breakpoints" when this run is armed to stop, and "signals" when it carries
+// the approval-gated release step.
+func dagLabels(n uint64, armBPs, withSignal bool) []string {
 	labels := []string{"pipeline", topicPool[(n-1)%uint64(len(topicPool))]}
 	if armBPs {
 		labels = append(labels, "breakpoints")
+	}
+	if withSignal {
+		labels = append(labels, "signals")
 	}
 	return labels
 }
@@ -346,7 +389,9 @@ func dagLabels(n uint64, armBPs bool) []string {
 // Returns the DAG's generated ID so the caller can surface it in logs.
 // Breakpoint labels are always declared on the steps (inert by default);
 // armBPs decides at submit time whether this execution stops at them.
-func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs bool, labels []string) (string, error) {
+// withSignal appends the approval-gated release step (signals have no arming
+// concept — a declared wait always gates, so the step is added conditionally).
+func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal bool, labels []string) (string, error) {
 	// Fast-giving-up retry policy — transform-b goes to DLQ after 3 attempts
 	// so the user sees DLQ entries within ~10s rather than after a minute.
 	quickRetry := task.RetryPolicy{
@@ -385,9 +430,16 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs bool, labels [
 
 	// Before-BP: when armed, the line stops with publish pending — inspect
 	// aggregate's output before the "side-effecting" terminal step runs.
-	_ = dag.StepOpts("publish", Publish,
+	publish := dag.StepOpts("publish", Publish,
 		[]workflow.StepOption{workflow.BreakBefore("BeforePublish")},
 		agg.Ref())
+
+	// Human-in-the-loop tail: release waits for the "approval" signal (implied
+	// by the SignalRef arg) and receives the operator's payload. The DAG shows
+	// ⚑ in `dag get` / `dag signal ls` until `ebctl dag signal <id> approval ...`.
+	if withSignal {
+		_ = dag.Step("release", Release, workflow.SignalRef("approval"), publish.Ref())
+	}
 
 	// Independent parallel chain. Nice second root for `ebctl dag tree`.
 	// Its before-BP shows one line blocked while the other keeps running.

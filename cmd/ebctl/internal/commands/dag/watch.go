@@ -55,6 +55,8 @@ func newWatchCmd(c *cli.Context) *cobra.Command {
 				case workflow.EventBPResumed:
 					line += fmt.Sprintf("  position=%s label=%s",
 						ev.BPPosition, strings.Join(ev.BPLabels, ","))
+				case workflow.EventSignal:
+					line += fmt.Sprintf("  ⚑ name=%s", ev.SignalName)
 				}
 				_ = c.Printer.Text(cmd.OutOrStdout(), line)
 			})

@@ -140,6 +140,98 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 		}
 	})
 
+	t.Run("Signal_CreateOnce_FirstWins", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		first := SignalRecord{DAGID: "d", Name: "go", Payload: json.RawMessage(`1`), DeliveredAt: time.Now().UTC()}
+		if err := s.PutSignal(ctx, "d", first); err != nil {
+			t.Fatal(err)
+		}
+		second := first
+		second.Payload = json.RawMessage(`2`)
+		if err := s.PutSignal(ctx, "d", second); !errors.Is(err, ErrStaleRevision) {
+			t.Errorf("duplicate create should fail with ErrStaleRevision, got %v", err)
+		}
+		got, err := s.GetSignal(ctx, "d", "go")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got.Payload) != `1` {
+			t.Errorf("first payload must win, got %s", got.Payload)
+		}
+	})
+
+	t.Run("Signal_GetMissing", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.GetSignal(context.Background(), "d", "nope"); !errors.Is(err, ErrSignalNotFound) {
+			t.Errorf("want ErrSignalNotFound, got %v", err)
+		}
+	})
+
+	// Names chosen to attack the KV key encoding: a name that could collide
+	// with the .meta suffix scan, one containing the .step. delimiter, and
+	// arbitrary unicode. All must round-trip and stay invisible to the other
+	// scans.
+	t.Run("Signal_ListAndEncodingHazards", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		names := []string{"meta", "a.step.b", "emoji 🎉 name", "x"}
+		for _, n := range names {
+			if err := s.PutSignal(ctx, "d", SignalRecord{DAGID: "d", Name: n, DeliveredAt: time.Now().UTC()}); err != nil {
+				t.Fatalf("put %q: %v", n, err)
+			}
+		}
+		sigs, err := s.ListSignals(ctx, "d")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(sigs) != len(names) {
+			t.Fatalf("want %d signals, got %d", len(names), len(sigs))
+		}
+		seen := map[string]bool{}
+		for _, rec := range sigs {
+			seen[rec.Name] = true
+		}
+		for _, n := range names {
+			if !seen[n] {
+				t.Errorf("name %q did not round-trip", n)
+			}
+		}
+		// A signal named "meta" must not surface as a DAG in ListDAGs.
+		dags, err := s.ListDAGs(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(dags) != 0 {
+			t.Errorf("signal keys leaked into ListDAGs: %+v", dags)
+		}
+		// Nor as steps of the DAG.
+		steps, err := s.ListSteps(ctx, "d")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(steps) != 0 {
+			t.Errorf("signal keys leaked into ListSteps: %+v", steps)
+		}
+	})
+
+	t.Run("Signal_DeleteIdempotent", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		if err := s.PutSignal(ctx, "d", SignalRecord{DAGID: "d", Name: "go", DeliveredAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeleteSignal(ctx, "d", "go"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.GetSignal(ctx, "d", "go"); !errors.Is(err, ErrSignalNotFound) {
+			t.Errorf("want ErrSignalNotFound after delete, got %v", err)
+		}
+		if err := s.DeleteSignal(ctx, "d", "go"); err != nil {
+			t.Errorf("second delete must be idempotent, got %v", err)
+		}
+	})
+
 	t.Run("WatchResult_Immediate", func(t *testing.T) {
 		s := newStore(t)
 		ctx := context.Background()

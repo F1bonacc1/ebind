@@ -1,6 +1,7 @@
 package dag
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -18,6 +19,7 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 	var since time.Duration
 	var limit int
 	var bpBlockedOnly bool
+	var sigWaitingOnly bool
 	var labelFilter []string
 
 	cmd := &cobra.Command{
@@ -41,9 +43,11 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 			if since > 0 {
 				cutoff = time.Now().Add(-since)
 			}
-			// blockedCounts is filled only when --bp-blocked filtering needs it;
-			// the pretty path reuses it to avoid a second ListSteps round trip.
+			// blockedCounts / waitingCounts are filled only when the respective
+			// filter needs them; the pretty path reuses them to avoid second
+			// round trips.
 			blockedCounts := map[string]int{}
+			waitingCounts := map[string]int{}
 			for _, m := range metas {
 				if statusFilter != "" && !strings.EqualFold(string(m.Status), statusFilter) {
 					continue
@@ -54,16 +58,25 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 				if len(labelFilter) > 0 && !workflow.MatchesLabels(m, labelFilter) {
 					continue
 				}
-				if bpBlockedOnly {
+				if bpBlockedOnly || sigWaitingOnly {
 					steps, err := wf.Store.ListSteps(ctx, m.ID)
 					if err != nil {
 						continue
 					}
-					n := blockedBPCount(m, steps)
-					if n == 0 {
-						continue
+					if bpBlockedOnly {
+						n := blockedBPCount(m, steps)
+						if n == 0 {
+							continue
+						}
+						blockedCounts[m.ID] = n
 					}
-					blockedCounts[m.ID] = n
+					if sigWaitingOnly {
+						n := sigWaitingCount(ctx, wf, m, steps)
+						if n == 0 {
+							continue
+						}
+						waitingCounts[m.ID] = n
+					}
 				}
 				filtered = append(filtered, m)
 			}
@@ -105,6 +118,13 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 					if n > 0 {
 						stepSum += fmt.Sprintf(" ⦿%d", n)
 					}
+					w, counted := waitingCounts[m.ID]
+					if !counted {
+						w = sigWaitingCount(ctx, wf, m, steps)
+					}
+					if w > 0 {
+						stepSum += fmt.Sprintf(" ⚑%d", w)
+					}
 				}
 				labels := "-"
 				if len(m.Labels) > 0 {
@@ -126,6 +146,7 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 	cmd.Flags().DurationVar(&since, "since", 0, "only DAGs created within this duration (e.g. 1h)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max rows (0 = unlimited)")
 	cmd.Flags().BoolVar(&bpBlockedOnly, "bp-blocked", false, "only DAGs with at least one step blocked at a breakpoint")
+	cmd.Flags().BoolVar(&sigWaitingOnly, "sig-waiting", false, "only DAGs with at least one step waiting on an undelivered signal")
 	cmd.Flags().StringArrayVar(&labelFilter, "label", nil, "only DAGs carrying all of these labels (repeatable)")
 	return cmd
 }
@@ -133,6 +154,27 @@ func newLsCmd(c *cli.Context) *cobra.Command {
 // blockedBPCount counts breakpoints currently stopping work in a DAG.
 func blockedBPCount(meta workflow.DAGMeta, steps []workflow.StepRecord) int {
 	return workflow.CountBlocked(workflow.ComputeBreakpoints(meta, steps))
+}
+
+// sigWaitingCount counts steps currently waiting on undelivered signals.
+// Skips the ListSignals round trip when no pending step declares wait-signals
+// — the common case for DAGs without a signal flow.
+func sigWaitingCount(ctx context.Context, wf *workflow.Workflow, meta workflow.DAGMeta, steps []workflow.StepRecord) int {
+	declared := false
+	for _, s := range steps {
+		if s.Status == workflow.StatusPending && len(s.WaitSignals) > 0 {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return 0
+	}
+	sigs, err := wf.Store.ListSignals(ctx, meta.ID)
+	if err != nil {
+		return 0
+	}
+	return workflow.CountWaitingSteps(workflow.ComputeSignals(meta, steps, sigs))
 }
 
 func stepsSummary(steps []workflow.StepRecord) string {
