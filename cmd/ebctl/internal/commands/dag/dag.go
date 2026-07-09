@@ -22,5 +22,6 @@ func NewCmd(c *cli.Context) *cobra.Command {
 	cmd.AddCommand(newWatchCmd(c))
 	cmd.AddCommand(newStepCmd(c))
 	cmd.AddCommand(newBPCmd(c))
+	cmd.AddCommand(newSignalCmd(c))
 	return cmd
 }

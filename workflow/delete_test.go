@@ -27,12 +27,19 @@ func TestDeleteDAG_RemovesAllRecords(t *testing.T) {
 		}
 	}
 
+	if err := store.PutSignal(ctx, dagID, SignalRecord{DAGID: dagID, Name: "approve", DeliveredAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := DeleteDAG(ctx, wf, dagID); err != nil {
 		t.Fatalf("DeleteDAG: %v", err)
 	}
 
 	if _, _, err := store.GetMeta(ctx, dagID); !errors.Is(err, ErrDAGNotFound) {
 		t.Errorf("meta still present: err=%v", err)
+	}
+	if sigs, err := store.ListSignals(ctx, dagID); err != nil || len(sigs) != 0 {
+		t.Errorf("signals still present: %d (err=%v)", len(sigs), err)
 	}
 	steps, err := store.ListSteps(ctx, dagID)
 	if err != nil {

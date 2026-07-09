@@ -133,6 +133,28 @@ func stepArgDeps(args []any) []string {
 	return deps
 }
 
+// stepSignalArgs extracts signal names referenced in a step's args via SigRefs.
+// These are NOT step dependencies — they feed WaitSignals, not Deps.
+func stepSignalArgs(args []any) []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, a := range args {
+		if r, ok := a.(SigRef); ok {
+			if !seen[r.Name] {
+				seen[r.Name] = true
+				names = append(names, r.Name)
+			}
+		}
+	}
+	return names
+}
+
+// waitSignalNames returns the step's full wait-signal set: explicit
+// WaitForSignal() names + implicit SignalRef() arg names. Deduped.
+func (s *Step) waitSignalNames() []string {
+	return dedupeStrings(append(append([]string{}, s.waitSignals...), stepSignalArgs(s.args)...))
+}
+
 // requiredDeps returns the step's full required dependency list: Ref-derived
 // deps from args + explicit After() deps. Deduped.
 func (s *Step) requiredDeps() []string {
@@ -204,6 +226,8 @@ func marshalArgs(args []any) (json.RawMessage, error) {
 		switch v := a.(type) {
 		case Ref:
 			b, err = json.Marshal(v)
+		case SigRef:
+			b, err = json.Marshal(v)
 		default:
 			b, err = marshalAny(v)
 		}
@@ -234,6 +258,22 @@ func validateStepBreakpoints(s *Step) error {
 	}
 	if slices.Contains(s.breakAfter, "") {
 		return fmt.Errorf("workflow: step %q: BreakAfter label must be non-empty", s.id)
+	}
+	return nil
+}
+
+// validateStepSignals rejects WaitForSignal() used with zero names, and
+// empty-string names from either WaitForSignal() or SignalRef() args. Shared
+// by DAG.Submit and the dynamic ContextDAG.StepOpts path.
+func validateStepSignals(s *Step) error {
+	if s.hasWaitSignals && len(s.waitSignals) == 0 {
+		return fmt.Errorf("workflow: step %q: WaitForSignal requires at least one name", s.id)
+	}
+	if slices.Contains(s.waitSignals, "") {
+		return fmt.Errorf("workflow: step %q: WaitForSignal name must be non-empty", s.id)
+	}
+	if slices.Contains(stepSignalArgs(s.args), "") {
+		return fmt.Errorf("workflow: step %q: SignalRef name must be non-empty", s.id)
 	}
 	return nil
 }
@@ -325,6 +365,10 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 			d.mu.Unlock()
 			return err
 		}
+		if err := validateStepSignals(s); err != nil {
+			d.mu.Unlock()
+			return err
+		}
 	}
 	if slices.Contains(so.activeBreakpoints, "") {
 		d.mu.Unlock()
@@ -385,6 +429,7 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 			Optional:     s.optional,
 			BreakBefore:  s.breakBefore,
 			BreakAfter:   s.breakAfter,
+			WaitSignals:  s.waitSignalNames(),
 			Policy:       s.policy,
 			Placement:    placement,
 			AddedAt:      time.Now().UTC(),
@@ -415,6 +460,24 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 	// the persist above and the CAS here and claim a ready root first, the
 	// documented one-wins-other-retries model — do we re-read to reassess, by
 	// which point the key provably exists.
+	//
+	// Roots that wait on signals need a signals snapshot: with WithDAGID a
+	// signal can have been delivered before this Submit (buffered), in which
+	// case the root must be enqueued now rather than strand until the sweep.
+	// A signal landing after this snapshot is covered by Signal's
+	// always-published EventSignal — the step records above are already
+	// persisted, so the scheduler's re-eval sees the gated root.
+	var sigSnap map[string]SignalRecord
+	for _, s := range d.steps {
+		if len(s.allDeps()) == 0 && len(s.waitSignalNames()) > 0 {
+			sigs, err := wf.Store.ListSignals(ctx, d.id)
+			if err != nil {
+				return fmt.Errorf("workflow: list signals: %w", err)
+			}
+			sigSnap = signalMap(sigs)
+			break
+		}
+	}
 	for _, s := range d.steps {
 		if len(s.allDeps()) != 0 {
 			continue
@@ -444,13 +507,22 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 				recs[s.id] = cur
 				break
 			}
+			if (&DAGState{Meta: meta, Signals: sigSnap}).signalBlocks(cur) {
+				// Root gated on an undelivered signal: leave it Pending. No
+				// advisory mark and no event — waiting state is fully
+				// computable from WaitSignals × signal records, and the
+				// wake-up comes from Signal's always-published EventSignal
+				// (or the leader sweep).
+				recs[s.id] = cur
+				break
+			}
 			next := cur
 			next.Status = StatusRunning
 			next.StartedAt = time.Now().UTC()
 			_, err := wf.Store.PutStep(ctx, d.id, s.id, next, rev)
 			if err == nil {
 				recs[s.id] = next
-				if err := enqueueStep(ctx, wf.Enq, next, recs, nil, nil); err != nil {
+				if err := enqueueStep(ctx, wf.Enq, next, recs, nil, nil, sigSnap); err != nil {
 					return fmt.Errorf("workflow: enqueue root %q: %w", s.id, err)
 				}
 				break
@@ -470,7 +542,8 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 }
 
 // enqueueStep resolves Ref args against provided results + statuses (nil for
-// root-only calls), then publishes the task envelope via the Enqueuer.
+// root-only calls) and SigRef args against delivered signals, then publishes
+// the task envelope via the Enqueuer.
 // Returns any ResolveArgs error; a cascade-skip signal is a nil-error return
 // with the caller expected to mark the step skipped before calling.
 func enqueueStep(
@@ -480,12 +553,13 @@ func enqueueStep(
 	steps map[string]StepRecord,
 	results map[string]json.RawMessage,
 	statuses map[string]StepStatus,
+	signals map[string]SignalRecord,
 ) error {
 	var rawArgs []json.RawMessage
 	if err := json.Unmarshal(rec.ArgsJSON, &rawArgs); err != nil {
 		return fmt.Errorf("unmarshal args: %w", err)
 	}
-	resolved, skip, err := ResolveArgs(rawArgs, results, statuses)
+	resolved, skip, err := ResolveArgs(rawArgs, results, statuses, signals)
 	if err != nil {
 		return err
 	}

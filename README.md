@@ -17,7 +17,7 @@ Function-first ergonomics (`Register(reg, MyFunc)`, `Enqueue(c, MyFunc, args...)
 - **Single-binary HA.** The `embed` package boots a 3-node JetStream cluster inside your process. One binary per machine, cluster.routes wired automatically.
 - **Function-first API.** Pass your function reference, not a string name and a JSON schema. Reflection introspects the signature; runtime arg-type validation happens before publish.
 - **Typed responses.** `Await[Profile](ctx, fut)` returns a typed value, not `interface{}`.
-- **Durable DAG workflows.** Declare dependencies between steps; state lives in a NATS KV bucket so workflows survive producer restarts. Mandatory/optional steps, per-step retry policies, dynamic step addition from within handlers.
+- **Durable DAG workflows.** Declare dependencies between steps; state lives in a NATS KV bucket so workflows survive producer restarts. Mandatory/optional steps, per-step retry policies, dynamic step addition from within handlers, step placement across workers, pause/resume/cancel, step breakpoints, and human-in-the-loop signals.
 
 ## Install
 
@@ -25,7 +25,7 @@ Function-first ergonomics (`Register(reg, MyFunc)`, `Enqueue(c, MyFunc, args...)
 go get github.com/f1bonacc1/ebind
 ```
 
-Requires Go 1.22+ and NATS JetStream 2.8+.
+Requires Go 1.26+. The `embed` package bundles its own NATS server; running against an external deployment requires NATS Server 2.9+ with JetStream enabled.
 
 ## Quickstart - standalone task queue
 
@@ -86,6 +86,8 @@ func main() {
 }
 ```
 
+Don't need the result? `client.EnqueueAsync(c, SendEmail, ...)` is fire-and-forget: it publishes the task and returns just the task ID, with no response consumer involved.
+
 Run the bundled end-to-end demo:
 
 ```sh
@@ -133,12 +135,73 @@ Key behaviors:
 
 - `a.Ref()` - `combine` runs only if `fetch` succeeds; cascade-skips otherwise.
 - `b.RefOrDefault(v)` - `combine` runs with `v` substituted if `enrich` fails or is skipped.
+- `workflow.After(steps...)` / `workflow.AfterAny(steps...)` - temporal-only ordering when the handler doesn't consume upstream output: `After` cascade-skips on upstream failure, `AfterAny` runs regardless (best-effort/cleanup steps).
 - `workflow.Optional()` - `enrich`'s failure does not fail the DAG.
 - `workflow.WithRetry(policy)` - per-DAG default retry; `workflow.WithStepRetry(policy)` overrides per-step.
 - `workflow.WithLabels("billing", "nightly")` - immutable topic tags for querying workflow history (see below).
 - From inside a handler, `workflow.FromContext(ctx).Step(...)` adds more steps dynamically.
 - `workflow.Pause` / `workflow.Resume` - graceful whole-DAG pause: in-flight steps drain, pending steps are fenced.
+- `workflow.Cancel` - durable cancel (also `ebctl dag cancel`): pending steps flip to canceled immediately; running steps may finish but schedule no follow-on work.
+- `workflow.OnTarget("gpu")` and friends - pin steps to specific workers (see below).
+- `workflow.SignalRef("approval")` / `workflow.WaitForSignal(...)` - gate a step on an external event; `workflow.Signal` delivers it with a payload (see below).
 - `workflow.BreakBefore("label")` / `workflow.BreakAfter("label")` - per-step breakpoints (see below).
+
+### Signals - human-in-the-loop & external events
+
+A step can wait for a named external event - a human approval, a webhook, another DAG - and consume the event's payload as a typed handler argument:
+
+```go
+type Approval struct{ Approver string }
+
+// Deploy waits for "approval" (implied by the SignalRef arg) and receives its payload.
+func Deploy(ctx context.Context, ap Approval, artifact string) (string, error) { /* ... */ }
+
+dag := workflow.New()
+build  := dag.Step("build", Build)
+deploy := dag.Step("deploy", Deploy, workflow.SignalRef("approval"), build.Ref())
+_ = dag.Submit(ctx, wf)
+
+// ...build runs; deploy waits. Any process on the cluster can approve:
+delivered, _ := workflow.Signal(ctx, wf, dag.ID(), "approval", Approval{Approver: "eugene"})
+```
+
+- `workflow.SignalRef(name)` as an argument = wait for the signal AND receive its payload. `workflow.WaitForSignal(names...)` as a `StepOption` = wait only (ALL names must arrive, like deps).
+- **One-shot, buffered, first-wins.** A signal is delivered at most once per (DAG, name): the first payload is immutable, duplicates are idempotent no-ops (`delivered=false`). A signal sent before any step waits on it - including steps added dynamically later - is kept for the DAG's lifetime.
+- Waiting is durable (NATS KV) and composes with everything else: independent branches keep running, pause/resume and breakpoints are separate gates, and a waiting DAG survives restarts of every process involved.
+- Deliver and inspect from the CLI:
+
+```sh
+ebctl dag signal ls <dag-id>                          # NAME | DELIVERED | AT | WAITING | PAYLOAD
+ebctl dag signal <dag-id> approval '{"approver":"e"}' # deliver with a JSON payload
+ebctl dag ls --sig-waiting                            # only DAGs awaiting a signal (⚑N marker)
+ebctl dag watch                                       # live feed includes ⚑ signal events
+```
+
+See [`examples/17-workflow-signals`](./examples/17-workflow-signals) for a runnable approval-flow walkthrough.
+
+### Step placement
+
+Workers advertise logical targets ("claims"); steps can bind to a claim or to wherever another step ran. Useful when a step needs a GPU box, a host with a warm local cache, or the exact worker holding an open resource:
+
+```go
+// Worker side: claim logical targets. Claims can change at runtime
+// (worker.ClaimsFunc); every worker also always claims its own WorkerID.
+w, _ := worker.New(nc, reg, worker.Options{
+    WorkerID: "gpu-box-1",
+    Claims:   worker.StaticClaims{"gpu"},
+})
+
+// DAG side: bind steps to targets.
+train  := dag.StepOpts("train",  Train,  []workflow.StepOption{workflow.OnTarget("gpu")}, data.Ref())
+report := dag.StepOpts("report", Report, []workflow.StepOption{workflow.ColocateWith(train)}, train.Ref())
+```
+
+- `OnTarget(target)` - run on any worker currently claiming `target` (a logical name or a concrete `WorkerID`).
+- `ColocateWith(step)` - run on the *concrete worker* that executed `step` (adds an implicit dependency on it).
+- `FollowTargetOf(step)` - reuse `step`'s logical target expression, re-resolved at execution time - lands wherever that claim lives *now*.
+- `ColocateHere()` - for dynamic steps added via `FromContext`: pin the child step to the worker executing the current handler.
+
+See [`examples/12-workflow-placement`](./examples/12-workflow-placement) for all four modes across two workers with moving claims.
 
 ### Step breakpoints
 
@@ -273,7 +336,7 @@ See [CLAUDE.md](./CLAUDE.md) for the full architectural walk-through.
 | Exactly-one enqueue on retries | JetStream `Nats-Msg-Id` dedupe with 5-min window |
 | State consistency | NATS KV `Update(key, val, expectedRev)` CAS |
 | Handler panics | `worker.Recover` middleware → `TaskError{Kind: "panic"}` |
-| Retry control | `task.RetryPolicy` on envelope (per-task) or `worker.Options.MaxDeliver` default |
+| Retry control | `task.RetryPolicy` on envelope (per-task), `worker.Options.DefaultRetryPolicy` fallback, optional `MaxDeliver` hard cap |
 | Non-retryable errors | `RetryPolicy.NonRetryableErrorKinds` OR `TaskError{Retryable: false}` |
 | Dead-lettering | `dlq.Publish` auto-called on final failure → `EBIND_DLQ` stream |
 | Failure visibility | Failed step record carries `error_kind` + `error_msg` (durable in KV, via `ebctl dag step get`); full `TaskError` in `EBIND_DLQ`; cap with `Workflow.MaxStepErrorBytes` |
@@ -296,6 +359,10 @@ cmd/demo/     single-process end-to-end demo
 cmd/ebctl/    operator CLI: inspect DAGs/steps/results, DLQ, streams
 ```
 
+## Examples
+
+[`examples/`](./examples) holds 17 self-contained runnable programs, each starting its own embedded NATS - from basic enqueue/await through retries, middleware, and cluster HA to every workflow feature (fan-out, optional steps, dynamic steps, temporal deps, placement, cancel, pause/resume, breakpoints, label queries, signals). Start with the [index](./examples/README.md).
+
 ## Development
 
 ```sh
@@ -313,7 +380,8 @@ make demo          # run cmd/demo end-to-end
 - v1 (task queue): done - retries, DLQ, middleware, embedded HA cluster.
 - v2 (DAG workflows): done - optional steps, retry policies, dynamic DAGs.
 - v2.1 (stranded recovery): done - leader-acquisition sweep.
-- v2+ (future): phantom-Running detection, cross-DAG signals, saga/compensation.
+- v2.2 (signals): done - human-in-the-loop waits with payload delivery, cross-DAG capable.
+- v2+ (future): phantom-Running detection, saga/compensation, durable timers.
 
 ## License
 

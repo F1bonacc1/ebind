@@ -10,10 +10,11 @@ import (
 // revision; callers must pass the matching expectedRev or get ErrStaleRevision.
 type MemStore struct {
 	mu      sync.Mutex
-	steps   map[string]map[string]memEntry // dagID → stepID → entry
-	results map[string]map[string][]byte   // dagID → stepID → bytes
-	metas   map[string]memMetaEntry        // dagID → entry
-	watches map[string][]chan []byte       // "dagID/stepID" → waiters
+	steps   map[string]map[string]memEntry     // dagID → stepID → entry
+	results map[string]map[string][]byte       // dagID → stepID → bytes
+	metas   map[string]memMetaEntry            // dagID → entry
+	watches map[string][]chan []byte           // "dagID/stepID" → waiters
+	signals map[string]map[string]SignalRecord // dagID → signal name → record
 }
 
 type memEntry struct {
@@ -32,6 +33,7 @@ func NewMemStore() *MemStore {
 		results: map[string]map[string][]byte{},
 		metas:   map[string]memMetaEntry{},
 		watches: map[string][]chan []byte{},
+		signals: map[string]map[string]SignalRecord{},
 	}
 }
 
@@ -187,6 +189,58 @@ func (s *MemStore) DeleteResult(_ context.Context, dagID, stepID string) error {
 		delete(bucket, stepID)
 		if len(bucket) == 0 {
 			delete(s.results, dagID)
+		}
+	}
+	return nil
+}
+
+func (s *MemStore) GetSignal(_ context.Context, dagID, name string) (SignalRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if bucket, ok := s.signals[dagID]; ok {
+		if rec, ok := bucket[name]; ok {
+			return rec, nil
+		}
+	}
+	return SignalRecord{}, ErrSignalNotFound
+}
+
+func (s *MemStore) PutSignal(_ context.Context, dagID string, rec SignalRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	bucket, ok := s.signals[dagID]
+	if !ok {
+		bucket = map[string]SignalRecord{}
+		s.signals[dagID] = bucket
+	}
+	if _, exists := bucket[rec.Name]; exists {
+		return ErrStaleRevision
+	}
+	bucket[rec.Name] = rec
+	return nil
+}
+
+func (s *MemStore) ListSignals(_ context.Context, dagID string) ([]SignalRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	bucket, ok := s.signals[dagID]
+	if !ok {
+		return nil, nil
+	}
+	out := make([]SignalRecord, 0, len(bucket))
+	for _, rec := range bucket {
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+func (s *MemStore) DeleteSignal(_ context.Context, dagID, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if bucket, ok := s.signals[dagID]; ok {
+		delete(bucket, name)
+		if len(bucket) == 0 {
+			delete(s.signals, dagID)
 		}
 	}
 	return nil

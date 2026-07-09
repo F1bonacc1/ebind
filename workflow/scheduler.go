@@ -218,10 +218,13 @@ func (s *Scheduler) handleEvent(ctx context.Context, ev Event) error {
 	if state.Meta.Status == DAGStatusCanceled || state.Meta.Status == DAGStatusPaused {
 		return nil
 	}
-	// Pausing DAGs: gate step-added events (no new work during drain), but
-	// allow completion events through so the pausing→paused auto-transition
-	// in onCompleted can fire when the last in-flight step finishes (D-13).
-	if state.Meta.Status == DAGStatusPausing && ev.Kind == EventStepAdded {
+	// Pausing DAGs: gate step-added and signal events (no new work — and no
+	// finalize check — during drain), but allow completion events through so
+	// the pausing→paused auto-transition in onCompleted can fire when the last
+	// in-flight step finishes (D-13). A gated signal is not lost: its record
+	// is durable, and Resume's re-evaluation (or the sweep) picks it up.
+	if state.Meta.Status == DAGStatusPausing &&
+		(ev.Kind == EventStepAdded || ev.Kind == EventSignal) {
 		return nil
 	}
 	switch ev.Kind {
@@ -231,6 +234,11 @@ func (s *Scheduler) handleEvent(ctx context.Context, ev Event) error {
 		return s.onStepAdded(ctx, state)
 	case EventResumed:
 		return s.onResumed(ctx, state)
+	case EventSignal:
+		// Scheduling-relevant: the durable signal record was created before
+		// this event was published, so a plain readiness re-evaluation (the
+		// step-added path) sees the opened gate.
+		return s.onStepAdded(ctx, state)
 	case EventBPHit, EventBPResumed:
 		// Informational only (ebctl dag watch); nothing to schedule. Ack.
 		return nil
@@ -369,7 +377,7 @@ func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []s
 		if err := json.Unmarshal(rec.ArgsJSON, &rawArgs); err != nil {
 			return err
 		}
-		_, skip, err := ResolveArgs(rawArgs, results, statuses)
+		_, skip, err := ResolveArgs(rawArgs, results, statuses, state.Signals)
 		if err != nil {
 			return err
 		}
@@ -382,7 +390,7 @@ func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []s
 				Event{Kind: EventCompleted, DAGID: state.Meta.ID, StepID: id, Status: StatusSkipped})
 			continue
 		}
-		if err := enqueueStep(ctx, s.wf.Enq, rec, state.Steps, results, statuses); err != nil {
+		if err := enqueueStep(ctx, s.wf.Enq, rec, state.Steps, results, statuses, state.Signals); err != nil {
 			return err
 		}
 	}
@@ -574,7 +582,10 @@ func (s *Scheduler) maybeFinalize(ctx context.Context, state *DAGState) error {
 	return s.wf.Store.PutMeta(ctx, state.Meta.ID, meta, rev)
 }
 
-// loadState fetches DAG meta + all step records into an in-memory DAGState.
+// loadState fetches DAG meta + all step records + delivered signals into an
+// in-memory DAGState. Signals must be loaded here — this is the single point
+// where every gate consumer (handleEvent, sweep, onResumed) learns of them;
+// without it the signalBlocks gate would keep waiting steps blocked forever.
 func (s *Scheduler) loadState(ctx context.Context, dagID string) (*DAGState, error) {
 	meta, _, err := s.wf.Store.GetMeta(ctx, dagID)
 	if err != nil {
@@ -584,9 +595,13 @@ func (s *Scheduler) loadState(ctx context.Context, dagID string) (*DAGState, err
 	if err != nil {
 		return nil, err
 	}
+	sigs, err := s.wf.Store.ListSignals(ctx, dagID)
+	if err != nil {
+		return nil, err
+	}
 	m := make(map[string]StepRecord, len(steps))
 	for _, s := range steps {
 		m[s.StepID] = s
 	}
-	return &DAGState{Meta: meta, Steps: m}, nil
+	return &DAGState{Meta: meta, Steps: m, Signals: signalMap(sigs)}, nil
 }

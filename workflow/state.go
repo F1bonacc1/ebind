@@ -66,30 +66,35 @@ type DAGMeta struct {
 //     Step waits until each is terminal; failure never causes cascade.
 //     Populated by AfterAny() options.
 type StepRecord struct {
-	DAGID        string            `json:"dag_id"`
-	StepID       string            `json:"step_id"`
-	FnName       string            `json:"fn_name"`
-	ArgsJSON     json.RawMessage   `json:"args_json"` // JSON array; may contain Refs
-	Deps         []string          `json:"deps,omitempty"`
-	OptionalDeps []string          `json:"optional_deps,omitempty"`
-	Status       StepStatus        `json:"status"`
-	Attempt      int               `json:"attempt"`
-	ErrorKind    string            `json:"error_kind,omitempty"`
-	ErrorMessage string            `json:"error_message,omitempty"`
-	Optional     bool              `json:"optional,omitempty"`
-	Held         bool              `json:"held,omitempty"`         // held by Pause(); prevents enqueue
-	HeldAt       time.Time         `json:"held_at,omitempty"`      // when the hold was applied; age-gates orphan repair
-	BreakBefore  []string          `json:"break_before,omitempty"` // breakpoint labels gating execution start (immutable)
-	BreakAfter   []string          `json:"break_after,omitempty"`  // breakpoint labels gating direct dependents after done (immutable)
-	BPBefore     BPState           `json:"bp_before,omitempty"`    // ""→blocked(advisory)→released(monotonic)
-	BPAfter      BPState           `json:"bp_after,omitempty"`
-	BPBlockedAt  time.Time         `json:"bp_blocked_at,omitempty"` // advisory; when the blocked mark was written
-	Policy       *task.RetryPolicy `json:"policy,omitempty"`        // per-step override
-	Placement    *PlacementSpec    `json:"placement,omitempty"`
-	WorkerID     string            `json:"worker_id,omitempty"`
-	AddedAt      time.Time         `json:"added_at"`
-	StartedAt    time.Time         `json:"started_at,omitempty"`
-	FinishedAt   time.Time         `json:"finished_at,omitempty"`
+	DAGID        string          `json:"dag_id"`
+	StepID       string          `json:"step_id"`
+	FnName       string          `json:"fn_name"`
+	ArgsJSON     json.RawMessage `json:"args_json"` // JSON array; may contain Refs
+	Deps         []string        `json:"deps,omitempty"`
+	OptionalDeps []string        `json:"optional_deps,omitempty"`
+	Status       StepStatus      `json:"status"`
+	Attempt      int             `json:"attempt"`
+	ErrorKind    string          `json:"error_kind,omitempty"`
+	ErrorMessage string          `json:"error_message,omitempty"`
+	Optional     bool            `json:"optional,omitempty"`
+	Held         bool            `json:"held,omitempty"`         // held by Pause(); prevents enqueue
+	HeldAt       time.Time       `json:"held_at,omitempty"`      // when the hold was applied; age-gates orphan repair
+	BreakBefore  []string        `json:"break_before,omitempty"` // breakpoint labels gating execution start (immutable)
+	BreakAfter   []string        `json:"break_after,omitempty"`  // breakpoint labels gating direct dependents after done (immutable)
+	BPBefore     BPState         `json:"bp_before,omitempty"`    // ""→blocked(advisory)→released(monotonic)
+	BPAfter      BPState         `json:"bp_after,omitempty"`
+	BPBlockedAt  time.Time       `json:"bp_blocked_at,omitempty"` // advisory; when the blocked mark was written
+	// WaitSignals: names of external signals this step waits for, ALL of which
+	// must be delivered (workflow.Signal) before the step can start. Immutable
+	// config, fixed at Submit / dynamic StepOpts. Union of WaitForSignal()
+	// options and SignalRef() args.
+	WaitSignals []string          `json:"wait_signals,omitempty"`
+	Policy      *task.RetryPolicy `json:"policy,omitempty"` // per-step override
+	Placement   *PlacementSpec    `json:"placement,omitempty"`
+	WorkerID    string            `json:"worker_id,omitempty"`
+	AddedAt     time.Time         `json:"added_at"`
+	StartedAt   time.Time         `json:"started_at,omitempty"`
+	FinishedAt  time.Time         `json:"finished_at,omitempty"`
 }
 
 // IsTerminal returns true if this step's status cannot change anymore.
@@ -97,21 +102,36 @@ func (s StepRecord) IsTerminal() bool {
 	return s.Status == StatusDone || s.Status == StatusFailed || s.Status == StatusSkipped || s.Status == StatusCanceled
 }
 
+// SignalRecord is the durable record of one delivered signal (key:
+// <dag_id>/signal/<base64url(name)>). Created exactly once by Signal()
+// (first-wins, kv.Create), never mutated, deleted only by DeleteDAG. The
+// immutability is load-bearing: duplicate step enqueues are collapsed by
+// Nats-Msg-Id dedupe, which requires every enqueue attempt to resolve the
+// same payload.
+type SignalRecord struct {
+	DAGID       string          `json:"dag_id"`
+	Name        string          `json:"name"`
+	Payload     json.RawMessage `json:"payload,omitempty"`
+	DeliveredAt time.Time       `json:"delivered_at"`
+}
+
 // DAGState is the in-memory view of a DAG — loaded from the store at scheduler
 // evaluation time. All transition methods on DAGState are PURE (return data, no IO).
 type DAGState struct {
-	Meta  DAGMeta
-	Steps map[string]StepRecord // stepID -> record
+	Meta    DAGMeta
+	Steps   map[string]StepRecord   // stepID -> record
+	Signals map[string]SignalRecord // signal name -> delivered record; nil ⇒ none delivered
 }
 
 // ReadyToRun returns step IDs whose deps are all `done` (or satisfied-via-default)
 // and whose status is `pending` and not held. Used after MarkDone/MarkFailed to
 // find next work. Held steps are excluded — they are reserved by Pause().
 // Steps blocked at an armed before-breakpoint are excluded until released.
+// Steps waiting on undelivered signals are excluded until Signal delivers them.
 func (s *DAGState) ReadyToRun() []string {
 	var out []string
 	for id, step := range s.Steps {
-		if step.Status != StatusPending || step.Held || s.beforeBPBlocks(step) {
+		if step.Status != StatusPending || step.Held || s.beforeBPBlocks(step) || s.signalBlocks(step) {
 			continue
 		}
 		if s.depsSatisfied(step) {
@@ -149,6 +169,37 @@ func (s *DAGState) afterBPHolds(step StepRecord) bool {
 	return step.Status == StatusDone && len(step.BreakAfter) > 0 &&
 		step.BPAfter != BPStateReleased &&
 		breakpointArmed(step.BreakAfter, s.Meta.ActiveBreakpoints)
+}
+
+// signalBlocks: this step must not be enqueued — it declares wait-signals and
+// at least one has not been delivered. Computed from immutable config
+// (WaitSignals, fixed at Submit/StepOpts) plus the durable, monotonic signal
+// records; a nil Signals map errs toward "still blocked", the safe direction
+// for racing schedulers. Independent from the Held fence and the breakpoint
+// gates — the three fences compose and are released separately.
+func (s *DAGState) signalBlocks(step StepRecord) bool {
+	for _, name := range step.WaitSignals {
+		if _, ok := s.Signals[name]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// WaitingOnSignals returns IDs of pending steps that have "arrived at the
+// signal gate": every dependency is satisfied and only undelivered signals
+// keep them from running. Steps still waiting on deps are not reported.
+func (s *DAGState) WaitingOnSignals() []string {
+	var out []string
+	for id, step := range s.Steps {
+		if step.Status != StatusPending || !s.signalBlocks(step) {
+			continue
+		}
+		if s.depsSatisfied(step) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // BlockedAtBefore returns IDs of pending steps currently stopped AT their

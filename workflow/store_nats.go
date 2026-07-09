@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ const (
 	keyMetaSuffix   = ".meta"
 	keyStepPrefix   = ".step."
 	keyResultPrefix = ".result."
+	keySignalPrefix = ".signal."
 )
 
 // NatsStore is a JetStream KV-backed StateStore. Uses KV's built-in revision
@@ -43,6 +45,15 @@ func NewNatsStore(ctx context.Context, js jetstream.JetStream, replicas int) (*N
 func metaKey(dagID string) string           { return dagID + keyMetaSuffix }
 func stepKey(dagID, stepID string) string   { return dagID + keyStepPrefix + stepID }
 func resultKey(dagID, stepID string) string { return dagID + keyResultPrefix + stepID }
+
+// signalKey base64url-encodes the signal name: names are arbitrary user text,
+// while KV keys allow only [-/_=.a-zA-Z0-9]. The encoded alphabet ([A-Za-z0-9_-],
+// no dots) also keeps signal keys disjoint from the .meta suffix scan in
+// ListDAGs and the .step./.result. prefix scans. The raw name lives in the
+// record value — never decode it from the key.
+func signalKey(dagID, name string) string {
+	return dagID + keySignalPrefix + base64.RawURLEncoding.EncodeToString([]byte(name))
+}
 
 func (s *NatsStore) GetMeta(ctx context.Context, dagID string) (DAGMeta, uint64, error) {
 	entry, err := s.kv.Get(ctx, metaKey(dagID))
@@ -189,6 +200,63 @@ func (s *NatsStore) DeleteStep(ctx context.Context, dagID, stepID string) error 
 
 func (s *NatsStore) DeleteResult(ctx context.Context, dagID, stepID string) error {
 	if err := s.kv.Delete(ctx, resultKey(dagID, stepID)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return err
+	}
+	return nil
+}
+
+func (s *NatsStore) GetSignal(ctx context.Context, dagID, name string) (SignalRecord, error) {
+	entry, err := s.kv.Get(ctx, signalKey(dagID, name))
+	if err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return SignalRecord{}, ErrSignalNotFound
+		}
+		return SignalRecord{}, err
+	}
+	var rec SignalRecord
+	if err := json.Unmarshal(entry.Value(), &rec); err != nil {
+		return SignalRecord{}, err
+	}
+	return rec, nil
+}
+
+func (s *NatsStore) PutSignal(ctx context.Context, dagID string, rec SignalRecord) error {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = s.kv.Create(ctx, signalKey(dagID, rec.Name), data)
+	if err != nil && (errors.Is(err, jetstream.ErrKeyExists) || strings.Contains(err.Error(), "wrong last sequence")) {
+		return ErrStaleRevision
+	}
+	return err
+}
+
+func (s *NatsStore) ListSignals(ctx context.Context, dagID string) ([]SignalRecord, error) {
+	keys, err := s.kv.ListKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	prefix := dagID + keySignalPrefix
+	var out []SignalRecord
+	for k := range keys.Keys() {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		entry, err := s.kv.Get(ctx, k)
+		if err != nil {
+			continue
+		}
+		var rec SignalRecord
+		if err := json.Unmarshal(entry.Value(), &rec); err == nil {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
+func (s *NatsStore) DeleteSignal(ctx context.Context, dagID, name string) error {
+	if err := s.kv.Delete(ctx, signalKey(dagID, name)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
 		return err
 	}
 	return nil
