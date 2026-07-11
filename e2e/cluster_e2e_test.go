@@ -487,9 +487,11 @@ func TestClusterE2E(t *testing.T) {
 		if err := workflow.Cancel(pctx, h.wf, "e2e-cancel"); err != nil {
 			t.Fatal(err)
 		}
-		if st := h.dagStatus(pctx, "e2e-cancel"); st != workflow.DAGStatusCanceled {
-			t.Fatalf("after Cancel: got %s, want canceled", st)
-		}
+		// dagStatus is a relaxed direct get — a lagging replica can still
+		// serve the pre-Cancel meta. Poll until the CAS write is visible.
+		waitFor(t, 30*time.Second, "DAG canceled", func() bool {
+			return h.dagStatus(pctx, "e2e-cancel") == workflow.DAGStatusCanceled
+		})
 		if _, err := workflow.Await[string](pctx, h.wf, "e2e-cancel", dep); !errors.Is(err, workflow.ErrStepCanceled) {
 			t.Fatalf("dep await: got %v, want ErrStepCanceled", err)
 		}
@@ -513,9 +515,13 @@ func TestClusterE2E(t *testing.T) {
 		if err := workflow.DeleteDAG(pctx, h.wf, "e2e-delete"); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := h.wf.Store.GetMeta(pctx, "e2e-delete"); !errors.Is(err, workflow.ErrDAGNotFound) {
-			t.Fatalf("after DeleteDAG: got %v, want ErrDAGNotFound", err)
-		}
+		// GetMeta is a relaxed direct get — right after the quorum-committed
+		// delete, a lagging replica can still serve the old meta. Poll until
+		// the delete is visible everywhere.
+		waitFor(t, 30*time.Second, "meta gone after DeleteDAG", func() bool {
+			_, _, err := h.wf.Store.GetMeta(pctx, "e2e-delete")
+			return errors.Is(err, workflow.ErrDAGNotFound)
+		})
 	})
 
 	phase("07_BreakpointsDegraded", func(t *testing.T) {
