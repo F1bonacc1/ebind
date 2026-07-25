@@ -631,6 +631,10 @@ func TestClusterE2E(t *testing.T) {
 		pctx, pcancel := context.WithTimeout(ctx, 120*time.Second)
 		defer pcancel()
 
+		// Phase 07 restarted a node immediately before this; let the raft groups
+		// re-elect before reading, as every other post-injection phase does.
+		h.waitStreamLeadersSettled(t, 30*time.Second)
+
 		// The long DAG finalizes done: opt is the only failure and it's optional.
 		waitFor(t, 60*time.Second, "long DAG done", func() bool {
 			return h.dagStatus(ctx, longDAG) == workflow.DAGStatusDone
@@ -661,14 +665,15 @@ func TestClusterE2E(t *testing.T) {
 		// DLQ audit: at least one entry per induced failure with the right kind.
 		// Counts are lower bounds — DLQ publishes are not deduped, so injection
 		// windows can legitimately duplicate entries.
-		counts := h.dlqEntries(t, pctx)
-		for _, want := range []string{
+		wantDLQ := []string{
 			"e2e.eAdd/" + task.ErrKindDeadline,
 			"e2e.eNonRetryable/validation",
 			"e2e.ePanics/" + task.ErrKindPanic,
 			"e2e.eFailOptional/" + task.ErrKindHandler,
 			"e2e.eRetryExhaust/" + task.ErrKindHandler,
-		} {
+		}
+		counts := h.waitDLQEntries(t, pctx, 30*time.Second, wantDLQ)
+		for _, want := range wantDLQ {
 			if counts[want] < 1 {
 				t.Errorf("DLQ missing entry %s (have %v)", want, counts)
 			}

@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -377,41 +378,78 @@ func (h *harness) streamHasCurrentReplicas(name string) bool {
 	return true
 }
 
-// dlqEntries drains the DLQ stream through an ephemeral consumer and returns
-// entry counts grouped by "<task name>/<error kind>".
-func (h *harness) dlqEntries(t *testing.T, ctx context.Context) map[string]int {
-	t.Helper()
+// dlqCounts reads every DLQ entry via a bounded sequence scan and returns
+// counts grouped by "<task name>/<error kind>". Every failure is returned.
+//
+// It deliberately does not use a pull consumer. Creating an ephemeral consumer
+// on a cluster that has just taken a node back races consumer placement, and a
+// pull answered with "no responders" or a 409 leadership change closes its
+// batch with zero messages — indistinguishable from an empty DLQ unless
+// batch.Error() is inspected, which is exactly how an errored read once got
+// reported as five missing entries. EnsureStreams leaves AllowDirect off
+// EBIND_DLQ, so GetMsg is leader-served and strongly consistent.
+func (h *harness) dlqCounts(ctx context.Context) (map[string]int, error) {
 	s, err := h.js.Stream(ctx, stream.DLQStream)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	cons, err := s.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		AckPolicy:         jetstream.AckExplicitPolicy,
-		DeliverPolicy:     jetstream.DeliverAllPolicy,
-		InactiveThreshold: time.Minute,
-	})
+	info, err := s.Info(ctx)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	counts := map[string]int{}
-	for {
-		batch, err := cons.Fetch(50, jetstream.FetchMaxWait(2*time.Second))
+	// An empty stream reports FirstSeq == LastSeq+1, so this does not run.
+	for sq := info.State.FirstSeq; sq <= info.State.LastSeq; sq++ {
+		msg, err := s.GetMsg(ctx, sq)
 		if err != nil {
-			break
-		}
-		n := 0
-		for msg := range batch.Messages() {
-			var e dlq.Entry
-			if err := json.Unmarshal(msg.Data(), &e); err != nil {
-				t.Fatalf("decode DLQ entry: %v", err)
+			if errors.Is(err, jetstream.ErrMsgNotFound) {
+				continue // aged out or otherwise a gap in the sequence
 			}
-			counts[e.Task.Name+"/"+e.Error.Kind]++
-			_ = msg.Ack()
-			n++
+			return nil, err
 		}
-		if n == 0 {
-			break
+		var e dlq.Entry
+		if err := json.Unmarshal(msg.Data, &e); err != nil {
+			return nil, fmt.Errorf("decode DLQ entry seq %d: %w", sq, err)
 		}
+		counts[e.Task.Name+"/"+e.Error.Kind]++
 	}
-	return counts
+	return counts, nil
+}
+
+// waitDLQEntries polls the DLQ until every wanted key has at least one entry,
+// then returns the counts. On timeout it returns the last successful read — and
+// logs the last read error, if any — so the caller's own assertions still
+// report exactly what was there and why the read failed.
+func (h *harness) waitDLQEntries(t *testing.T, ctx context.Context, timeout time.Duration, want []string) map[string]int {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var (
+		last    map[string]int
+		lastErr error
+	)
+	for {
+		counts, err := h.dlqCounts(ctx)
+		if err != nil {
+			lastErr = err
+		} else {
+			last = counts
+			missing := false
+			for _, w := range want {
+				if counts[w] < 1 {
+					missing = true
+					break
+				}
+			}
+			if !missing {
+				return counts
+			}
+		}
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				t.Logf("last DLQ read error after %s: %v", timeout, lastErr)
+			}
+			return last
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
