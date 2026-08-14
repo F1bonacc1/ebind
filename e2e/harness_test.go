@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,28 +65,92 @@ type harness struct {
 	canary    *nats.Conn // knows only the victim's URL; proves the restarted node serves clients
 }
 
+// ringLogger keeps the tail of the NATS servers' own log output so a failed
+// bootstrap can explain itself. All three nodes share it, so lines carry no
+// node identity — a bind conflict names its port, which is enough to place it.
+type ringLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+const ringLoggerLines = 200
+
+func (l *ringLogger) add(format string, v ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, v...))
+	if len(l.lines) > ringLoggerLines {
+		l.lines = l.lines[len(l.lines)-ringLoggerLines:]
+	}
+}
+
+func (l *ringLogger) Noticef(f string, v ...any) { l.add(f, v...) }
+func (l *ringLogger) Warnf(f string, v ...any)   { l.add(f, v...) }
+func (l *ringLogger) Fatalf(f string, v ...any)  { l.add(f, v...) }
+func (l *ringLogger) Errorf(f string, v ...any)  { l.add(f, v...) }
+func (l *ringLogger) Debugf(f string, v ...any)  { l.add(f, v...) }
+func (l *ringLogger) Tracef(f string, v ...any)  { l.add(f, v...) }
+
+func (l *ringLogger) dump() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.lines) == 0 {
+		return "(no server output)"
+	}
+	return strings.Join(l.lines, "\n")
+}
+
+// startClusterWithRetry brings the 3-node cluster up, retrying a failed
+// bootstrap with a fresh port draw and a fresh store dir.
+//
+// This is containment, not a fix. The underlying defect — two port
+// reservations that could overlap — is fixed in embed; what remains is the
+// residual window any bind-then-close reservation has against the rest of the
+// machine, which a retry survives and a single attempt does not. The retry is
+// justified here because this test measures ebind under node chaos, and "three
+// servers came up" is its precondition rather than its subject.
+//
+// Each failed attempt is logged with the servers' own output so the flake stays
+// visible in CI instead of being silently absorbed. Delete this once the
+// nightly has been clean for long enough to trust the bootstrap.
+func startClusterWithRetry(t *testing.T) *embed.Cluster {
+	t.Helper()
+	const attempts = 3
+	var lastErr error
+	for a := 1; a <= attempts; a++ {
+		logger := &ringLogger{}
+		c, err := embed.StartCluster(embed.ClusterConfig{
+			Size:      numNodes,
+			Name:      "e2e",
+			BaseDir:   t.TempDir(),
+			ReadyWait: 30 * time.Second,
+			Logger:    logger,
+		})
+		if err == nil {
+			if err = c.WaitReady(30 * time.Second); err == nil {
+				return c
+			}
+			c.Shutdown()
+		}
+		lastErr = err
+		t.Logf("cluster bootstrap attempt %d/%d failed: %v\nlast %d server log lines:\n%s",
+			a, attempts, err, ringLoggerLines, logger.dump())
+	}
+	t.Fatalf("cluster did not bootstrap in %d attempts: %v", attempts, lastErr)
+	return nil
+}
+
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	resetGates()
 
-	c, err := embed.StartCluster(embed.ClusterConfig{
-		Size:      numNodes,
-		Name:      "e2e",
-		BaseDir:   t.TempDir(),
-		ReadyWait: 30 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := startClusterWithRetry(t)
 	h := &harness{cluster: c, victim: -1}
-	if err := c.WaitReady(30 * time.Second); err != nil {
-		c.Shutdown()
-		t.Fatal(err)
-	}
 	for _, n := range c.Nodes {
 		h.urls = append(h.urls, n.ClientURL())
 	}
 
+	var err error
 	h.nc, err = nats.Connect(strings.Join(h.urls, ","),
 		nats.ReconnectWait(100*time.Millisecond),
 		nats.MaxReconnects(-1),
