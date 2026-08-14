@@ -20,6 +20,15 @@ type ClusterConfig struct {
 	BaseDir string
 	// ReadyWait is the per-node timeout waiting for connections.
 	ReadyWait time.Duration
+	// Logger receives the NATS servers' own log output. Nil (the default) keeps
+	// every node silent, which is what an embedded deployment usually wants.
+	//
+	// Supply one when diagnosing a node that fails to start: Server.Start
+	// enables JetStream before the accept loops and reports failure through
+	// Server.Fatalf, which is a silent no-op while the logger is nil, so the
+	// reason is lost. Sending the output somewhere that is only printed on
+	// failure keeps a healthy run quiet and a broken one explicable.
+	Logger natsserver.Logger
 }
 
 type Cluster struct {
@@ -27,6 +36,7 @@ type Cluster struct {
 	dir       string
 	owned     bool // true if BaseDir was auto-created and we should clean it up
 	readyWait time.Duration
+	logger    natsserver.Logger // re-applied by RestartNode; nil keeps nodes silent
 }
 
 // StartCluster spins up an in-process cluster of Size nodes on loopback with random free ports.
@@ -55,22 +65,23 @@ func StartCluster(cfg ClusterConfig) (*Cluster, error) {
 	}
 
 	// Reserve ports up front so every node knows every peer's cluster URL at boot.
-	clientPorts, err := freePorts(cfg.Size)
+	// Both sets come from ONE freePorts call: it holds every listener open until
+	// all are chosen, so the client and cluster sets are guaranteed disjoint. Two
+	// separate calls would release the first set before drawing the second, and
+	// the kernel can hand a just-freed port straight back — which assigns some
+	// node the same number for its client and cluster listener. One of the two
+	// binds then fails, that node never becomes ready, and the whole cluster
+	// start times out.
+	ports, err := freePorts(2 * cfg.Size)
 	if err != nil {
 		if owned {
 			os.RemoveAll(dir)
 		}
 		return nil, err
 	}
-	clusterPorts, err := freePorts(cfg.Size)
-	if err != nil {
-		if owned {
-			os.RemoveAll(dir)
-		}
-		return nil, err
-	}
+	clientPorts, clusterPorts := ports[:cfg.Size], ports[cfg.Size:]
 
-	cluster := &Cluster{dir: dir, owned: owned, readyWait: cfg.ReadyWait}
+	cluster := &Cluster{dir: dir, owned: owned, readyWait: cfg.ReadyWait, logger: cfg.Logger}
 
 	// Phase 1: construct all servers and start them concurrently so routes can form
 	// before any single node commits to a singleton JetStream meta group.
@@ -101,7 +112,7 @@ func StartCluster(cfg ClusterConfig) (*Cluster, error) {
 			Routes:    routes,
 			JetStream: true,
 			StoreDir:  nodeDir,
-			NoLog:     true,
+			NoLog:     cfg.Logger == nil,
 			NoSigs:    true,
 		}
 		pristine := opts.Clone()
@@ -110,6 +121,7 @@ func StartCluster(cfg ClusterConfig) (*Cluster, error) {
 			cluster.Shutdown()
 			return nil, fmt.Errorf("embed: cluster node %d: %w", i, err)
 		}
+		applyLogger(srv, cfg.Logger)
 		servers[i] = srv
 		cluster.Nodes = append(cluster.Nodes, &Node{srv: srv, opts: pristine, cfg: NodeConfig{
 			ServerName: opts.ServerName,
@@ -126,11 +138,40 @@ func StartCluster(cfg ClusterConfig) (*Cluster, error) {
 	}
 	for i, srv := range servers {
 		if !srv.ReadyForConnections(cfg.ReadyWait) {
+			detail := readyFailure(srv)
 			cluster.Shutdown()
-			return nil, fmt.Errorf("embed: cluster node %d not ready within %s", i, cfg.ReadyWait)
+			return nil, fmt.Errorf("embed: cluster node %d not ready within %s: %s", i, cfg.ReadyWait, detail)
 		}
 	}
 	return cluster, nil
+}
+
+// readyFailure asks a server that failed ReadyForConnections why. The server
+// knows precisely — "listen tcp 127.0.0.1:43073: bind: address already in use"
+// — but ReadyForConnections narrows that to a bool, and NoLog silences the log
+// that would otherwise carry it. Healthz runs the same readiness check and does
+// report the reason, so it is the one way to recover the cause without a fork.
+//
+// JSServerOnly keeps the check to the server's own listeners: at start-up the
+// JetStream assets do not exist yet, and their absence is not the failure being
+// diagnosed.
+// applyLogger installs a logger on a freshly constructed server. Setting
+// Options.NoLog to false is not enough on its own: Server.Start never calls
+// ConfigureLogger — only the nats-server binary and a config reload do — so
+// without this the logger stays nil and every log call, Fatalf included, is
+// silently dropped. Debug and trace stay off; the start path logs at notice.
+func applyLogger(srv *natsserver.Server, logger natsserver.Logger) {
+	if logger != nil {
+		srv.SetLogger(logger, false, false)
+	}
+}
+
+func readyFailure(srv *natsserver.Server) string {
+	hs := srv.Healthz(&natsserver.HealthzOptions{JSServerOnly: true})
+	if hs == nil || hs.Error == "" {
+		return "no failure detail reported"
+	}
+	return hs.Error
 }
 
 // ClientURLs returns a comma-separated URL list suitable for nats.Connect.
@@ -198,14 +239,15 @@ func (c *Cluster) RestartNode(i int) error {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
+		applyLogger(srv, c.logger)
 		go srv.Start()
 		if srv.ReadyForConnections(5 * time.Second) {
 			n.srv = srv
 			return nil
 		}
+		lastErr = fmt.Errorf("embed: node %d did not become ready for connections: %s", i, readyFailure(srv))
 		srv.Shutdown()
 		srv.WaitForShutdown()
-		lastErr = fmt.Errorf("embed: node %d did not become ready for connections", i)
 	}
 	return fmt.Errorf("embed: restart node %d within %s: %w", i, c.readyWait, lastErr)
 }

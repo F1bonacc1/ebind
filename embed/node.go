@@ -14,6 +14,10 @@ type NodeConfig struct {
 	Port       int
 	StoreDir   string
 	ReadyWait  time.Duration
+	// Logger receives the NATS server's own log output. Nil (the default) keeps
+	// the server silent. See ClusterConfig.Logger — a server that fails to start
+	// reports the reason only through it.
+	Logger natsserver.Logger
 }
 
 type Node struct {
@@ -38,7 +42,7 @@ func StartNode(cfg NodeConfig) (*Node, error) {
 		Port:       cfg.Port,
 		JetStream:  true,
 		StoreDir:   cfg.StoreDir,
-		NoLog:      true,
+		NoLog:      cfg.Logger == nil,
 		NoSigs:     true,
 	}
 	pristine := opts.Clone()
@@ -46,10 +50,12 @@ func StartNode(cfg NodeConfig) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("embed: new server: %w", err)
 	}
+	applyLogger(srv, cfg.Logger)
 	go srv.Start()
 	if !srv.ReadyForConnections(cfg.ReadyWait) {
+		detail := readyFailure(srv)
 		srv.Shutdown()
-		return nil, fmt.Errorf("embed: server not ready within %s", cfg.ReadyWait)
+		return nil, fmt.Errorf("embed: server not ready within %s: %s", cfg.ReadyWait, detail)
 	}
 	return &Node{srv: srv, cfg: cfg, opts: pristine}, nil
 }
