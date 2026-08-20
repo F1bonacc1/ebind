@@ -311,17 +311,20 @@ func TestClusterE2E(t *testing.T) {
 		if err := workflow.Pause(pctx, h.wf, longDAG); err != nil {
 			t.Fatal(err)
 		}
-		if st := h.dagStatus(pctx, longDAG); st != workflow.DAGStatusPausing {
-			t.Fatalf("after Pause: got %s, want pausing", st)
-		}
+		// dagStatus is a relaxed direct get — a lagging replica can still serve
+		// the pre-Pause meta. Poll until the CAS write is visible. `pausing` is
+		// pinned for the whole window: gate2 is still held below, so g2 stays
+		// in flight and the DAG cannot drain to `paused` until we release it.
+		waitFor(t, 30*time.Second, "DAG pausing", func() bool {
+			return h.dagStatus(pctx, longDAG) == workflow.DAGStatusPausing
+		})
+		// Same relaxed read: fencePendingSteps CAS-wrote Held=true on these
+		// records just before the meta write. Held is monotonic until Resume.
 		for _, id := range []string{"g3", "dynp", "final"} {
-			rec, _, err := h.wf.Store.GetStep(pctx, longDAG, id)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !rec.Held || rec.Status != workflow.StatusPending {
-				t.Fatalf("step %s: held=%v status=%s, want held pending", id, rec.Held, rec.Status)
-			}
+			waitFor(t, 30*time.Second, "step "+id+" held pending", func() bool {
+				rec, _, err := h.wf.Store.GetStep(pctx, longDAG, id)
+				return err == nil && rec.Held && rec.Status == workflow.StatusPending
+			})
 		}
 
 		// Drain: g2 finishes, DAG auto-transitions pausing → paused.
