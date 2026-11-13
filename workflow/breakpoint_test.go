@@ -307,8 +307,17 @@ func TestDAG_Submit_PersistsBreakpointsAndActiveSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(meta.ActiveBreakpoints) != 2 || meta.ActiveBreakpoints[0] != "X" || meta.ActiveBreakpoints[1] != "Z" {
-		t.Errorf("ActiveBreakpoints = %v, want deduped [X Z]", meta.ActiveBreakpoints)
+	// Since v0.9.0 labels are stored as label matchers, deduplicated, and the
+	// deprecated ActiveBreakpoints field is never written.
+	if len(meta.ActiveBreakpoints) != 0 {
+		t.Errorf("ActiveBreakpoints = %v, want unwritten", meta.ActiveBreakpoints)
+	}
+	var keys []string
+	for _, m := range meta.ArmedMatchers {
+		keys = append(keys, m.Key())
+	}
+	if want := "before:label:X,after:label:X,before:label:Z,after:label:Z"; strings.Join(keys, ",") != want {
+		t.Errorf("ArmedMatchers = %v, want %s", keys, want)
 	}
 	aRec, _, _ := store.GetStep(context.Background(), dag.ID(), "a")
 	if len(aRec.BreakAfter) != 2 || aRec.BreakAfter[0] != "A1" {

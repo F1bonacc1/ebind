@@ -14,7 +14,8 @@ import (
 // before-breakpoint and one done step holding at an after-breakpoint.
 func seedBlockedDAG(t *testing.T, store *workflow.MemStore) workflow.DAGMeta {
 	t.Helper()
-	meta := workflow.DAGMeta{ID: "d", Status: workflow.DAGStatusRunning, ActiveBreakpoints: []string{"X"}}
+	meta := workflow.DAGMeta{ID: "d", Status: workflow.DAGStatusRunning,
+		ArmedMatchers: []workflow.BPMatcher{workflow.BeforeLabel("X"), workflow.AfterLabel("X")}}
 	if err := store.PutMeta(context.Background(), "d", meta, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -38,23 +39,23 @@ func TestBPTable_RendersStates(t *testing.T) {
 	}
 	infos := workflow.ComputeBreakpoints(meta, steps)
 	headers, rows := bpTable(infos)
-	if len(headers) != 7 || len(rows) != 2 {
-		t.Fatalf("headers=%d rows=%d, want 7/2", len(headers), len(rows))
+	if len(headers) != 8 || len(rows) != 2 {
+		t.Fatalf("headers=%d rows=%d, want 8/2", len(headers), len(rows))
 	}
 	// Rows are ordered by step ID: a/after first, then b/before.
 	a := rows[0]
-	if a[0] != "a" || a[1] != "after" || a[3] != "yes" || a[4] != "blocked" {
+	if a[0] != "a" || a[1] != "after" || a[3] != "after:label:X" || a[4] != "yes" || a[5] != "blocked" {
 		t.Errorf("a row: %v", a)
 	}
-	if a[6] != "-" {
+	if a[7] != "-" {
 		// b is held by a's gate? b depends on nothing — a holds no one here.
 		t.Errorf("a holding: %q, want -", a[6])
 	}
-	if a[5] == "-" {
-		t.Errorf("a SINCE should render from BPBlockedAt, got %q", a[5])
+	if a[6] == "-" {
+		t.Errorf("a SINCE should render from BPBlockedAt, got %q", a[6])
 	}
 	b := rows[1]
-	if b[0] != "b" || b[1] != "before" || b[2] != "X,Y" || b[4] != "blocked" {
+	if b[0] != "b" || b[1] != "before" || b[2] != "X,Y" || b[5] != "blocked" {
 		t.Errorf("b row: %v", b)
 	}
 }
@@ -83,7 +84,7 @@ func TestBlockedBPCount(t *testing.T) {
 		t.Errorf("blockedBPCount = %d, want 2", n)
 	}
 	// Inactive labels: nothing blocked.
-	meta.ActiveBreakpoints = nil
+	meta.ArmedMatchers = nil
 	if n := blockedBPCount(meta, steps); n != 0 {
 		t.Errorf("inactive blockedBPCount = %d, want 0", n)
 	}
@@ -110,5 +111,47 @@ func TestBPReleaseText(t *testing.T) {
 	got = bpReleaseText("d", "upload-eu", workflow.BPPositionAfter, false)
 	if !strings.HasPrefix(got, "not stopped") || !strings.Contains(got, "after") {
 		t.Errorf("not-stopped text: %q", got)
+	}
+}
+
+func TestBPTable_MatcherOnlyRow(t *testing.T) {
+	meta := workflow.DAGMeta{ID: "d", Status: workflow.DAGStatusRunning,
+		ArmedMatchers: []workflow.BPMatcher{workflow.BeforeStep("node-*")}}
+	steps := []workflow.StepRecord{{DAGID: "d", StepID: "node-1", Status: workflow.StatusPending}}
+	_, rows := bpTable(workflow.ComputeBreakpoints(meta, steps))
+	if len(rows) != 1 {
+		t.Fatalf("rows = %v", rows)
+	}
+	r := rows[0]
+	if r[0] != "node-1" || r[2] != "-" || r[3] != "before:step:node-*" || r[4] != "yes" || r[5] != "blocked" {
+		t.Errorf("matcher-only row: %v", r)
+	}
+}
+
+func TestBPLsOptions(t *testing.T) {
+	meta := workflow.DAGMeta{ID: "d", Status: workflow.DAGStatusRunning,
+		ArmedMatchers: []workflow.BPMatcher{workflow.BeforeLabel("X")}}
+	steps := []workflow.StepRecord{
+		{DAGID: "d", StepID: "armed", Status: workflow.StatusPending, BreakBefore: []string{"X"}},
+		{DAGID: "d", StepID: "unarmed", Status: workflow.StatusPending, BreakBefore: []string{"Y"}},
+		{DAGID: "d", StepID: "a", Status: workflow.StatusRunning},
+		{DAGID: "d", StepID: "later", Status: workflow.StatusPending, BreakBefore: []string{"X"}, Deps: []string{"a"}},
+	}
+	infos := workflow.ComputeBreakpoints(meta, steps)
+	ids := func(opts []workflow.ListBPOption) string {
+		var out []string
+		for _, bp := range workflow.FilterBreakpoints(infos, opts...) {
+			out = append(out, bp.StepID)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := ids(bpLsOptions(false, false)); got != "armed,later" {
+		t.Errorf("default = %s, want armed,later", got)
+	}
+	if got := ids(bpLsOptions(true, false)); got != "armed,later,unarmed" {
+		t.Errorf("--all = %s", got)
+	}
+	if got := ids(bpLsOptions(false, true)); got != "armed" {
+		t.Errorf("--blocked = %s, want armed", got)
 	}
 }

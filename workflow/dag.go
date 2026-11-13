@@ -40,6 +40,7 @@ type SubmitOption func(*submitOptions)
 
 type submitOptions struct {
 	activeBreakpoints []string
+	armedMatchers     []BPMatcher
 	startPaused       bool
 }
 
@@ -73,10 +74,70 @@ func StartPaused() SubmitOption {
 //
 //	dag := buildPipeline()                                  // BP config lives on the steps
 //	err := dag.Submit(ctx, wf, workflow.WithActiveBreakpoints("BeforeUpload"))
+//
+// Each label is stored as the matchers BeforeLabel(label) and
+// AfterLabel(label) in DAGMeta.ArmedMatchers, so it behaves exactly like
+// WithArmedBreakpoints with those two matchers.
 func WithActiveBreakpoints(labels ...string) SubmitOption {
 	return func(o *submitOptions) {
 		o.activeBreakpoints = append(o.activeBreakpoints, labels...)
 	}
+}
+
+// WithArmedBreakpoints arms breakpoints for this execution by matcher, so a
+// step can be stopped without declaring BreakBefore/BreakAfter in the code
+// that builds the DAG:
+//
+//	err := dag.Submit(ctx, wf, workflow.WithArmedBreakpoints(
+//		workflow.BeforeStep("upgrade-node-*"), // every node, before it runs
+//		workflow.AfterFn("deploy.Prepare"),    // hold Prepare's dependents
+//	))
+//
+// Matchers also apply to steps added later through FromContext. The armed
+// set is fixed at Submit and immutable for the DAG's lifetime; duplicates (by
+// Key) are collapsed, and an invalid matcher fails the Submit with
+// ErrInvalidMatcher. Releasing a stop (ResumeBreakpoint, ReleaseStep,
+// ReleaseMatching) does not disarm the matcher: a later matching step stops
+// again.
+func WithArmedBreakpoints(ms ...BPMatcher) SubmitOption {
+	return func(o *submitOptions) {
+		o.armedMatchers = append(o.armedMatchers, ms...)
+	}
+}
+
+// armedMatcherSet builds DAGMeta.ArmedMatchers from the submit options: label
+// arming first (as before+after label matchers), then explicit matchers,
+// deduplicated by Key in that order.
+func (o submitOptions) armedMatcherSet() ([]BPMatcher, error) {
+	all := make([]BPMatcher, 0, 2*len(o.activeBreakpoints)+len(o.armedMatchers))
+	for _, label := range o.activeBreakpoints {
+		if label == "" {
+			return nil, fmt.Errorf("workflow: WithActiveBreakpoints label must be non-empty")
+		}
+		all = append(all, BeforeLabel(label), AfterLabel(label))
+	}
+	for _, m := range o.armedMatchers {
+		if err := m.Validate(); err != nil {
+			return nil, fmt.Errorf("workflow: WithArmedBreakpoints: %w", err)
+		}
+		all = append(all, m)
+	}
+	return dedupeMatchers(all), nil
+}
+
+func dedupeMatchers(ms []BPMatcher) []BPMatcher {
+	if len(ms) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(ms))
+	out := make([]BPMatcher, 0, len(ms))
+	for _, m := range ms {
+		if k := m.Key(); !seen[k] {
+			seen[k] = true
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // DAG is the user-facing workflow builder. Not safe for concurrent Step() calls.
@@ -391,9 +452,10 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 			return err
 		}
 	}
-	if slices.Contains(so.activeBreakpoints, "") {
+	armed, err := so.armedMatcherSet()
+	if err != nil {
 		d.mu.Unlock()
-		return fmt.Errorf("workflow: WithActiveBreakpoints label must be non-empty")
+		return err
 	}
 	if slices.Contains(d.labels, "") {
 		d.mu.Unlock()
@@ -415,12 +477,12 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 	// Persist meta.
 	now := time.Now().UTC()
 	meta := DAGMeta{
-		ID:                d.id,
-		Status:            DAGStatusRunning,
-		CreatedAt:         now,
-		DefaultPolicy:     d.defaultPolicy,
-		ActiveBreakpoints: dedupeStrings(so.activeBreakpoints),
-		Labels:            dedupeStrings(d.labels),
+		ID:            d.id,
+		Status:        DAGStatusRunning,
+		CreatedAt:     now,
+		DefaultPolicy: d.defaultPolicy,
+		ArmedMatchers: armed,
+		Labels:        dedupeStrings(d.labels),
 	}
 	if so.startPaused {
 		meta.Status = DAGStatusPaused

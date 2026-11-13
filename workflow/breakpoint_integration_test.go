@@ -332,3 +332,51 @@ func TestBreakpoint_E2E_ReleaseStep_FanOut(t *testing.T) {
 	}
 	waitForStatus(t, h, dag.ID(), workflow.DAGStatusDone, 5*time.Second)
 }
+
+// TestBreakpoint_E2E_Matchers: no step declares a breakpoint; matchers armed
+// at submit stop them, and the stops are released one, then the rest.
+func TestBreakpoint_E2E_Matchers(t *testing.T) {
+	h := setup(t)
+	task.MustRegister(h.reg, hAdd)
+	task.MustRegister(h.reg, hDouble)
+
+	dag := workflow.New()
+	a := dag.Step("prepare", hAdd, 2, 3)
+	n1 := dag.Step("upgrade-1", hDouble, a.Ref())
+	n2 := dag.Step("upgrade-2", hDouble, a.Ref())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := dag.Submit(ctx, h.wf, workflow.StartPaused(),
+		workflow.WithArmedBreakpoints(workflow.AfterStep("prepare"), workflow.BeforeStep("upgrade-*"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflow.Resume(ctx, h.wf, dag.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workflow.WaitForBreakpoint(ctx, h.wf, dag.ID(), workflow.AfterStep("prepare")); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := workflow.ReleaseStep(ctx, h.wf, dag.ID(), "prepare", workflow.BPPositionAfter); err != nil || !ok {
+		t.Fatalf("release prepare: %v, %v", ok, err)
+	}
+	for _, id := range []string{"upgrade-1", "upgrade-2"} {
+		info, err := workflow.WaitForBreakpoint(ctx, h.wf, dag.ID(), workflow.BeforeStep(id))
+		if err != nil || len(info.Matchers) != 1 || info.Matchers[0] != "before:step:upgrade-*" {
+			t.Fatalf("wait %s: %+v, %v", id, info, err)
+		}
+	}
+	if ok, err := workflow.ReleaseStep(ctx, h.wf, dag.ID(), "upgrade-1", workflow.BPPositionBefore); err != nil || !ok {
+		t.Fatalf("release upgrade-1: %v, %v", ok, err)
+	}
+	if got, err := workflow.Await[int](ctx, h.wf, dag.ID(), n1); err != nil || got != 10 {
+		t.Fatalf("upgrade-1 = %d, %v", got, err)
+	}
+	if n, err := workflow.ReleaseMatching(ctx, h.wf, dag.ID(), workflow.BeforeStep("upgrade-*")); err != nil || n != 1 {
+		t.Fatalf("ReleaseMatching = %d, %v; want 1", n, err)
+	}
+	if got, err := workflow.Await[int](ctx, h.wf, dag.ID(), n2); err != nil || got != 10 {
+		t.Fatalf("upgrade-2 = %d, %v", got, err)
+	}
+	waitForStatus(t, h, dag.ID(), workflow.DAGStatusDone, 5*time.Second)
+}

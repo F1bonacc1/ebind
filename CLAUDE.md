@@ -103,7 +103,7 @@ workflow/
   scheduler.go           handleEvent + watchLeadership + sweep
   breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint, ReleaseStep
   wait_breakpoint.go     WaitForBreakpoint: fold a WatchDAG stream, return the first matching stop
-  matcher.go             BPMatcher (position × step|fn|label pattern, path.Match globs) + Key/Validate/Matches (pure)
+  matcher.go             BPMatcher (position × step|fn|label pattern, path.Match globs) + Key/Validate/Matches (pure); gate use in state.go bpArmed
   signal.go              external signals: Signal (deliver), ComputeSignals/ListSignalInfo (observability)
   hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
   context.go             FromContext — dynamic step addition
@@ -172,13 +172,16 @@ Within one scheduler instance, `mu` serializes event handling. Across instances,
 When `IsLeader()` flips false→true, the scheduler sweeps all running DAGs and re-enqueues any stranded ready steps. Edge-triggered, not level-triggered. Defaults: 5s poll, 60s sweep timeout. Overlap-guarded.
 
 ### Breakpoints are computed gates; `Held` and BP fences are independent
-Per-step breakpoints (`BreakBefore`/`BreakAfter` StepOptions, armed via
-`WithActiveBreakpoints` at submit) gate scheduling inside the pure layer:
+Per-step breakpoints are armed at submit by matcher (`WithArmedBreakpoints`;
+`WithActiveBreakpoints` labels are stored as `BeforeLabel`/`AfterLabel`
+matchers in `DAGMeta.ArmedMatchers`) and gate scheduling inside the pure layer:
 `ReadyToRun` refuses a pending step whose before-BP is armed, `depsSatisfied`
 refuses dependents of a done step whose after-BP is armed. The gate is computed
-from immutable config (labels × `DAGMeta.ActiveBreakpoints`) plus the monotonic
-`BPBefore`/`BPAfter = released` flag written only by `ResumeBreakpoint` and
-`ReleaseStep` (both through `releaseInstance`, the one release path) — the
+from immutable config (step ID, fn name, declared labels × `ArmedMatchers`, plus
+the deprecated read-only `ActiveBreakpoints` of pre-v0.9.0 DAGs) plus the monotonic
+`BPBefore`/`BPAfter = released` flag written only by `ResumeBreakpoint`,
+`ReleaseMatching` and `ReleaseStep` (all through `releaseInstance`, the one
+release path) — the
 persisted `blocked` marks (`bp_before`/`bp_after`/`bp_blocked_at`) are advisory
 observability only, never load-bearing. Resume is debugger "continue": the label
 stays armed; each call releases only what is currently stopped. `ReleaseStep`

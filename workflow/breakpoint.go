@@ -14,8 +14,13 @@ import (
 type BreakpointInfo struct {
 	StepID   string     `json:"step_id"`
 	Position BPPosition `json:"position"` // before | after
-	Labels   []string   `json:"labels"`
-	Armed    bool       `json:"armed"` // labels ∩ ActiveBreakpoints ≠ ∅
+	Labels   []string   `json:"labels"`   // declared with BreakBefore/BreakAfter; may be empty
+	// Armed: a legacy ActiveBreakpoints label or an armed matcher selects
+	// this step at this position.
+	Armed bool `json:"armed"`
+	// Matchers are the keys of the armed matchers that select this step at
+	// this position (e.g. "before:step:upgrade-node-*").
+	Matchers []string `json:"matchers,omitempty"`
 	// State is the computed lifecycle: "" (not hit), blocked (currently
 	// stopping work), or released (a ResumeBreakpoint passed it).
 	State        BPState   `json:"state,omitempty"`
@@ -24,7 +29,8 @@ type BreakpointInfo struct {
 }
 
 // ComputeBreakpoints is the pure projection of a DAG's breakpoints from its
-// meta + step records. State is computed from the live gate predicates, not
+// meta + step records. It has one entry per (step, position) that declares
+// labels or is selected by an armed matcher. State is computed from the live gate predicates, not
 // the advisory blocked marks, so it is correct even if a scheduler has not
 // written the marks yet. Results are ordered by step ID, before-position first.
 //
@@ -48,12 +54,14 @@ func ComputeBreakpoints(meta DAGMeta, steps []StepRecord) []BreakpointInfo {
 
 	var out []BreakpointInfo
 	for _, rec := range steps {
-		if len(rec.BreakBefore) > 0 {
+		beforeKeys := state.armedMatcherKeys(rec, BPPositionBefore)
+		if len(rec.BreakBefore) > 0 || len(beforeKeys) > 0 {
 			info := BreakpointInfo{
 				StepID:   rec.StepID,
 				Position: BPPositionBefore,
 				Labels:   rec.BreakBefore,
-				Armed:    breakpointArmed(rec.BreakBefore, meta.ActiveBreakpoints),
+				Armed:    state.bpArmed(rec, BPPositionBefore),
+				Matchers: beforeKeys,
 			}
 			switch {
 			case rec.BPBefore == BPStateReleased:
@@ -64,12 +72,14 @@ func ComputeBreakpoints(meta DAGMeta, steps []StepRecord) []BreakpointInfo {
 			}
 			out = append(out, info)
 		}
-		if len(rec.BreakAfter) > 0 {
+		afterKeys := state.armedMatcherKeys(rec, BPPositionAfter)
+		if len(rec.BreakAfter) > 0 || len(afterKeys) > 0 {
 			info := BreakpointInfo{
 				StepID:   rec.StepID,
 				Position: BPPositionAfter,
 				Labels:   rec.BreakAfter,
-				Armed:    breakpointArmed(rec.BreakAfter, meta.ActiveBreakpoints),
+				Armed:    state.bpArmed(rec, BPPositionAfter),
+				Matchers: afterKeys,
 			}
 			switch {
 			case rec.BPAfter == BPStateReleased:
@@ -116,9 +126,45 @@ func CountBlocked(infos []BreakpointInfo) int {
 	return n
 }
 
-// ListBreakpoints loads the DAG from the store and returns its breakpoints.
-// Returns ErrDAGNotFound if the DAG's meta key is missing.
-func ListBreakpoints(ctx context.Context, wf *Workflow, dagID string) ([]BreakpointInfo, error) {
+// ListBPOption filters ListBreakpoints.
+type ListBPOption func(*listBPOptions)
+
+type listBPOptions struct {
+	onlyArmed, onlyBlocked bool
+}
+
+// OnlyArmed keeps only armed breakpoints (drops declared-but-unarmed labels).
+func OnlyArmed() ListBPOption { return func(o *listBPOptions) { o.onlyArmed = true } }
+
+// OnlyBlocked keeps only breakpoints currently stopping work.
+func OnlyBlocked() ListBPOption { return func(o *listBPOptions) { o.onlyBlocked = true } }
+
+// FilterBreakpoints applies ListBPOptions to computed infos, keeping order.
+func FilterBreakpoints(infos []BreakpointInfo, opts ...ListBPOption) []BreakpointInfo {
+	var o listBPOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if !o.onlyArmed && !o.onlyBlocked {
+		return infos
+	}
+	out := make([]BreakpointInfo, 0, len(infos))
+	for _, bp := range infos {
+		if o.onlyArmed && !bp.Armed {
+			continue
+		}
+		if o.onlyBlocked && bp.State != BPStateBlocked {
+			continue
+		}
+		out = append(out, bp)
+	}
+	return out
+}
+
+// ListBreakpoints loads the DAG from the store and returns its breakpoints:
+// by default every declared or matcher-armed one, narrowed by OnlyArmed and
+// OnlyBlocked. Returns ErrDAGNotFound if the DAG's meta key is missing.
+func ListBreakpoints(ctx context.Context, wf *Workflow, dagID string, opts ...ListBPOption) ([]BreakpointInfo, error) {
 	meta, _, err := wf.Store.GetMeta(ctx, dagID)
 	if err != nil {
 		return nil, err
@@ -127,7 +173,7 @@ func ListBreakpoints(ctx context.Context, wf *Workflow, dagID string) ([]Breakpo
 	if err != nil {
 		return nil, err
 	}
-	return ComputeBreakpoints(meta, steps), nil
+	return FilterBreakpoints(ComputeBreakpoints(meta, steps), opts...), nil
 }
 
 // ResumeBreakpoint releases every step in the DAG currently blocked at a
@@ -138,7 +184,8 @@ func ListBreakpoints(ctx context.Context, wf *Workflow, dagID string) ([]Breakpo
 // call releases only what is currently stopped.
 //
 // If the breakpoint has multiple labels, any one of them releases it. Returns
-// the number of breakpoint instances released.
+// the number of breakpoint instances released. Equivalent to ReleaseMatching
+// with BeforeLabel(label) and AfterLabel(label), in one call.
 //
 // Idempotent: a repeat call finds nothing blocked (released is monotonic),
 // returns 0, and still re-publishes EventResumed — so a crash between the CAS
@@ -148,34 +195,73 @@ func ListBreakpoints(ctx context.Context, wf *Workflow, dagID string) ([]Breakpo
 // the DAG-level Resume re-opens scheduling. Terminal DAGs return (0, nil);
 // an unknown DAG returns ErrDAGNotFound.
 func ResumeBreakpoint(ctx context.Context, wf *Workflow, dagID, label string) (int, error) {
+	return releaseMatching(ctx, wf, dagID, []BPMatcher{BeforeLabel(label), AfterLabel(label)},
+		func(StepRecord, BPPosition) []string { return []string{label} })
+}
+
+// ReleaseMatching continues every breakpoint instance m selects that is
+// stopped right now, then publishes EventResumed so the scheduler re-evaluates
+// ready steps. m stays armed (if it is armed): debugger "continue", like
+// ResumeBreakpoint, which is ReleaseMatching with BeforeLabel and AfterLabel.
+// m need not be one of the armed matchers: BeforeStep("node-*") releases
+// every node stopped before running, whatever armed it.
+//
+// Returns the number of instances released. Idempotent: a repeat finds
+// nothing stopped, returns 0 and re-publishes EventResumed, so a crash
+// between the CAS writes and the publish converges on retry. A release on a
+// paused DAG is persisted and takes effect on Resume. Terminal DAGs return
+// (0, nil); an unknown DAG returns ErrDAGNotFound; an invalid m returns an
+// error wrapping ErrInvalidMatcher.
+func ReleaseMatching(ctx context.Context, wf *Workflow, dagID string, m BPMatcher) (int, error) {
+	if err := m.Validate(); err != nil {
+		return 0, err
+	}
+	return releaseMatching(ctx, wf, dagID, []BPMatcher{m},
+		func(rec StepRecord, pos BPPosition) []string {
+			if pos == BPPositionBefore {
+				return rec.BreakBefore
+			}
+			return rec.BreakAfter
+		})
+}
+
+// releaseMatching releases every stopped instance selected by any of ms and
+// publishes EventResumed once. eventLabels gives the labels announced on each
+// bp_resumed event.
+func releaseMatching(ctx context.Context, wf *Workflow, dagID string, ms []BPMatcher,
+	eventLabels func(StepRecord, BPPosition) []string) (int, error) {
 	state, err := loadBPState(ctx, wf, dagID)
 	if err != nil || state == nil {
 		return 0, err
 	}
+	selects := func(rec StepRecord, pos BPPosition) bool {
+		for _, m := range ms {
+			if m.Position == pos && m.Matches(rec) {
+				return true
+			}
+		}
+		return false
+	}
 
 	released := 0
-	for _, id := range state.BlockedAtBefore() {
-		if !slices.Contains(state.Steps[id].BreakBefore, label) {
-			continue
+	for _, pos := range []BPPosition{BPPositionBefore, BPPositionAfter} {
+		stopped := state.BlockedAtBefore()
+		if pos == BPPositionAfter {
+			stopped = state.HoldingAtAfter()
 		}
-		ok, err := releaseInstance(ctx, wf, dagID, id, BPPositionBefore, []string{label})
-		if err != nil {
-			return released, err
-		}
-		if ok {
-			released++
-		}
-	}
-	for _, id := range state.HoldingAtAfter() {
-		if !slices.Contains(state.Steps[id].BreakAfter, label) {
-			continue
-		}
-		ok, err := releaseInstance(ctx, wf, dagID, id, BPPositionAfter, []string{label})
-		if err != nil {
-			return released, err
-		}
-		if ok {
-			released++
+		sort.Strings(stopped)
+		for _, id := range stopped {
+			rec := state.Steps[id]
+			if !selects(rec, pos) {
+				continue
+			}
+			ok, err := releaseInstance(ctx, wf, dagID, id, pos, eventLabels(rec, pos))
+			if err != nil {
+				return released, err
+			}
+			if ok {
+				released++
+			}
 		}
 	}
 

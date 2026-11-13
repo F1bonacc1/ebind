@@ -9,7 +9,8 @@
 //
 //	validate  BreakAfter("AfterValidate", "Checkpoint") — validate completes,
 //	          then holds all three transform branches; resumable via either label
-//	transform-a/b/c  BreakBefore("BeforeTransform") — once validate is resumed,
+//	transform-a/b/c  matcher BeforeFn("main.Transform*"), armed at Submit with
+//	          no breakpoint declared on the steps — once validate is resumed,
 //	          each branch stops again before running; `dag bp release` lets one
 //	          branch through while the others stay stopped
 //	publish   BreakBefore("BeforePublish") — aggregate result inspectable
@@ -56,7 +57,7 @@
 //	./bin/ebctl dag bp wait <dag-id> --before --step 'transform-*' --wait-timeout 2m
 //	./bin/ebctl dag bp resume <dag-id> Checkpoint
 //	./bin/ebctl dag bp release <dag-id> transform-a --position before
-//	./bin/ebctl dag bp resume <dag-id> BeforeTransform
+//	./bin/ebctl dag bp continue <dag-id> --before --fn 'main.Transform*'
 //	./bin/ebctl dag bp resume <dag-id> BeforePublish
 //	./bin/ebctl dag bp resume <dag-id> BeforeNotify
 //	./bin/ebctl dag ls --status paused
@@ -342,7 +343,7 @@ func run(cfg config) error {
 			return
 		}
 		if armBPs {
-			log.Printf("submitted DAG #%d id=%s  ⦿ breakpoints armed: %s", n, id, strings.Join(armedBPLabels, ", "))
+			log.Printf("submitted DAG #%d id=%s  ⦿ breakpoints armed: %s, %s", n, id, strings.Join(armedBPLabels, ", "), transformMatcher.Key())
 			log.Printf("  watch:  ebctl -s %s dag bp ls %s", node.ClientURL(), id)
 			log.Printf("  resume: ebctl -s %s dag bp resume %s Checkpoint", node.ClientURL(), id)
 		} else {
@@ -387,7 +388,11 @@ shutdown:
 // armedBPLabels is the active set passed at Submit when a DAG is chosen to
 // stop at its breakpoints. Note "Checkpoint" arms validate's after-BP via its
 // SECOND label — resuming works through either one ("any label" semantics).
-var armedBPLabels = []string{"Checkpoint", "BeforeTransform", "BeforePublish", "BeforeNotify"}
+var armedBPLabels = []string{"Checkpoint", "BeforePublish", "BeforeNotify"}
+
+// transformMatcher stops all three transform branches with one glob over
+// their function names; the transform steps declare no breakpoint at all.
+var transformMatcher = workflow.BeforeFn("main.Transform*")
 
 // topicPool rotates a topic tag across submissions so `dag ls --label <topic>`
 // returns a subset rather than everything.
@@ -443,13 +448,13 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal, s
 		[]workflow.StepOption{workflow.BreakAfter("AfterValidate", "Checkpoint")},
 		ingest.Ref())
 
-	// Fan out: three parallel transforms, each stopping before it runs when
-	// armed. `dag bp release <id> transform-a` lets one branch through;
-	// `dag bp resume <id> BeforeTransform` releases whatever is still stopped.
-	beforeTransform := []workflow.StepOption{workflow.BreakBefore("BeforeTransform")}
-	tA := dag.StepOpts("transform-a", TransformA, beforeTransform, validate.Ref())
-	tB := dag.StepOpts("transform-b", TransformB, beforeTransform, validate.Ref())
-	tC := dag.StepOpts("transform-c", TransformC, beforeTransform, validate.Ref())
+	// Fan out: three parallel transforms. No breakpoint is declared here; when
+	// armed, transformMatcher stops each branch before it runs.
+	// `dag bp release <id> transform-a` lets one branch through;
+	// `dag bp continue <id> --before --fn 'main.Transform*'` releases the rest.
+	tA := dag.Step("transform-a", TransformA, validate.Ref())
+	tB := dag.Step("transform-b", TransformB, validate.Ref())
+	tC := dag.Step("transform-c", TransformC, validate.Ref())
 
 	// Fan in. RefOrDefault on tB so the DAG survives tB's DLQ outcome.
 	agg := dag.Step("aggregate", Aggregate,
@@ -488,7 +493,8 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal, s
 
 	var opts []workflow.SubmitOption
 	if armBPs {
-		opts = append(opts, workflow.WithActiveBreakpoints(armedBPLabels...))
+		opts = append(opts, workflow.WithActiveBreakpoints(armedBPLabels...),
+			workflow.WithArmedBreakpoints(transformMatcher))
 	}
 	if startPaused {
 		opts = append(opts, workflow.StartPaused())

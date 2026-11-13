@@ -400,7 +400,7 @@ func TestDagBPRelease(t *testing.T) {
 	const dagID = "dag-bp-release"
 	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
 		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
-		ActiveBreakpoints: []string{"X"},
+		ArmedMatchers: []workflow.BPMatcher{workflow.BeforeLabel("X")},
 	}, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +480,7 @@ func TestDagBPWait(t *testing.T) {
 	const dagID = "dag-bp-wait"
 	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
 		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
-		ActiveBreakpoints: []string{"X"},
+		ArmedMatchers: []workflow.BPMatcher{workflow.BeforeLabel("X")},
 	}, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -526,5 +526,72 @@ func TestDagBPWait(t *testing.T) {
 	}
 	if _, err := run("ghost", "--before", "--step", "x"); !errors.Is(err, workflow.ErrDAGNotFound) {
 		t.Errorf("unknown DAG: err = %v, want ErrDAGNotFound", err)
+	}
+}
+
+func TestDagBPContinueAndLsDefaults(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// node-1 and node-2 are stopped by a matcher; "decl" declares an unarmed label.
+	const dagID = "dag-bp-continue"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+		ArmedMatchers: []workflow.BPMatcher{workflow.BeforeStep("node-*")},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, rec := range []workflow.StepRecord{
+		{DAGID: dagID, StepID: "node-1", Status: workflow.StatusPending, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "node-2", Status: workflow.StatusPending, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "decl", Status: workflow.StatusPending, FnName: "test.noop", BreakBefore: []string{"Z"}, AddedAt: now},
+	} {
+		if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run := func(args ...string) []byte {
+		t.Helper()
+		root := cmddag.NewCmd(c)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs(append([]string{"bp"}, args...))
+		if err := root.Execute(); err != nil {
+			t.Fatalf("bp %v: %v", args, err)
+		}
+		return out.Bytes()
+	}
+	count := func(raw []byte) int {
+		t.Helper()
+		var infos []workflow.BreakpointInfo
+		if err := json.Unmarshal(raw, &infos); err != nil {
+			t.Fatalf("bad json %q: %v", raw, err)
+		}
+		return len(infos)
+	}
+	if n := count(run("ls", dagID)); n != 2 {
+		t.Errorf("bp ls (armed only) = %d entries, want 2", n)
+	}
+	if n := count(run("ls", dagID, "--all")); n != 3 {
+		t.Errorf("bp ls --all = %d entries, want 3", n)
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(run("continue", dagID, "--before", "--step", "node-*"), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res["released"] != float64(2) || res["matcher"] != "before:step:node-*" {
+		t.Errorf("continue = %v, want 2 released", res)
+	}
+	if n := count(run("ls", dagID, "--blocked")); n != 0 {
+		t.Errorf("bp ls --blocked after continue = %d, want 0", n)
 	}
 }

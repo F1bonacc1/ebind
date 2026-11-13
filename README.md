@@ -226,19 +226,22 @@ n, _ := workflow.ResumeBreakpoint(ctx, wf, dag.ID(), "BeforeUpload")
 - `BreakBefore(labels...)` stops before the step executes (it stays `pending`); `BreakAfter(labels...)` lets the step complete - result persisted - but holds its direct dependents.
 - Breakpoints are **inactive by default**. `WithActiveBreakpoints(labels...)` is a `Submit` option, so a statically defined DAG decides at run time which breakpoints to arm; a breakpoint with several labels is armed (and resumable) by any one of them.
 - `ResumeBreakpoint` is "continue", not "disable": the label stays armed, so a later step (including dynamically added ones) carrying it stops again.
+- **Matchers arm steps that declare no breakpoint at all**, chosen at submit: `WithArmedBreakpoints(workflow.BeforeStep("upgrade-node-*"), workflow.AfterFn("deploy.Prepare"))`. They select by step-ID glob, canonical function name glob, or declared label (`path.Match` globs: `*` does not cross `/`), and they apply to dynamically added steps too. `WithActiveBreakpoints("X")` is stored as `BeforeLabel("X")` + `AfterLabel("X")`. `ReleaseMatching(ctx, wf, dagID, m)` continues every stop `m` selects; `ResumeBreakpoint` is that for a label.
+- **Upgrading a cluster:** a worker older than v0.9.0 ignores matchers, including the ones `WithActiveBreakpoints` now writes, and would run straight through those breakpoints. Upgrade every worker before submitting DAGs with armed breakpoints.
 - `WaitForBreakpoint(ctx, wf, dagID, workflow.BeforeStep("upload-*"))` blocks until a matching step is stopped and returns it - no polling: it follows the DAG's KV records through a watch, and survives worker, scheduler and node restarts. It returns `ErrDAGTerminal` if the DAG finishes first. Matchers select by step-ID glob (`BeforeStep`/`AfterStep`), function name (`BeforeFn`/`AfterFn`) or label (`BeforeLabel`/`AfterLabel`).
 - `ReleaseStep(ctx, wf, dagID, stepID, pos)` releases one step instead of everything on a label - e.g. let one branch of a fan-out through while the others stay stopped. It returns `false` for a step that has not reached its breakpoint yet; it never pre-releases one.
 - Blocked state lives in NATS KV - it survives restarts, and any process (or `ebctl`) can list and resume:
 
 ```sh
-ebctl dag bp ls <dag-id>              # STEP | POS | LABELS | ARMED | STATE | SINCE | HOLDING
+ebctl dag bp ls <dag-id>              # armed only; --all adds declared-but-unarmed, --blocked only stopped
 ebctl dag bp resume <dag-id> <label>  # release the blocked line(s); label stays armed
+ebctl dag bp continue <dag-id> --before --step 'upgrade-node-*'  # release every stop a matcher selects
 ebctl dag bp release <dag-id> <step-id> --position before|after  # release one step only
 ebctl dag bp wait <dag-id> --before --step 'upload-*' --wait-timeout 1m  # block until one stops
 ebctl dag watch                       # live feed includes bp_hit / bp_resumed events
 ```
 
-See [`examples/15-workflow-breakpoints`](./examples/15-workflow-breakpoints) for a runnable walkthrough: two stops, and a fan-out where one branch is released alone.
+See [`examples/15-workflow-breakpoints`](./examples/15-workflow-breakpoints) for a runnable walkthrough: two stops, and a fan-out where one branch is released alone. [`examples/18-workflow-breakpoint-matchers`](./examples/18-workflow-breakpoint-matchers) arms a canary rollout by matcher, with no breakpoint declared on any step.
 
 ### Resuming `Await` from another instance
 
@@ -366,7 +369,7 @@ cmd/ebctl/    operator CLI: inspect DAGs/steps/results, DLQ, streams
 
 ## Examples
 
-[`examples/`](./examples) holds 17 self-contained runnable programs, each starting its own embedded NATS - from basic enqueue/await through retries, middleware, and cluster HA to every workflow feature (fan-out, optional steps, dynamic steps, temporal deps, placement, cancel, pause/resume, breakpoints, label queries, signals). Start with the [index](./examples/README.md).
+[`examples/`](./examples) holds 18 self-contained runnable programs, each starting its own embedded NATS - from basic enqueue/await through retries, middleware, and cluster HA to every workflow feature (fan-out, optional steps, dynamic steps, temporal deps, placement, cancel, pause/resume, breakpoints and breakpoint matchers, label queries, signals). Start with the [index](./examples/README.md).
 
 ## Development
 
