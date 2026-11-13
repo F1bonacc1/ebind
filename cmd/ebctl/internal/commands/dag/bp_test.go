@@ -88,3 +88,27 @@ func TestBlockedBPCount(t *testing.T) {
 		t.Errorf("inactive blockedBPCount = %d, want 0", n)
 	}
 }
+
+func TestParseBPPosition(t *testing.T) {
+	for _, ok := range []string{"before", "after"} {
+		if p, err := parseBPPosition(ok); err != nil || string(p) != ok {
+			t.Errorf("parseBPPosition(%q) = %q, %v", ok, p, err)
+		}
+	}
+	for _, bad := range []string{"", "Before", "during"} {
+		if _, err := parseBPPosition(bad); err == nil {
+			t.Errorf("parseBPPosition(%q): want error", bad)
+		}
+	}
+}
+
+func TestBPReleaseText(t *testing.T) {
+	got := bpReleaseText("d", "upload-eu", workflow.BPPositionBefore, true)
+	if !strings.HasPrefix(got, "released upload-eu") || !strings.Contains(got, "before") {
+		t.Errorf("released text: %q", got)
+	}
+	got = bpReleaseText("d", "upload-eu", workflow.BPPositionAfter, false)
+	if !strings.HasPrefix(got, "not stopped") || !strings.Contains(got, "after") {
+		t.Errorf("not-stopped text: %q", got)
+	}
+}

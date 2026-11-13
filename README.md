@@ -225,15 +225,17 @@ n, _ := workflow.ResumeBreakpoint(ctx, wf, dag.ID(), "BeforeUpload")
 - `BreakBefore(labels...)` stops before the step executes (it stays `pending`); `BreakAfter(labels...)` lets the step complete - result persisted - but holds its direct dependents.
 - Breakpoints are **inactive by default**. `WithActiveBreakpoints(labels...)` is a `Submit` option, so a statically defined DAG decides at run time which breakpoints to arm; a breakpoint with several labels is armed (and resumable) by any one of them.
 - `ResumeBreakpoint` is "continue", not "disable": the label stays armed, so a later step (including dynamically added ones) carrying it stops again.
+- `ReleaseStep(ctx, wf, dagID, stepID, pos)` releases one step instead of everything on a label - e.g. let one branch of a fan-out through while the others stay stopped. It returns `false` for a step that has not reached its breakpoint yet; it never pre-releases one.
 - Blocked state lives in NATS KV - it survives restarts, and any process (or `ebctl`) can list and resume:
 
 ```sh
 ebctl dag bp ls <dag-id>              # STEP | POS | LABELS | ARMED | STATE | SINCE | HOLDING
 ebctl dag bp resume <dag-id> <label>  # release the blocked line(s); label stays armed
+ebctl dag bp release <dag-id> <step-id> --position before|after  # release one step only
 ebctl dag watch                       # live feed includes bp_hit / bp_resumed events
 ```
 
-See [`examples/15-workflow-breakpoints`](./examples/15-workflow-breakpoints) for a runnable two-stop walkthrough.
+See [`examples/15-workflow-breakpoints`](./examples/15-workflow-breakpoints) for a runnable walkthrough: two stops, and a fan-out where one branch is released alone.
 
 ### Resuming `Await` from another instance
 

@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sort"
 	"time"
@@ -147,52 +148,34 @@ func ListBreakpoints(ctx context.Context, wf *Workflow, dagID string) ([]Breakpo
 // the DAG-level Resume re-opens scheduling. Terminal DAGs return (0, nil);
 // an unknown DAG returns ErrDAGNotFound.
 func ResumeBreakpoint(ctx context.Context, wf *Workflow, dagID, label string) (int, error) {
-	meta, _, err := wf.Store.GetMeta(ctx, dagID)
-	if err != nil {
+	state, err := loadBPState(ctx, wf, dagID)
+	if err != nil || state == nil {
 		return 0, err
-	}
-	switch meta.Status {
-	case DAGStatusDone, DAGStatusFailed, DAGStatusCanceled:
-		return 0, nil // nothing can be blocked in a terminal DAG
-	}
-	steps, err := wf.Store.ListSteps(ctx, dagID)
-	if err != nil {
-		return 0, err
-	}
-	state := &DAGState{Meta: meta, Steps: make(map[string]StepRecord, len(steps))}
-	for _, s := range steps {
-		state.Steps[s.StepID] = s
 	}
 
-	// The bp_resumed publishes below are informational (see EventBPResumed):
-	// best-effort for live observers only, so their errors are discarded.
 	released := 0
 	for _, id := range state.BlockedAtBefore() {
 		if !slices.Contains(state.Steps[id].BreakBefore, label) {
 			continue
 		}
-		ok, err := releaseBP(ctx, wf, dagID, id, BPPositionBefore)
+		ok, err := releaseInstance(ctx, wf, dagID, id, BPPositionBefore, []string{label})
 		if err != nil {
 			return released, err
 		}
 		if ok {
 			released++
-			_ = publishEvent(ctx, wf.Bus, Event{Kind: EventBPResumed, DAGID: dagID,
-				StepID: id, BPPosition: BPPositionBefore, BPLabels: []string{label}})
 		}
 	}
 	for _, id := range state.HoldingAtAfter() {
 		if !slices.Contains(state.Steps[id].BreakAfter, label) {
 			continue
 		}
-		ok, err := releaseBP(ctx, wf, dagID, id, BPPositionAfter)
+		ok, err := releaseInstance(ctx, wf, dagID, id, BPPositionAfter, []string{label})
 		if err != nil {
 			return released, err
 		}
 		if ok {
 			released++
-			_ = publishEvent(ctx, wf.Bus, Event{Kind: EventBPResumed, DAGID: dagID,
-				StepID: id, BPPosition: BPPositionAfter, BPLabels: []string{label}})
 		}
 	}
 
@@ -202,6 +185,102 @@ func ResumeBreakpoint(ctx context.Context, wf *Workflow, dagID, label string) (i
 		return released, err
 	}
 	return released, nil
+}
+
+// ReleaseStep releases one step's breakpoint at pos, if that step is stopped
+// there right now, then publishes EventResumed so the scheduler re-evaluates
+// ready steps. Other steps stopped at the same label stay stopped: this is
+// "release this one instance", where ResumeBreakpoint is "continue everything
+// stopped at this label".
+//
+// For BPPositionBefore the step must be pending with its deps satisfied and
+// its before-breakpoint armed and not released. For BPPositionAfter the step
+// must be done with its after-breakpoint armed and holding its dependents;
+// releasing it lets only that step's dependents start.
+//
+// Returns true if this call released it. A step that is not stopped at pos
+// yet (still waiting on deps, not run yet, or already released) returns
+// false and is NOT pre-released: the breakpoint still stops it when it
+// arrives. Like ResumeBreakpoint, every call re-publishes EventResumed, so a
+// crash between the CAS write and the publish converges on retry.
+//
+// A release on a paused/pausing DAG is persisted but takes effect only when
+// the DAG-level Resume re-opens scheduling. Terminal DAGs return (false, nil);
+// an unknown DAG returns ErrDAGNotFound; an unknown step returns
+// ErrStepNotFound.
+func ReleaseStep(ctx context.Context, wf *Workflow, dagID, stepID string, pos BPPosition) (bool, error) {
+	if pos != BPPositionBefore && pos != BPPositionAfter {
+		return false, fmt.Errorf("workflow: ReleaseStep: unknown position %q (want %q or %q)", pos, BPPositionBefore, BPPositionAfter)
+	}
+	state, err := loadBPState(ctx, wf, dagID)
+	if err != nil || state == nil {
+		return false, err
+	}
+	rec, ok := state.Steps[stepID]
+	if !ok {
+		return false, fmt.Errorf("%w: %q in DAG %q", ErrStepNotFound, stepID, dagID)
+	}
+
+	var stopped bool
+	var labels []string
+	if pos == BPPositionBefore {
+		stopped = slices.Contains(state.BlockedAtBefore(), stepID)
+		labels = rec.BreakBefore
+	} else {
+		stopped = slices.Contains(state.HoldingAtAfter(), stepID)
+		labels = rec.BreakAfter
+	}
+
+	released := false
+	if stopped {
+		released, err = releaseInstance(ctx, wf, dagID, stepID, pos, labels)
+		if err != nil {
+			return false, err
+		}
+	}
+	if err := publishResumeEvent(ctx, wf, dagID); err != nil {
+		return released, err
+	}
+	return released, nil
+}
+
+// loadBPState loads the DAG for a breakpoint release. It returns (nil, nil)
+// for a terminal DAG, where nothing can be stopped, and ErrDAGNotFound for an
+// unknown one.
+func loadBPState(ctx context.Context, wf *Workflow, dagID string) (*DAGState, error) {
+	meta, _, err := wf.Store.GetMeta(ctx, dagID)
+	if err != nil {
+		return nil, err
+	}
+	switch meta.Status {
+	case DAGStatusDone, DAGStatusFailed, DAGStatusCanceled:
+		return nil, nil
+	}
+	steps, err := wf.Store.ListSteps(ctx, dagID)
+	if err != nil {
+		return nil, err
+	}
+	state := &DAGState{Meta: meta, Steps: make(map[string]StepRecord, len(steps))}
+	for _, s := range steps {
+		state.Steps[s.StepID] = s
+	}
+	return state, nil
+}
+
+// releaseInstance releases one stopped breakpoint instance and, if this call
+// won the CAS, announces it with an informational bp_resumed event carrying
+// labels. Every release path (ResumeBreakpoint, ReleaseStep) goes through it,
+// so release-time bookkeeping is added in one place. The caller publishes
+// EventResumed.
+func releaseInstance(ctx context.Context, wf *Workflow, dagID, stepID string, pos BPPosition, labels []string) (bool, error) {
+	ok, err := releaseBP(ctx, wf, dagID, stepID, pos)
+	if err != nil || !ok {
+		return false, err
+	}
+	// Informational (see EventBPResumed): best-effort for live observers only.
+	_ = publishEvent(ctx, wf.Bus, Event{Kind: EventBPResumed, DAGID: dagID,
+		StepID: stepID, BPPosition: pos, BPLabels: labels})
+	return true, nil
 }
 
 // releaseBP CAS-writes the released flag for one step's breakpoint position.

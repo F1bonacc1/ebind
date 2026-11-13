@@ -15,10 +15,11 @@ import (
 func newBPCmd(c *cli.Context) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bp",
-		Short: "Inspect and resume step breakpoints",
+		Short: "Inspect, resume and release step breakpoints",
 	}
 	cmd.AddCommand(newBPLsCmd(c))
 	cmd.AddCommand(newBPResumeCmd(c))
+	cmd.AddCommand(newBPReleaseCmd(c))
 	return cmd
 }
 
@@ -124,4 +125,60 @@ func newBPResumeCmd(c *cli.Context) *cobra.Command {
 				fmt.Sprintf("released %d breakpoint(s) for label %q in %s", n, args[1], args[0]))
 		},
 	}
+}
+
+func newBPReleaseCmd(c *cli.Context) *cobra.Command {
+	var position string
+	cmd := &cobra.Command{
+		Use:   "release <dag-id> <step-id>",
+		Short: "Release one step stopped at a breakpoint; others with the same label stay stopped",
+		Long: `Release one step stopped at a breakpoint. Other steps stopped at the same
+label stay stopped (use "bp resume" to release all of them).
+
+--position before releases a step stopped before it runs; --position after
+releases a completed step holding its dependents. A step that has not reached
+its breakpoint yet is not pre-released: the command reports "not stopped" and
+the breakpoint still stops the step when it arrives.`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pos, err := parseBPPosition(position)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := c.Ctx()
+			defer cancel()
+			wf, err := c.Workflow(ctx)
+			if err != nil {
+				return err
+			}
+			dagID, stepID := args[0], args[1]
+			released, err := workflow.ReleaseStep(ctx, wf, dagID, stepID, pos)
+			if err != nil {
+				return err
+			}
+			if c.Printer.Name() == "json" {
+				return c.Printer.Value(cmd.OutOrStdout(), map[string]any{
+					"dag_id": dagID, "step_id": stepID, "position": pos, "released": released,
+				})
+			}
+			return c.Printer.Text(cmd.OutOrStdout(), bpReleaseText(dagID, stepID, pos, released))
+		},
+	}
+	cmd.Flags().StringVar(&position, "position", string(workflow.BPPositionBefore), "breakpoint position: before|after")
+	return cmd
+}
+
+func parseBPPosition(s string) (workflow.BPPosition, error) {
+	switch p := workflow.BPPosition(s); p {
+	case workflow.BPPositionBefore, workflow.BPPositionAfter:
+		return p, nil
+	}
+	return "", fmt.Errorf("invalid --position %q (want before|after)", s)
+}
+
+func bpReleaseText(dagID, stepID string, pos workflow.BPPosition, released bool) string {
+	if released {
+		return fmt.Sprintf("released %s at its %s breakpoint in %s", stepID, pos, dagID)
+	}
+	return fmt.Sprintf("not stopped: %s is not stopped at its %s breakpoint in %s (nothing released)", stepID, pos, dagID)
 }

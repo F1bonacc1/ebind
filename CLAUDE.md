@@ -101,7 +101,7 @@ workflow/
   step.go                Step + StepOption
   dag.go                 DAG builder, Submit, cycle detection
   scheduler.go           handleEvent + watchLeadership + sweep
-  breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint
+  breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint, ReleaseStep
   matcher.go             BPMatcher (position × step|fn|label pattern, path.Match globs) + Key/Validate/Matches (pure)
   signal.go              external signals: Signal (deliver), ComputeSignals/ListSignalInfo (observability)
   hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
@@ -175,17 +175,20 @@ Per-step breakpoints (`BreakBefore`/`BreakAfter` StepOptions, armed via
 `ReadyToRun` refuses a pending step whose before-BP is armed, `depsSatisfied`
 refuses dependents of a done step whose after-BP is armed. The gate is computed
 from immutable config (labels × `DAGMeta.ActiveBreakpoints`) plus the monotonic
-`BPBefore`/`BPAfter = released` flag written only by `ResumeBreakpoint` — the
+`BPBefore`/`BPAfter = released` flag written only by `ResumeBreakpoint` and
+`ReleaseStep` (both through `releaseInstance`, the one release path) — the
 persisted `blocked` marks (`bp_before`/`bp_after`/`bp_blocked_at`) are advisory
 observability only, never load-bearing. Resume is debugger "continue": the label
-stays armed; each call releases only what is currently stopped. The pause `Held`
+stays armed; each call releases only what is currently stopped. `ReleaseStep`
+releases one step at one position and never pre-releases a step that has not
+reached its breakpoint (that would silently consume a stop). The pause `Held`
 fence and BP state are separate fields by design — DAG `Resume` and the
-orphan-hold sweep touch only `Held`/`HeldAt`, `ResumeBreakpoint` touches only BP
+orphan-hold sweep touch only `Held`/`HeldAt`, BP releases touch only BP
 state; the two fences compose. Never merge them.
 
 Breakpoint transitions are announced as **informational** `bp_hit`/`bp_resumed`
 events (published best-effort by the advisory-mark CAS winner and by
-`ResumeBreakpoint`; rendered live by `ebctl dag watch`). Schedulers Ack-drop
+`releaseInstance`; rendered live by `ebctl dag watch`). Schedulers Ack-drop
 them — nothing load-bearing may ever depend on their delivery; the durable
 truth is the step record (`dag bp ls`).
 

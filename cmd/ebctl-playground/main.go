@@ -5,10 +5,13 @@
 // around.
 //
 // Breakpoints: every -bp-every'th DAG (default: every 2nd, starting with the
-// first) is submitted with three breakpoints armed:
+// first) is submitted with four breakpoints armed:
 //
 //	validate  BreakAfter("AfterValidate", "Checkpoint") — validate completes,
 //	          then holds all three transform branches; resumable via either label
+//	transform-a/b/c  BreakBefore("BeforeTransform") — once validate is resumed,
+//	          each branch stops again before running; `dag bp release` lets one
+//	          branch through while the others stay stopped
 //	publish   BreakBefore("BeforePublish") — aggregate result inspectable
 //	          before the side-effecting publish step runs
 //	notify    BreakBefore("BeforeNotify") — blocks the independent metrics
@@ -43,6 +46,8 @@
 //	./bin/ebctl dag get <dag-id>
 //	./bin/ebctl dag bp ls <dag-id>
 //	./bin/ebctl dag bp resume <dag-id> Checkpoint
+//	./bin/ebctl dag bp release <dag-id> transform-a --position before
+//	./bin/ebctl dag bp resume <dag-id> BeforeTransform
 //	./bin/ebctl dag bp resume <dag-id> BeforePublish
 //	./bin/ebctl dag bp resume <dag-id> BeforeNotify
 //	./bin/ebctl dag ls --sig-waiting
@@ -364,7 +369,7 @@ shutdown:
 // armedBPLabels is the active set passed at Submit when a DAG is chosen to
 // stop at its breakpoints. Note "Checkpoint" arms validate's after-BP via its
 // SECOND label — resuming works through either one ("any label" semantics).
-var armedBPLabels = []string{"Checkpoint", "BeforePublish", "BeforeNotify"}
+var armedBPLabels = []string{"Checkpoint", "BeforeTransform", "BeforePublish", "BeforeNotify"}
 
 // topicPool rotates a topic tag across submissions so `dag ls --label <topic>`
 // returns a subset rather than everything.
@@ -416,10 +421,13 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal bo
 		[]workflow.StepOption{workflow.BreakAfter("AfterValidate", "Checkpoint")},
 		ingest.Ref())
 
-	// Fan out: three parallel transforms.
-	tA := dag.Step("transform-a", TransformA, validate.Ref())
-	tB := dag.Step("transform-b", TransformB, validate.Ref())
-	tC := dag.Step("transform-c", TransformC, validate.Ref())
+	// Fan out: three parallel transforms, each stopping before it runs when
+	// armed. `dag bp release <id> transform-a` lets one branch through;
+	// `dag bp resume <id> BeforeTransform` releases whatever is still stopped.
+	beforeTransform := []workflow.StepOption{workflow.BreakBefore("BeforeTransform")}
+	tA := dag.StepOpts("transform-a", TransformA, beforeTransform, validate.Ref())
+	tB := dag.StepOpts("transform-b", TransformB, beforeTransform, validate.Ref())
+	tC := dag.StepOpts("transform-c", TransformC, beforeTransform, validate.Ref())
 
 	// Fan in. RefOrDefault on tB so the DAG survives tB's DLQ outcome.
 	agg := dag.Step("aggregate", Aggregate,

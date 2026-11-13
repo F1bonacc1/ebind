@@ -385,3 +385,83 @@ func jsonRowsContain(t *testing.T, raw []byte, key, val string) bool {
 
 var _ jetstream.JetStream // keep import aligned with the harness
 var _ = jsonRowsContain
+
+func TestDagBPRelease(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// a is done; upload-eu and upload-us both stop before running at label X.
+	const dagID = "dag-bp-release"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+		ActiveBreakpoints: []string{"X"},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, rec := range []workflow.StepRecord{
+		{DAGID: dagID, StepID: "a", Status: workflow.StatusDone, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "upload-eu", Status: workflow.StatusPending, FnName: "test.noop",
+			Deps: []string{"a"}, BreakBefore: []string{"X"}, AddedAt: now},
+		{DAGID: dagID, StepID: "upload-us", Status: workflow.StatusPending, FnName: "test.noop",
+			Deps: []string{"a"}, BreakBefore: []string{"X"}, AddedAt: now},
+	} {
+		if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	release := func(args ...string) map[string]any {
+		t.Helper()
+		root := cmddag.NewCmd(c)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs(append([]string{"bp", "release"}, args...))
+		if err := root.Execute(); err != nil {
+			t.Fatalf("bp release %v: %v", args, err)
+		}
+		var res map[string]any
+		if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+			t.Fatalf("bp release %v: bad json %q: %v", args, out.String(), err)
+		}
+		return res
+	}
+
+	if res := release(dagID, "upload-eu"); res["released"] != true || res["position"] != "before" {
+		t.Errorf("first release = %v, want released before", res)
+	}
+	if res := release(dagID, "upload-eu"); res["released"] != false {
+		t.Errorf("repeat release = %v, want released=false", res)
+	}
+	if res := release(dagID, "upload-us", "--position", "after"); res["released"] != false {
+		t.Errorf("after position on a pending step = %v, want released=false", res)
+	}
+
+	eu, _, _ := wf.Store.GetStep(ctx, dagID, "upload-eu")
+	us, _, _ := wf.Store.GetStep(ctx, dagID, "upload-us")
+	if eu.BPBefore != workflow.BPStateReleased {
+		t.Errorf("upload-eu bp_before = %q, want released", eu.BPBefore)
+	}
+	if us.BPBefore == workflow.BPStateReleased {
+		t.Error("upload-us must stay stopped")
+	}
+
+	root := cmddag.NewCmd(c)
+	root.SetOut(&bytes.Buffer{})
+	root.SetArgs([]string{"bp", "release", dagID, "ghost"})
+	if err := root.Execute(); !errors.Is(err, workflow.ErrStepNotFound) {
+		t.Errorf("unknown step: err = %v, want ErrStepNotFound", err)
+	}
+	root = cmddag.NewCmd(c)
+	root.SetOut(&bytes.Buffer{})
+	root.SetArgs([]string{"bp", "release", dagID, "upload-us", "--position", "during"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "--position") {
+		t.Errorf("bad position: err = %v", err)
+	}
+}
