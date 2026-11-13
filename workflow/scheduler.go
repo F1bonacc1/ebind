@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 )
@@ -114,13 +115,30 @@ func (s *Scheduler) sweep(ctx context.Context) error {
 			if err != nil {
 				continue
 			}
+			// Leader meta, read after the step list: a disarm whose meta write
+			// this replica has not applied yet must not keep the DAG idle
+			// (stale matchers make ReadyToRun empty, so enqueueReady would
+			// never take its own leader read).
+			if err := s.refreshMeta(ctx, state); err != nil {
+				continue
+			}
 			// Repair: a held step under a running meta means Pause crashed
 			// between fencing and its meta write (or Resume crashed between
 			// its meta write and releasing) — nothing else will ever release
 			// it and the DAG stalls. Age-gated so an in-progress Pause is
 			// never unfenced.
-			if s.releaseOrphanedHolds(ctx, dag.ID, state) {
+			// Repair: a fence token left by a DisarmBreakpoints or release
+			// that crashed before its token cleanup. persistStatus honors
+			// tokens, so nothing else would ever clear it.
+			repaired := s.releaseOrphanedHolds(ctx, dag.ID, state)
+			if releaseOrphanedBPFences(ctx, s.wf.Store, dag.ID, state) {
+				repaired = true
+			}
+			if repaired {
 				if state, err = s.loadState(ctx, dag.ID); err != nil {
+					continue
+				}
+				if err := s.refreshMeta(ctx, state); err != nil {
 					continue
 				}
 			}
@@ -251,6 +269,13 @@ func (s *Scheduler) handleEvent(ctx context.Context, ev Event) error {
 // the DAG was paused were gated, so After()-linked dependents never got
 // cascade-skipped (Ref-linked ones are covered by ResolveArgs at enqueue time).
 func (s *Scheduler) onResumed(ctx context.Context, state *DAGState) error {
+	// DisarmBreakpoints and every release publish EventResumed. Re-read meta
+	// from the leader so a disarm is seen even when this scheduler's replica
+	// lags: with the old matchers ReadyToRun is empty and enqueueReady would
+	// skip its own leader read, leaving the step waiting for another event.
+	if err := s.refreshMeta(ctx, state); err != nil {
+		return err
+	}
 	for id, step := range state.Steps {
 		if step.Status != StatusFailed && step.Status != StatusSkipped {
 			continue
@@ -358,6 +383,24 @@ func (s *Scheduler) enqueueReady(ctx context.Context, state *DAGState, ready []s
 		state.Meta.Status == DAGStatusPaused {
 		return nil
 	}
+	// The step list was read before this point; now read meta from the
+	// leader and keep only steps still ready under it. A direct-get meta can
+	// predate a runtime ArmBreakpoints, and this read is what lets that
+	// arm's single fence pass suffice (see the argument on ArmBreakpoints).
+	// Paid only when something would be dispatched.
+	if err := s.refreshMeta(ctx, state); err != nil {
+		return err
+	}
+	if state.Meta.Status != DAGStatusRunning {
+		return nil
+	}
+	stillReady := state.ReadyToRun()
+	ready = slices.DeleteFunc(slices.Clone(ready), func(id string) bool {
+		return !slices.Contains(stillReady, id)
+	})
+	if len(ready) == 0 {
+		return nil
+	}
 	results, statuses, err := s.snapshotUpstream(ctx, state)
 	if err != nil {
 		return err
@@ -431,6 +474,19 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 		if rec.Held && status == StatusRunning {
 			return errStepNotEnqueueable
 		}
+		if status == StatusRunning && len(rec.BPFence) > 0 {
+			// The breakpoint dispatch guard. A runtime arm that wrote its
+			// token before this CAS wins; one that writes after it finds the
+			// step running and reports it Missed.
+			live, err := liveFenceTokens(ctx, s.wf.Store, dagID, rec)
+			if err != nil {
+				return err
+			}
+			if len(live) > 0 {
+				return errStepNotEnqueueable
+			}
+			rec.BPFence = nil // every token was void (released); drop them
+		}
 		if rec.IsTerminal() && status != StatusSkipped {
 			return errStepNotEnqueueable
 		}
@@ -457,10 +513,17 @@ func (s *Scheduler) persistStatus(ctx context.Context, dagID, stepID string, sta
 // crashing before writing them cannot affect correctness. Best-effort: gives
 // up silently after a few stale retries.
 func (s *Scheduler) markBlockedBreakpoints(ctx context.Context, state *DAGState) {
+	markBlockedBreakpoints(ctx, s.wf, state)
+}
+
+// markBlockedBreakpoints is the scheduler-independent body, shared with
+// ArmBreakpoints (a runtime arm wakes no scheduler, so it writes the marks
+// and bp_hit events itself).
+func markBlockedBreakpoints(ctx context.Context, wf *Workflow, state *DAGState) {
 	now := time.Now().UTC()
 	mark := func(stepID string, pos BPPosition) {
 		for attempt := 0; attempt < 3; attempt++ {
-			rec, rev, err := s.wf.Store.GetStep(ctx, state.Meta.ID, stepID)
+			rec, rev, err := wf.Store.GetStep(ctx, state.Meta.ID, stepID)
 			if err != nil {
 				return
 			}
@@ -484,12 +547,12 @@ func (s *Scheduler) markBlockedBreakpoints(ctx context.Context, state *DAGState)
 			if rec.BPBlockedAt.IsZero() {
 				rec.BPBlockedAt = now
 			}
-			_, err = s.wf.Store.PutStep(ctx, state.Meta.ID, stepID, rec, rev)
+			_, err = wf.Store.PutStep(ctx, state.Meta.ID, stepID, rec, rev)
 			if err == nil {
 				// The CAS winner announces the hit, so racing schedulers
 				// produce exactly one bp_hit per breakpoint instance.
 				// Informational — delivery is best-effort (see EventBPHit).
-				_ = publishEvent(ctx, s.wf.Bus, Event{Kind: EventBPHit,
+				_ = publishEvent(ctx, wf.Bus, Event{Kind: EventBPHit,
 					DAGID: state.Meta.ID, StepID: stepID, BPPosition: pos, BPLabels: labels})
 				return
 			}
@@ -580,6 +643,18 @@ func (s *Scheduler) maybeFinalize(ctx context.Context, state *DAGState) error {
 	}
 	meta.Status = status
 	return s.wf.Store.PutMeta(ctx, state.Meta.ID, meta, rev)
+}
+
+// refreshMeta replaces state.Meta with the leader's copy (GetMetaLatest).
+// Callers read the step list first: the ordering is what the ArmBreakpoints
+// argument relies on.
+func (s *Scheduler) refreshMeta(ctx context.Context, state *DAGState) error {
+	meta, _, err := s.wf.Store.GetMetaLatest(ctx, state.Meta.ID)
+	if err != nil {
+		return err
+	}
+	state.Meta = meta
+	return nil
 }
 
 // loadState fetches DAG meta + all step records + delivered signals into an

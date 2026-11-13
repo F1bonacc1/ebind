@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"slices"
+	"sync"
 	"time"
 )
 
@@ -31,6 +33,42 @@ type Workflow struct {
 	// negative ⇒ persist no message, keeping only the error kind. The full
 	// message always remains available in the DLQ entry and the response stream.
 	MaxStepErrorBytes int
+
+	hooksMu     sync.RWMutex
+	submitHooks []SubmitHook
+}
+
+// SubmitHook adds submit options to every DAG submitted through a Workflow,
+// so a decision such as "arm breakpoints on DAGs labeled debug" lives in one
+// place instead of at every Submit call site. It runs inside Submit, before
+// anything is persisted, and receives the DAG's provisional meta: ID, Labels,
+// DefaultPolicy and CreatedAt are set; Status and the armed breakpoints are
+// not, since the hook's options decide them. The meta is a copy; changing it
+// has no effect.
+//
+// The returned options are applied after the caller's options, so a hook can
+// add matchers or StartPaused but cannot remove what the caller armed.
+// Returning an error fails the Submit with nothing persisted; the same *DAG
+// can be submitted again. A hook may do I/O and should honor ctx.
+//
+// Dynamic steps (FromContext) never pass through Submit: arm them with
+// matchers, which the scheduler evaluates for every step of the DAG.
+type SubmitHook func(ctx context.Context, meta DAGMeta) ([]SubmitOption, error)
+
+// UseSubmitHook registers h to run on every later Submit through this
+// Workflow, after the hooks registered before it. Safe to call at any time,
+// including concurrently with Submit; a Submit already running uses the hooks
+// registered when it started.
+func (wf *Workflow) UseSubmitHook(h SubmitHook) {
+	wf.hooksMu.Lock()
+	defer wf.hooksMu.Unlock()
+	wf.submitHooks = append(wf.submitHooks, h)
+}
+
+func (wf *Workflow) submitHookList() []SubmitHook {
+	wf.hooksMu.RLock()
+	defer wf.hooksMu.RUnlock()
+	return slices.Clone(wf.submitHooks)
 }
 
 // NewWorkflow constructs a Workflow with the three dependencies. Defaults:

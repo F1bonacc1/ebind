@@ -40,6 +40,27 @@ type SubmitOption func(*submitOptions)
 
 type submitOptions struct {
 	activeBreakpoints []string
+	armedMatchers     []BPMatcher
+	startPaused       bool
+}
+
+// StartPaused submits the DAG in the paused state: meta is written paused and
+// every step record is created held, so nothing runs until Resume. Use it to
+// arm, inspect or signal a DAG before any step executes. Calling Pause right
+// after Submit cannot do that: Submit enqueues the roots before Pause runs, so
+// they may already be executing.
+//
+// Steps are written held at create, never created and then held, so no
+// scheduler or sweep ever sees an unheld pending root. Resume (or
+// `ebctl dag resume`) releases the holds and the scheduler dispatches the
+// roots. A paused DAG can be canceled, and signals delivered while it is
+// paused are durable and gate as usual after Resume.
+//
+// Crash semantics are those of any Submit: meta is written first, then the
+// steps; a crash in between leaves a paused DAG with a partial step set, and
+// Resume runs what exists.
+func StartPaused() SubmitOption {
+	return func(o *submitOptions) { o.startPaused = true }
 }
 
 // WithActiveBreakpoints arms the given breakpoint labels for this execution.
@@ -53,10 +74,70 @@ type submitOptions struct {
 //
 //	dag := buildPipeline()                                  // BP config lives on the steps
 //	err := dag.Submit(ctx, wf, workflow.WithActiveBreakpoints("BeforeUpload"))
+//
+// Each label is stored as the matchers BeforeLabel(label) and
+// AfterLabel(label) in DAGMeta.ArmedMatchers, so it behaves exactly like
+// WithArmedBreakpoints with those two matchers.
 func WithActiveBreakpoints(labels ...string) SubmitOption {
 	return func(o *submitOptions) {
 		o.activeBreakpoints = append(o.activeBreakpoints, labels...)
 	}
+}
+
+// WithArmedBreakpoints arms breakpoints for this execution by matcher, so a
+// step can be stopped without declaring BreakBefore/BreakAfter in the code
+// that builds the DAG:
+//
+//	err := dag.Submit(ctx, wf, workflow.WithArmedBreakpoints(
+//		workflow.BeforeStep("upgrade-node-*"), // every node, before it runs
+//		workflow.AfterFn("deploy.Prepare"),    // hold Prepare's dependents
+//	))
+//
+// Matchers also apply to steps added later through FromContext. The armed
+// set is fixed at Submit and immutable for the DAG's lifetime; duplicates (by
+// Key) are collapsed, and an invalid matcher fails the Submit with
+// ErrInvalidMatcher. Releasing a stop (ResumeBreakpoint, ReleaseStep,
+// ReleaseMatching) does not disarm the matcher: a later matching step stops
+// again.
+func WithArmedBreakpoints(ms ...BPMatcher) SubmitOption {
+	return func(o *submitOptions) {
+		o.armedMatchers = append(o.armedMatchers, ms...)
+	}
+}
+
+// armedMatcherSet builds DAGMeta.ArmedMatchers from the submit options: label
+// arming first (as before+after label matchers), then explicit matchers,
+// deduplicated by Key in that order.
+func (o submitOptions) armedMatcherSet() ([]BPMatcher, error) {
+	all := make([]BPMatcher, 0, 2*len(o.activeBreakpoints)+len(o.armedMatchers))
+	for _, label := range o.activeBreakpoints {
+		if label == "" {
+			return nil, fmt.Errorf("workflow: WithActiveBreakpoints label must be non-empty")
+		}
+		all = append(all, BeforeLabel(label), AfterLabel(label))
+	}
+	for _, m := range o.armedMatchers {
+		if err := m.Validate(); err != nil {
+			return nil, fmt.Errorf("workflow: WithArmedBreakpoints: %w", err)
+		}
+		all = append(all, m)
+	}
+	return dedupeMatchers(all), nil
+}
+
+func dedupeMatchers(ms []BPMatcher) []BPMatcher {
+	if len(ms) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(ms))
+	out := make([]BPMatcher, 0, len(ms))
+	for _, m := range ms {
+		if k := m.Key(); !seen[k] {
+			seen[k] = true
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // DAG is the user-facing workflow builder. Not safe for concurrent Step() calls.
@@ -337,12 +418,15 @@ func (d *DAG) detectCycles() error {
 // DAG ID returns ErrStaleRevision for the meta write.
 //
 // Run-time decisions are passed as SubmitOptions — e.g.
-// WithActiveBreakpoints arms step breakpoints for this execution.
+// WithActiveBreakpoints arms step breakpoints for this execution, and
+// StartPaused submits it paused so nothing runs until Resume.
+//
+// Submit hooks registered with Workflow.UseSubmitHook run after validation
+// and before anything is persisted; their options are applied after opts. If
+// a hook or the merged options fail, nothing is persisted and the DAG can be
+// submitted again.
 func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) error {
-	var so submitOptions
-	for _, opt := range opts {
-		opt(&so)
-	}
+	// 1. Structural validation under the lock.
 	d.mu.Lock()
 	if d.submitted {
 		d.mu.Unlock()
@@ -370,13 +454,45 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 			return err
 		}
 	}
-	if slices.Contains(so.activeBreakpoints, "") {
-		d.mu.Unlock()
-		return fmt.Errorf("workflow: WithActiveBreakpoints label must be non-empty")
-	}
 	if slices.Contains(d.labels, "") {
 		d.mu.Unlock()
 		return fmt.Errorf("workflow: WithLabels label must be non-empty")
+	}
+	labels := dedupeStrings(d.labels)
+	d.mu.Unlock()
+
+	// 2. Submit hooks, outside the lock (they may do I/O). Their options go
+	// after the caller's. A hook error leaves the DAG unsubmitted (and
+	// resubmittable) with nothing persisted.
+	now := time.Now().UTC()
+	provisional := DAGMeta{ID: d.id, CreatedAt: now, DefaultPolicy: d.defaultPolicy, Labels: labels}
+	all := slices.Clone(opts)
+	for _, h := range wf.submitHookList() {
+		more, err := h(ctx, cloneMetaForHook(provisional))
+		if err != nil {
+			return fmt.Errorf("workflow: submit hook: %w", err)
+		}
+		all = append(all, more...)
+	}
+
+	// 3. Validate the merged options.
+	var so submitOptions
+	for _, opt := range all {
+		if opt != nil {
+			opt(&so)
+		}
+	}
+	armed, err := so.armedMatcherSet()
+	if err != nil {
+		return err
+	}
+
+	// 4. Claim the DAG. Re-check: a concurrent Submit of the same *DAG may
+	// have claimed it while the hooks ran.
+	d.mu.Lock()
+	if d.submitted {
+		d.mu.Unlock()
+		return fmt.Errorf("workflow: DAG %s already submitted", d.id)
 	}
 	d.submitted = true
 	d.mu.Unlock()
@@ -393,12 +509,16 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 
 	// Persist meta.
 	meta := DAGMeta{
-		ID:                d.id,
-		Status:            DAGStatusRunning,
-		CreatedAt:         time.Now().UTC(),
-		DefaultPolicy:     d.defaultPolicy,
-		ActiveBreakpoints: dedupeStrings(so.activeBreakpoints),
-		Labels:            dedupeStrings(d.labels),
+		ID:            d.id,
+		Status:        DAGStatusRunning,
+		CreatedAt:     now,
+		DefaultPolicy: d.defaultPolicy,
+		ArmedMatchers: armed,
+		Labels:        labels,
+	}
+	if so.startPaused {
+		meta.Status = DAGStatusPaused
+		meta.PausedAt = now
 	}
 	if err := wf.Store.PutMeta(ctx, d.id, meta, 0); err != nil {
 		return fmt.Errorf("workflow: put meta: %w", err)
@@ -434,12 +554,25 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 			Placement:    placement,
 			AddedAt:      time.Now().UTC(),
 		}
+		if so.startPaused {
+			// Held at create: there is never an unheld pending root for a
+			// sweep to dispatch. Resume's releaseHeldSteps clears it.
+			rec.Held = true
+			rec.HeldAt = now
+		}
 		rev, err := wf.Store.PutStep(ctx, d.id, s.id, rec, 0)
 		if err != nil {
 			return fmt.Errorf("workflow: put step %q: %w", s.id, err)
 		}
 		recs[s.id] = rec
 		createdRev[s.id] = rev
+	}
+
+	if so.startPaused {
+		// Nothing to enqueue: every step is held. Resume publishes
+		// EventResumed, and the scheduler dispatches the roots and writes
+		// the advisory breakpoint marks then.
+		return nil
 	}
 
 	// Enqueue roots — steps with no required AND no optional deps. Dependent
@@ -467,6 +600,21 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 	// A signal landing after this snapshot is covered by Signal's
 	// always-published EventSignal — the step records above are already
 	// persisted, so the scheduler's re-eval sees the gated root.
+	//
+	// Meta is re-read from the stream leader now that the steps exist: a
+	// runtime ArmBreakpoints that committed after the meta write above is
+	// either in this read, or its fence pass listed these steps and fenced
+	// the roots (the CAS below then fails and re-reads). See ArmBreakpoints.
+	if latest, _, err := wf.Store.GetMetaLatest(ctx, d.id); err == nil {
+		meta = latest
+	} else {
+		return fmt.Errorf("workflow: read meta: %w", err)
+	}
+	if meta.Status != DAGStatusRunning {
+		// Paused or canceled between the meta write and here: its owner
+		// (Resume, the sweep) dispatches the roots.
+		return nil
+	}
 	var sigSnap map[string]SignalRecord
 	for _, s := range d.steps {
 		if len(s.allDeps()) == 0 && len(s.waitSignalNames()) > 0 {
@@ -585,4 +733,16 @@ func enqueueStep(
 		Target:      target,
 	}
 	return enq.Enqueue(ctx, envelope)
+}
+
+// cloneMetaForHook copies the provisional meta's reference fields so a hook
+// cannot change what Submit persists.
+func cloneMetaForHook(m DAGMeta) DAGMeta {
+	m.Labels = slices.Clone(m.Labels)
+	if m.DefaultPolicy != nil {
+		p := *m.DefaultPolicy
+		p.NonRetryableErrorKinds = slices.Clone(p.NonRetryableErrorKinds)
+		m.DefaultPolicy = &p
+	}
+	return m
 }

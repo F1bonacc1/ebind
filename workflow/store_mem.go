@@ -9,12 +9,23 @@ import (
 // It emulates NATS KV's revision-based CAS: each Put* increments the stored
 // revision; callers must pass the matching expectedRev or get ErrStaleRevision.
 type MemStore struct {
-	mu      sync.Mutex
-	steps   map[string]map[string]memEntry     // dagID → stepID → entry
-	results map[string]map[string][]byte       // dagID → stepID → bytes
-	metas   map[string]memMetaEntry            // dagID → entry
-	watches map[string][]chan []byte           // "dagID/stepID" → waiters
-	signals map[string]map[string]SignalRecord // dagID → signal name → record
+	mu       sync.Mutex
+	steps    map[string]map[string]memEntry     // dagID → stepID → entry
+	results  map[string]map[string][]byte       // dagID → stepID → bytes
+	metas    map[string]memMetaEntry            // dagID → entry
+	watches  map[string][]chan []byte           // "dagID/stepID" → waiters
+	signals  map[string]map[string]SignalRecord // dagID → signal name → record
+	dagWatch map[string][]*memDAGWatcher        // dagID → WatchDAG subscribers
+}
+
+// memDAGWatchBuffer is how many live changes a WatchDAG subscriber may lag
+// behind before its channel is closed (it then re-watches). Writers never
+// block on a slow subscriber.
+const memDAGWatchBuffer = 256
+
+type memDAGWatcher struct {
+	ch     chan DAGChange
+	closed bool
 }
 
 type memEntry struct {
@@ -29,11 +40,12 @@ type memMetaEntry struct {
 
 func NewMemStore() *MemStore {
 	return &MemStore{
-		steps:   map[string]map[string]memEntry{},
-		results: map[string]map[string][]byte{},
-		metas:   map[string]memMetaEntry{},
-		watches: map[string][]chan []byte{},
-		signals: map[string]map[string]SignalRecord{},
+		steps:    map[string]map[string]memEntry{},
+		results:  map[string]map[string][]byte{},
+		metas:    map[string]memMetaEntry{},
+		watches:  map[string][]chan []byte{},
+		signals:  map[string]map[string]SignalRecord{},
+		dagWatch: map[string][]*memDAGWatcher{},
 	}
 }
 
@@ -65,6 +77,7 @@ func (s *MemStore) PutStep(_ context.Context, dagID, stepID string, rec StepReco
 			return 0, ErrStaleRevision
 		}
 		bucket[stepID] = memEntry{rec: rec, rev: 1}
+		s.notifyLocked(dagID, DAGChange{Step: &rec})
 		return 1, nil
 	}
 	if !exists || existing.rev != expectedRev {
@@ -72,6 +85,7 @@ func (s *MemStore) PutStep(_ context.Context, dagID, stepID string, rec StepReco
 	}
 	newRev := existing.rev + 1
 	bucket[stepID] = memEntry{rec: rec, rev: newRev}
+	s.notifyLocked(dagID, DAGChange{Step: &rec})
 	return newRev, nil
 }
 
@@ -135,6 +149,11 @@ func (s *MemStore) GetMeta(_ context.Context, dagID string) (DAGMeta, uint64, er
 	return e.meta, e.rev, nil
 }
 
+// GetMetaLatest is GetMeta: MemStore reads are always current.
+func (s *MemStore) GetMetaLatest(ctx context.Context, dagID string) (DAGMeta, uint64, error) {
+	return s.GetMeta(ctx, dagID)
+}
+
 func (s *MemStore) ListDAGs(_ context.Context) ([]DAGMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -154,19 +173,24 @@ func (s *MemStore) PutMeta(_ context.Context, dagID string, meta DAGMeta, expect
 			return ErrStaleRevision
 		}
 		s.metas[dagID] = memMetaEntry{meta: meta, rev: 1}
+		s.notifyLocked(dagID, DAGChange{Meta: &meta})
 		return nil
 	}
 	if !exists || existing.rev != expectedRev {
 		return ErrStaleRevision
 	}
 	s.metas[dagID] = memMetaEntry{meta: meta, rev: existing.rev + 1}
+	s.notifyLocked(dagID, DAGChange{Meta: &meta})
 	return nil
 }
 
 func (s *MemStore) DeleteMeta(_ context.Context, dagID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.metas, dagID)
+	if _, ok := s.metas[dagID]; ok {
+		delete(s.metas, dagID)
+		s.notifyLocked(dagID, DAGChange{Deleted: DeletedMeta})
+	}
 	return nil
 }
 
@@ -174,7 +198,10 @@ func (s *MemStore) DeleteStep(_ context.Context, dagID, stepID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if bucket, ok := s.steps[dagID]; ok {
-		delete(bucket, stepID)
+		if _, exists := bucket[stepID]; exists {
+			delete(bucket, stepID)
+			s.notifyLocked(dagID, DAGChange{Deleted: stepID})
+		}
 		if len(bucket) == 0 {
 			delete(s.steps, dagID)
 		}
@@ -273,4 +300,67 @@ func (s *MemStore) WatchResult(ctx context.Context, dagID, stepID string) (<-cha
 		s.mu.Unlock()
 	}()
 	return ch, nil
+}
+
+// WatchDAG implements StateStore. The snapshot and the Synced marker are
+// queued under the store lock, so no write can slip between the snapshot and
+// the first live change.
+func (s *MemStore) WatchDAG(ctx context.Context, dagID string) (<-chan DAGChange, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	steps := s.steps[dagID]
+	w := &memDAGWatcher{ch: make(chan DAGChange, len(steps)+2+memDAGWatchBuffer)}
+	if e, ok := s.metas[dagID]; ok {
+		meta := e.meta
+		w.ch <- DAGChange{Meta: &meta}
+	}
+	for _, e := range steps {
+		rec := e.rec
+		w.ch <- DAGChange{Step: &rec}
+	}
+	w.ch <- DAGChange{Synced: true}
+	s.dagWatch[dagID] = append(s.dagWatch[dagID], w)
+	go func() {
+		<-ctx.Done()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.dropWatcherLocked(dagID, w)
+	}()
+	return w.ch, nil
+}
+
+// notifyLocked fans a change out to dagID's watchers without blocking; a
+// watcher whose buffer is full is closed and dropped. Caller holds s.mu.
+func (s *MemStore) notifyLocked(dagID string, c DAGChange) {
+	for _, w := range s.dagWatch[dagID] {
+		select {
+		case w.ch <- c:
+		default:
+			s.dropWatcherLocked(dagID, w)
+		}
+	}
+}
+
+func (s *MemStore) dropWatcherLocked(dagID string, w *memDAGWatcher) {
+	if w.closed {
+		return
+	}
+	w.closed = true
+	close(w.ch)
+	ws := s.dagWatch[dagID]
+	for i, x := range ws {
+		if x == w {
+			// Copy rather than append in place: notifyLocked may be ranging
+			// over the old slice right now.
+			next := make([]*memDAGWatcher, 0, len(ws)-1)
+			next = append(next, ws[:i]...)
+			next = append(next, ws[i+1:]...)
+			if len(next) == 0 {
+				delete(s.dagWatch, dagID)
+			} else {
+				s.dagWatch[dagID] = next
+			}
+			break
+		}
+	}
 }
