@@ -33,6 +33,13 @@
 //	ebctl dag ls --status paused
 //	ebctl dag resume <dag-id>
 //
+// Runtime breakpoints: with -arm-running D, every DAG submitted without
+// breakpoints or StartPaused gets BeforeFn("main.Publish") armed D after
+// Submit, while it runs (ArmBreakpoints). Its publish step stops when it
+// arrives; disarm it to let it run:
+//
+//	ebctl dag bp disarm <dag-id> --before --fn main.Publish
+//
 // Labels: every DAG is tagged "pipeline" plus a rotating topic
 // (billing/reports/analytics); breakpoint-armed DAGs additionally carry
 // "breakpoints", signal-gated ones "signals", and start-paused ones
@@ -66,6 +73,8 @@
 //	./bin/ebctl dag bp resume <dag-id> BeforeNotify
 //	./bin/ebctl dag ls --status paused
 //	./bin/ebctl dag resume <dag-id>
+//	./bin/ebctl dag bp arm <dag-id> --before --step aggregate
+//	./bin/ebctl dag bp disarm <dag-id> --before --fn main.Publish
 //	./bin/ebctl dag ls --sig-waiting
 //	./bin/ebctl dag ls --label signals
 //	./bin/ebctl dag signal ls <dag-id>
@@ -226,6 +235,7 @@ type config struct {
 	bpEvery     int
 	signalEvery int
 	pausedEvery int
+	armRunning  time.Duration
 }
 
 func main() {
@@ -237,6 +247,7 @@ func main() {
 	flag.IntVar(&cfg.bpEvery, "bp-every", 2, "arm breakpoints on every Nth DAG, starting with the first (0 = never)")
 	flag.IntVar(&cfg.signalEvery, "signal-every", 3, "add a signal-gated release step to every Nth DAG, starting with the first (0 = never)")
 	flag.IntVar(&cfg.pausedEvery, "paused-every", 0, "submit every Nth DAG with StartPaused, starting with the first (0 = never)")
+	flag.DurationVar(&cfg.armRunning, "arm-running", 0, "this long after submitting a DAG with no breakpoints, arm before:fn:main.Publish on it at runtime (0 = never)")
 	flag.Parse()
 
 	if err := run(cfg); err != nil {
@@ -369,6 +380,9 @@ func run(cfg config) error {
 		}
 		log.Printf("  labels: [%s] — e.g. ebctl -s %s dag ls --label %s",
 			strings.Join(labels, ","), node.ClientURL(), labels[len(labels)-1])
+		if cfg.armRunning > 0 && !armBPs && !startPaused {
+			go armRunning(ctx, wf, id, cfg.armRunning, node.ClientURL())
+		}
 	}
 
 	submit()
@@ -447,6 +461,26 @@ func playgroundSubmitHook(_ context.Context, meta workflow.DAGMeta) ([]workflow.
 // at them or starts paused. withSignal appends the approval-gated release
 // step (signals have no arming concept — a declared wait always gates, so the
 // step is added conditionally).
+// armRunning arms publishMatcher on a running DAG after delay, the way an
+// operator would with `ebctl dag bp arm`.
+func armRunning(ctx context.Context, wf *workflow.Workflow, id string, delay time.Duration, url string) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(delay):
+	}
+	rep, err := workflow.ArmBreakpoints(ctx, wf, id, publishMatcher)
+	if err != nil {
+		log.Printf("arm %s on %s: %v", publishMatcher.Key(), id, err)
+		return
+	}
+	log.Printf("⦿ armed %s on running DAG %s: stopped %v, missed %v", publishMatcher.Key(), id, rep.Stopped, rep.Missed)
+	log.Printf("  disarm: ebctl -s %s dag bp disarm %s --before --fn main.Publish", url, id)
+}
+
+// publishMatcher is what -arm-running arms at runtime.
+var publishMatcher = workflow.BeforeFn("main.Publish")
+
 func submitDAG(ctx context.Context, wf *workflow.Workflow, withSignal bool, labels []string) (string, error) {
 	// Fast-giving-up retry policy — transform-b goes to DLQ after 3 attempts
 	// so the user sees DLQ entries within ~10s rather than after a minute.

@@ -22,6 +22,13 @@ type StateStore interface {
 	PutResult(ctx context.Context, dagID, stepID string, data []byte) error
 
 	GetMeta(ctx context.Context, dagID string) (DAGMeta, uint64, error)
+	// GetMetaLatest is GetMeta with read-your-writes: it never returns a
+	// meta older than the last committed write. On a clustered KV, GetMeta
+	// is a direct get that a lagging replica may answer; GetMetaLatest asks
+	// the stream leader, so it costs a leader round trip. Used where a stale
+	// ArmedMatchers set could dispatch a step a runtime ArmBreakpoints has
+	// already fenced (see ArmBreakpoints), and for read-modify-write of meta.
+	GetMetaLatest(ctx context.Context, dagID string) (DAGMeta, uint64, error)
 	PutMeta(ctx context.Context, dagID string, meta DAGMeta, expectedRev uint64) error
 	// ListDAGs enumerates all stored DAG meta records. Used by the scheduler's
 	// sweep on leader acquisition to find stranded ready steps across all running DAGs.

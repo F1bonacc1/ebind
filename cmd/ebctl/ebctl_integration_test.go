@@ -595,3 +595,87 @@ func TestDagBPContinueAndLsDefaults(t *testing.T) {
 		t.Errorf("bp ls --blocked after continue = %d, want 0", n)
 	}
 }
+
+func TestDagBPArmDisarm(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// "build" is running; node-1 and node-2 are pending behind it. Nothing
+	// is armed at submit.
+	const dagID = "dag-bp-arm"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, rec := range []workflow.StepRecord{
+		{DAGID: dagID, StepID: "build", Status: workflow.StatusRunning, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "node-1", Deps: []string{"build"}, Status: workflow.StatusPending, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "node-2", Deps: []string{"build"}, Status: workflow.StatusPending, FnName: "test.noop", AddedAt: now},
+	} {
+		if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run := func(args ...string) map[string]any {
+		t.Helper()
+		root := cmddag.NewCmd(c)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs(append([]string{"bp"}, args...))
+		if err := root.Execute(); err != nil {
+			t.Fatalf("bp %v: %v", args, err)
+		}
+		var res map[string]any
+		if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+			t.Fatalf("bad json %q: %v", out.Bytes(), err)
+		}
+		return res
+	}
+	join := func(v any) string {
+		var parts []string
+		for _, x := range v.([]any) {
+			parts = append(parts, x.(string))
+		}
+		return strings.Join(parts, ",")
+	}
+
+	res := run("arm", dagID, "--before", "--step", "*")
+	if join(res["added"]) != "before:step:*" || join(res["stopped"]) != "node-1@before,node-2@before" ||
+		join(res["missed"]) != "build@before" {
+		t.Errorf("arm = %v", res)
+	}
+	res = run("arm", dagID, "--before", "--step", "*")
+	if join(res["added"]) != "" {
+		t.Errorf("repeat arm added = %v, want none", res["added"])
+	}
+	rec, _, err := wf.Store.GetStep(ctx, dagID, "node-1")
+	if err != nil || strings.Join(rec.BPFence, ",") != "b:before:step:*" {
+		t.Fatalf("node-1 fence = %v, %v", rec.BPFence, err)
+	}
+
+	res = run("disarm", dagID, "--before", "--step", "*")
+	if res["matcher"] != "before:step:*" || res["released"] != float64(0) {
+		t.Errorf("disarm = %v (nothing had arrived at the breakpoint yet)", res)
+	}
+	rec, _, _ = wf.Store.GetStep(ctx, dagID, "node-1")
+	meta, _, _ := wf.Store.GetMeta(ctx, dagID)
+	if len(rec.BPFence) != 0 || len(meta.ArmedMatchers) != 0 {
+		t.Errorf("after disarm: fence %v, armed %v", rec.BPFence, meta.ArmedMatchers)
+	}
+
+	root := cmddag.NewCmd(c)
+	root.SetOut(&bytes.Buffer{})
+	root.SetArgs([]string{"bp", "arm", dagID, "--step", "x"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "--before or --after") {
+		t.Errorf("missing position: err = %v", err)
+	}
+}

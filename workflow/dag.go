@@ -600,6 +600,21 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 	// A signal landing after this snapshot is covered by Signal's
 	// always-published EventSignal — the step records above are already
 	// persisted, so the scheduler's re-eval sees the gated root.
+	//
+	// Meta is re-read from the stream leader now that the steps exist: a
+	// runtime ArmBreakpoints that committed after the meta write above is
+	// either in this read, or its fence pass listed these steps and fenced
+	// the roots (the CAS below then fails and re-reads). See ArmBreakpoints.
+	if latest, _, err := wf.Store.GetMetaLatest(ctx, d.id); err == nil {
+		meta = latest
+	} else {
+		return fmt.Errorf("workflow: read meta: %w", err)
+	}
+	if meta.Status != DAGStatusRunning {
+		// Paused or canceled between the meta write and here: its owner
+		// (Resume, the sweep) dispatches the roots.
+		return nil
+	}
 	var sigSnap map[string]SignalRecord
 	for _, s := range d.steps {
 		if len(s.allDeps()) == 0 && len(s.waitSignalNames()) > 0 {

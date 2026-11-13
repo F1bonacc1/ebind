@@ -123,6 +123,23 @@ func (s *NatsStore) GetMeta(ctx context.Context, dagID string) (DAGMeta, uint64,
 	return meta, entry.Revision(), nil
 }
 
+// GetMetaLatest reads meta through the stream leader (leaderMsg), never a
+// direct get, so it reflects every committed write.
+func (s *NatsStore) GetMetaLatest(ctx context.Context, dagID string) (DAGMeta, uint64, error) {
+	val, seq, live, err := s.leaderMsg(ctx, kvSubjectPrefix+metaKey(dagID))
+	if err != nil {
+		return DAGMeta{}, 0, err
+	}
+	if !live {
+		return DAGMeta{}, 0, ErrDAGNotFound
+	}
+	var meta DAGMeta
+	if err := json.Unmarshal(val, &meta); err != nil {
+		return DAGMeta{}, 0, err
+	}
+	return meta, seq, nil
+}
+
 func (s *NatsStore) PutMeta(ctx context.Context, dagID string, meta DAGMeta, expectedRev uint64) error {
 	data, err := json.Marshal(meta)
 	if err != nil {
@@ -297,41 +314,50 @@ func (s *NatsStore) leaderSubjects(ctx context.Context, filter string) ([]string
 	return out, nil
 }
 
-// leaderLastMsg reads the last message on subj through the non-direct
+// leaderLastMsg reads the last message on subj through the stream leader;
+// see leaderMsg.
+func (s *NatsStore) leaderLastMsg(ctx context.Context, subj string) ([]byte, bool, error) {
+	val, _, live, err := s.leaderMsg(ctx, subj)
+	return val, live, err
+}
+
+// leaderMsg reads the last message on subj through the non-direct
 // STREAM.MSG.GET API, which only the stream leader answers. jetstream's
 // Stream.GetLastMsgForSubject cannot stand in: it switches to a direct get
-// whenever the stream allows them, and KV buckets always do. The bool is false
-// for a delete/purge tombstone or a subject with no message left.
-func (s *NatsStore) leaderLastMsg(ctx context.Context, subj string) ([]byte, bool, error) {
+// whenever the stream allows them, and KV buckets always do. The sequence is
+// the KV revision. The bool is false for a delete/purge tombstone or a
+// subject with no message left.
+func (s *NatsStore) leaderMsg(ctx context.Context, subj string) ([]byte, uint64, bool, error) {
 	var resp struct {
 		Error   *jetstream.APIError `json:"error,omitempty"`
 		Message *struct {
+			Seq    uint64 `json:"seq"`
 			Header []byte `json:"hdrs,omitempty"`
 			Data   []byte `json:"data,omitempty"`
 		} `json:"message,omitempty"`
 	}
 	req := map[string]string{"last_by_subj": subj}
 	if err := s.apiRequest(ctx, "STREAM.MSG.GET."+kvStreamName, req, &resp); err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	switch {
 	case resp.Error != nil && resp.Error.ErrorCode == jetstream.JSErrCodeMessageNotFound:
-		return nil, false, nil
+		return nil, 0, false, nil
 	case resp.Error != nil:
-		return nil, false, resp.Error
+		return nil, 0, false, resp.Error
 	case resp.Message == nil:
-		return nil, false, jetstream.ErrInvalidJetStreamResponse
+		return nil, 0, false, jetstream.ErrInvalidJetStreamResponse
 	}
 	if len(resp.Message.Header) > 0 {
 		hdr, err := nats.DecodeHeadersMsg(resp.Message.Header)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, false, err
 		}
 		if op := hdr.Get("KV-Operation"); op == "DEL" || op == "PURGE" {
-			return nil, false, nil
+			return nil, 0, false, nil
 		}
 	}
-	return resp.Message.Data, true, nil
+	return resp.Message.Data, resp.Message.Seq, true, nil
 }
 
 // apiRequest sends a JetStream API request and decodes the JSON reply into

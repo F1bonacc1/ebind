@@ -149,6 +149,11 @@ func (s *MemStore) GetMeta(_ context.Context, dagID string) (DAGMeta, uint64, er
 	return e.meta, e.rev, nil
 }
 
+// GetMetaLatest is GetMeta: MemStore reads are always current.
+func (s *MemStore) GetMetaLatest(ctx context.Context, dagID string) (DAGMeta, uint64, error) {
+	return s.GetMeta(ctx, dagID)
+}
+
 func (s *MemStore) ListDAGs(_ context.Context) ([]DAGMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

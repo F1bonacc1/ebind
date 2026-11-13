@@ -52,15 +52,25 @@ func ComputeBreakpoints(meta DAGMeta, steps []StepRecord) []BreakpointInfo {
 		holdingAfter = state.HoldingAtAfter()
 	}
 
+	// Fence tokens arm a position too: the evaluator's meta may predate a
+	// runtime ArmBreakpoints, or a crashed disarm may have left a token that
+	// persistStatus still honors. Either way the step is stopped, so say so.
+	afterFenced := state.afterFenceUpstreams()
 	var out []BreakpointInfo
 	for _, rec := range steps {
 		beforeKeys := state.armedMatcherKeys(rec, BPPositionBefore)
+		fenceKeys := beforeFenceKeys(rec)
+		for _, k := range fenceKeys {
+			if !slices.Contains(beforeKeys, k) {
+				beforeKeys = append(beforeKeys, k)
+			}
+		}
 		if len(rec.BreakBefore) > 0 || len(beforeKeys) > 0 {
 			info := BreakpointInfo{
 				StepID:   rec.StepID,
 				Position: BPPositionBefore,
 				Labels:   rec.BreakBefore,
-				Armed:    state.bpArmed(rec, BPPositionBefore),
+				Armed:    state.bpArmed(rec, BPPositionBefore) || len(fenceKeys) > 0,
 				Matchers: beforeKeys,
 			}
 			switch {
@@ -73,12 +83,12 @@ func ComputeBreakpoints(meta DAGMeta, steps []StepRecord) []BreakpointInfo {
 			out = append(out, info)
 		}
 		afterKeys := state.armedMatcherKeys(rec, BPPositionAfter)
-		if len(rec.BreakAfter) > 0 || len(afterKeys) > 0 {
+		if len(rec.BreakAfter) > 0 || len(afterKeys) > 0 || afterFenced[rec.StepID] {
 			info := BreakpointInfo{
 				StepID:   rec.StepID,
 				Position: BPPositionAfter,
 				Labels:   rec.BreakAfter,
-				Armed:    state.bpArmed(rec, BPPositionAfter),
+				Armed:    state.bpArmed(rec, BPPositionAfter) || afterFenced[rec.StepID],
 				Matchers: afterKeys,
 			}
 			switch {
@@ -164,16 +174,24 @@ func FilterBreakpoints(infos []BreakpointInfo, opts ...ListBPOption) []Breakpoin
 // ListBreakpoints loads the DAG from the store and returns its breakpoints:
 // by default every declared or matcher-armed one, narrowed by OnlyArmed and
 // OnlyBlocked. Returns ErrDAGNotFound if the DAG's meta key is missing.
+//
+// Meta is read from the stream leader, so matchers armed or disarmed at
+// runtime show up at once.
 func ListBreakpoints(ctx context.Context, wf *Workflow, dagID string, opts ...ListBPOption) ([]BreakpointInfo, error) {
-	meta, _, err := wf.Store.GetMeta(ctx, dagID)
+	state, err := loadLatestState(ctx, wf, dagID)
 	if err != nil {
 		return nil, err
 	}
-	steps, err := wf.Store.ListSteps(ctx, dagID)
-	if err != nil {
-		return nil, err
+	return FilterBreakpoints(state.breakpoints(), opts...), nil
+}
+
+// breakpoints is ComputeBreakpoints over this state.
+func (s *DAGState) breakpoints() []BreakpointInfo {
+	steps := make([]StepRecord, 0, len(s.Steps))
+	for _, rec := range s.Steps {
+		steps = append(steps, rec)
 	}
-	return FilterBreakpoints(ComputeBreakpoints(meta, steps), opts...), nil
+	return ComputeBreakpoints(s.Meta, steps)
 }
 
 // ResumeBreakpoint releases every step in the DAG currently blocked at a
@@ -315,6 +333,13 @@ func ReleaseStep(ctx context.Context, wf *Workflow, dagID, stepID string, pos BP
 	} else {
 		stopped = slices.Contains(state.HoldingAtAfter(), stepID)
 		labels = rec.BreakAfter
+		if !stopped && rec.Status == StatusDone && rec.BPAfter == BPStateReleased {
+			// A retry after a crash between the release and the dependent
+			// token cleanup: finish the cleanup.
+			if err := clearAfterFence(ctx, wf.Store, dagID, stepID); err != nil {
+				return false, err
+			}
+		}
 	}
 
 	released := false
@@ -330,25 +355,14 @@ func ReleaseStep(ctx context.Context, wf *Workflow, dagID, stepID string, pos BP
 	return released, nil
 }
 
-// loadBPState loads the DAG for a breakpoint release. It returns (nil, nil)
+// loadBPState loads the DAG for a breakpoint release, with meta from the
+// stream leader so stops from a runtime arm are seen. It returns (nil, nil)
 // for a terminal DAG, where nothing can be stopped, and ErrDAGNotFound for an
 // unknown one.
 func loadBPState(ctx context.Context, wf *Workflow, dagID string) (*DAGState, error) {
-	meta, _, err := wf.Store.GetMeta(ctx, dagID)
-	if err != nil {
+	state, err := loadLatestState(ctx, wf, dagID)
+	if err != nil || state.isTerminal() {
 		return nil, err
-	}
-	switch meta.Status {
-	case DAGStatusDone, DAGStatusFailed, DAGStatusCanceled:
-		return nil, nil
-	}
-	steps, err := wf.Store.ListSteps(ctx, dagID)
-	if err != nil {
-		return nil, err
-	}
-	state := &DAGState{Meta: meta, Steps: make(map[string]StepRecord, len(steps))}
-	for _, s := range steps {
-		state.Steps[s.StepID] = s
 	}
 	return state, nil
 }
@@ -360,8 +374,21 @@ func loadBPState(ctx context.Context, wf *Workflow, dagID string) (*DAGState, er
 // EventResumed.
 func releaseInstance(ctx context.Context, wf *Workflow, dagID, stepID string, pos BPPosition, labels []string) (bool, error) {
 	ok, err := releaseBP(ctx, wf, dagID, stepID, pos)
-	if err != nil || !ok {
+	if err != nil {
 		return false, err
+	}
+	if pos == BPPositionAfter {
+		// Drop the "a:<stepID>" fence tokens a runtime arm put on the
+		// dependents. Run even when this call lost the release (ok false),
+		// so a retry finishes a crashed cleanup. They are void once the
+		// step is released (liveFenceTokens), so this only tidies records
+		// and saves persistStatus an upstream read.
+		if err := clearAfterFence(ctx, wf.Store, dagID, stepID); err != nil {
+			return ok, err
+		}
+	}
+	if !ok {
+		return false, nil
 	}
 	// Informational (see EventBPResumed): best-effort for live observers only.
 	_ = publishEvent(ctx, wf.Bus, Event{Kind: EventBPResumed, DAGID: dagID,
@@ -386,6 +413,15 @@ func releaseBP(ctx context.Context, wf *Workflow, dagID, stepID string, pos BPPo
 				return false, nil
 			}
 			rec.BPBefore = BPStateReleased
+			// "b:" tokens yield to released anyway; drop them in the same
+			// write so the record reads clean.
+			rec.BPFence = slices.DeleteFunc(rec.BPFence, func(tok string) bool {
+				_, isAfter := cutAfterToken(tok)
+				return !isAfter
+			})
+			if len(rec.BPFence) == 0 {
+				rec.BPFence = nil
+			}
 		case BPPositionAfter:
 			if rec.Status != StatusDone || rec.BPAfter == BPStateReleased {
 				return false, nil

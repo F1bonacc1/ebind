@@ -19,13 +19,15 @@ import (
 func newBPCmd(c *cli.Context) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bp",
-		Short: "Inspect, wait for, resume and release step breakpoints",
+		Short: "Inspect, arm, disarm, wait for, resume and release step breakpoints",
 	}
 	cmd.AddCommand(newBPLsCmd(c))
 	cmd.AddCommand(newBPResumeCmd(c))
 	cmd.AddCommand(newBPReleaseCmd(c))
 	cmd.AddCommand(newBPWaitCmd(c))
 	cmd.AddCommand(newBPContinueCmd(c))
+	cmd.AddCommand(newBPArmCmd(c))
+	cmd.AddCommand(newBPDisarmCmd(c))
 	return cmd
 }
 
@@ -319,6 +321,103 @@ Examples:
 		}
 		return c.Printer.Text(cmd.OutOrStdout(),
 			fmt.Sprintf("released %d breakpoint(s) matching %s in %s", n, m.Key(), args[0]))
+	}
+	return cmd
+}
+
+func newBPArmCmd(c *cli.Context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "arm <dag-id> (--before|--after) (--step|--fn|--label) <pattern>",
+		Short: "Arm a breakpoint on a running or paused DAG",
+		Long: `Arm a breakpoint matcher on a DAG that is already running (or paused).
+Every step it selects stops at that position from now on, including steps
+added dynamically later. A step already past the point is not interrupted:
+it is reported as missed.
+
+Every worker must run ebind v0.10.0 or later before you arm at runtime: an
+older scheduler ignores runtime breakpoints and runs straight through them.
+
+Examples:
+  ebctl dag bp arm <dag-id> --before --step 'upgrade-node-*'
+  ebctl dag bp arm <dag-id> --after --fn main.Prepare`,
+		Args: cobra.ExactArgs(1),
+	}
+	mf := cli.AddMatcherFlags(cmd)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		m, err := mf.Matcher()
+		if err != nil {
+			return err
+		}
+		ctx, cancel := c.Ctx()
+		defer cancel()
+		wf, err := c.Workflow(ctx)
+		if err != nil {
+			return err
+		}
+		rep, err := workflow.ArmBreakpoints(ctx, wf, args[0], m)
+		if err != nil {
+			return err
+		}
+		if c.Printer.Name() == "json" {
+			return c.Printer.Value(cmd.OutOrStdout(), map[string]any{
+				"dag_id": args[0], "matcher": m.Key(),
+				"added": rep.Added, "stopped": rep.Stopped, "missed": rep.Missed,
+			})
+		}
+		return c.Printer.Text(cmd.OutOrStdout(), bpArmText(args[0], m, rep))
+	}
+	return cmd
+}
+
+// bpArmText renders an ArmReport for humans.
+func bpArmText(dagID string, m workflow.BPMatcher, rep workflow.ArmReport) string {
+	var b strings.Builder
+	if len(rep.Added) > 0 {
+		fmt.Fprintf(&b, "armed %s in %s\n", m.Key(), dagID)
+	} else {
+		fmt.Fprintf(&b, "%s was already armed in %s\n", m.Key(), dagID)
+	}
+	fmt.Fprintf(&b, "stopped: %s\n", dashIfEmpty(strings.Join(rep.Stopped, ", ")))
+	fmt.Fprintf(&b, "missed:  %s", dashIfEmpty(strings.Join(rep.Missed, ", ")))
+	return b.String()
+}
+
+func newBPDisarmCmd(c *cli.Context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "disarm <dag-id> (--before|--after) (--step|--fn|--label) <pattern>",
+		Short: "Disarm a breakpoint and let the steps it alone stopped continue",
+		Long: `Remove a breakpoint matcher from a DAG's armed set. Steps it was the only
+reason for stopping continue now, and later matching steps run straight
+through. Unlike "bp continue", this changes what is armed; unlike a release,
+re-arming the same matcher stops a step again.
+
+Examples:
+  ebctl dag bp disarm <dag-id> --before --step 'upgrade-node-*'`,
+		Args: cobra.ExactArgs(1),
+	}
+	mf := cli.AddMatcherFlags(cmd)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		m, err := mf.Matcher()
+		if err != nil {
+			return err
+		}
+		ctx, cancel := c.Ctx()
+		defer cancel()
+		wf, err := c.Workflow(ctx)
+		if err != nil {
+			return err
+		}
+		n, err := workflow.DisarmBreakpoints(ctx, wf, args[0], m)
+		if err != nil {
+			return err
+		}
+		if c.Printer.Name() == "json" {
+			return c.Printer.Value(cmd.OutOrStdout(), map[string]any{
+				"dag_id": args[0], "matcher": m.Key(), "released": n,
+			})
+		}
+		return c.Printer.Text(cmd.OutOrStdout(),
+			fmt.Sprintf("disarmed %s in %s; released %d breakpoint(s)", m.Key(), args[0], n))
 	}
 	return cmd
 }

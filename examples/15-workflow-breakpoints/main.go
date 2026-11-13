@@ -20,6 +20,9 @@
 // follows the DAG's KV records through a watch), which is how this example
 // knows each stop has been reached.
 //
+// Breakpoints can also be armed on a DAG that is already running, without
+// declaring anything up front: see example 20 (ArmBreakpoints).
+//
 // All breakpoint state lives in NATS KV, so blocked DAGs survive restarts and
 // can be released from any process, or from the CLI:
 //

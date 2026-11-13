@@ -155,3 +155,17 @@ func TestBPLsOptions(t *testing.T) {
 		t.Errorf("--blocked = %s, want armed", got)
 	}
 }
+
+func TestBPArmText(t *testing.T) {
+	got := bpArmText("d1", workflow.BeforeStep("n-*"), workflow.ArmReport{
+		Added: []string{"before:step:n-*"}, Stopped: []string{"n-1@before", "n-2@before"}, Missed: []string{},
+	})
+	want := "armed before:step:n-* in d1\nstopped: n-1@before, n-2@before\nmissed:  -"
+	if got != want {
+		t.Errorf("text =\n%s\nwant\n%s", got, want)
+	}
+	got = bpArmText("d1", workflow.BeforeStep("n-*"), workflow.ArmReport{Missed: []string{"n-0@before"}})
+	if !strings.HasPrefix(got, "before:step:n-* was already armed in d1") || !strings.HasSuffix(got, "missed:  n-0@before") {
+		t.Errorf("repeat text = %q", got)
+	}
+}
