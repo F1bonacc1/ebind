@@ -12,6 +12,8 @@ import (
 // runStoreContract runs the contract tests against any StateStore implementation.
 // Both store_mem and store_nats must pass these.
 func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
+	runWatchDAGContract(t, newStore)
+
 	t.Run("PutMeta_CreateOnce", func(t *testing.T) {
 		s := newStore(t)
 		ctx := context.Background()

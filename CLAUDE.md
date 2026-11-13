@@ -88,7 +88,7 @@ workflow/
   errors.go              ErrStepFailed, ErrStepSkipped sentinels
   ref.go                 Ref type + ResolveArgs (pure substitution)
   state.go               DAGState + MarkDone/MarkFailed/MarkSkipped (pure)
-  store.go               StateStore interface
+  store.go               StateStore interface + DAGChange (WatchDAG stream item)
   store_mem.go           In-memory impl (tests + exported for external use)
   store_nats.go          JetStream KV impl
   events.go              EventBus interface + Event types
@@ -102,6 +102,7 @@ workflow/
   dag.go                 DAG builder, Submit, cycle detection
   scheduler.go           handleEvent + watchLeadership + sweep
   breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint, ReleaseStep
+  wait_breakpoint.go     WaitForBreakpoint: fold a WatchDAG stream, return the first matching stop
   matcher.go             BPMatcher (position × step|fn|label pattern, path.Match globs) + Key/Validate/Matches (pure)
   signal.go              external signals: Signal (deliver), ComputeSignals/ListSignalInfo (observability)
   hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
@@ -134,6 +135,7 @@ cmd/ebctl/               operator CLI (cobra)
 - **Unit with fakes** — MemStore + MemBus + captureEnq:
   - `workflow/scheduler_test.go`, `workflow/store_test.go`
   - `workflow/breakpoint_test.go` (pure gate-predicate tests + fakes-driven scheduler/resume tests)
+  - `workflow/release_step_test.go`, `workflow/start_paused_test.go`, `workflow/wait_breakpoint_test.go`
   - `workflow/signal_test.go` (pure gate/ResolveArgs tests + fakes-driven Signal/scheduler tests)
 - **Integration** — real in-process NATS via `embed.StartNode`:
   - `worker/worker_test.go`, `workflow/integration_test.go`, `workflow/breakpoint_integration_test.go`, `workflow/signal_integration_test.go`
@@ -218,6 +220,9 @@ they bypass the scheduler gate.
 
 ### Operator tools open, never create-or-update
 `NewFromNATS`/`NewNatsStore`/`NewNatsBus` use `CreateOrUpdate*`, which rewrites the whole bucket/stream config (replicas included) to whatever the caller passes. Only the deployment that owns the infrastructure (workers) may call them. `ebctl` and any other tool that attaches to a running deployment must use `OpenFromNATS` (`OpenNatsStore`/`OpenNatsBus`), which opens existing resources and errors if they are missing. Before v0.9 ebctl defaulted `--replicas 1` through the create path and silently scaled R=3 deployments to R=1. Regression test: `cmd/ebctl/open_only_test.go`.
+
+### Waiting on DAG state: watch, never poll Get
+`StateStore.WatchDAG` streams a DAG's meta + step records (snapshot, `Synced`, then every change). On NatsStore it is a KV `WatchFiltered` (ordered consumer), so it never sees the direct-get staleness below; a closed channel means "re-watch", and the fresh snapshot makes that restart-safe. `WaitForBreakpoint` is built on it and evaluates the computed gate (`ComputeBreakpoints`), never the advisory marks. MemStore's watch never blocks writers: a subscriber whose buffer fills is closed. `WatchDAG` is part of the `StateStore` interface and of `runStoreContract` (`runWatchDAGContract`, also run against NatsStore).
 
 ### KV reads are direct-get — no read-your-writes
 NATS JetStream KV `Get` is a *direct get*: hardcoded `AllowDirect: true` on the bucket stream, served by any in-sync replica via a queue group, not just the leader. A `Create`/`Update` commits at quorum (leader + 1 of 2 followers); the third replica applies a beat later. So a `Get` issued immediately after a write can be answered by a lagging replica and return a stale value — including `ErrKeyNotFound`/`ErrStepNotFound` for a key that definitely exists. The window is widest right after a node restart (the rejoined replica is back in the direct-get pool but a hair behind). **Never read-back-after-write to recover a revision** — `StateStore.PutStep`/`PutMeta` should return the new revision (as `kv.Create`/`kv.Update` do) and callers CAS from it directly. Writes/CAS are strongly consistent (leader-served, quorum); only this relaxed read path needs care. See `workflow/dag.go::Submit` and the `Step_PutReturnsUsableRevision` store contract.

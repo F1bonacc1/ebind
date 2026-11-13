@@ -226,6 +226,7 @@ n, _ := workflow.ResumeBreakpoint(ctx, wf, dag.ID(), "BeforeUpload")
 - `BreakBefore(labels...)` stops before the step executes (it stays `pending`); `BreakAfter(labels...)` lets the step complete - result persisted - but holds its direct dependents.
 - Breakpoints are **inactive by default**. `WithActiveBreakpoints(labels...)` is a `Submit` option, so a statically defined DAG decides at run time which breakpoints to arm; a breakpoint with several labels is armed (and resumable) by any one of them.
 - `ResumeBreakpoint` is "continue", not "disable": the label stays armed, so a later step (including dynamically added ones) carrying it stops again.
+- `WaitForBreakpoint(ctx, wf, dagID, workflow.BeforeStep("upload-*"))` blocks until a matching step is stopped and returns it - no polling: it follows the DAG's KV records through a watch, and survives worker, scheduler and node restarts. It returns `ErrDAGTerminal` if the DAG finishes first. Matchers select by step-ID glob (`BeforeStep`/`AfterStep`), function name (`BeforeFn`/`AfterFn`) or label (`BeforeLabel`/`AfterLabel`).
 - `ReleaseStep(ctx, wf, dagID, stepID, pos)` releases one step instead of everything on a label - e.g. let one branch of a fan-out through while the others stay stopped. It returns `false` for a step that has not reached its breakpoint yet; it never pre-releases one.
 - Blocked state lives in NATS KV - it survives restarts, and any process (or `ebctl`) can list and resume:
 
@@ -233,6 +234,7 @@ n, _ := workflow.ResumeBreakpoint(ctx, wf, dag.ID(), "BeforeUpload")
 ebctl dag bp ls <dag-id>              # STEP | POS | LABELS | ARMED | STATE | SINCE | HOLDING
 ebctl dag bp resume <dag-id> <label>  # release the blocked line(s); label stays armed
 ebctl dag bp release <dag-id> <step-id> --position before|after  # release one step only
+ebctl dag bp wait <dag-id> --before --step 'upload-*' --wait-timeout 1m  # block until one stops
 ebctl dag watch                       # live feed includes bp_hit / bp_resumed events
 ```
 

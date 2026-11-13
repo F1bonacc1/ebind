@@ -16,10 +16,15 @@
 //     same label stay stopped, e.g. to let one branch of a fan-out through
 //     while you look at the other.
 //
+// WaitForBreakpoint blocks until a matching step is stopped (no polling: it
+// follows the DAG's KV records through a watch), which is how this example
+// knows each stop has been reached.
+//
 // All breakpoint state lives in NATS KV, so blocked DAGs survive restarts and
 // can be released from any process, or from the CLI:
 //
 //	ebctl dag bp ls <dag-id>
+//	ebctl dag bp wait <dag-id> --before --step 'upload-*' --wait-timeout 1m
 //	ebctl dag bp release <dag-id> <step-id> --position before
 //	ebctl dag bp resume <dag-id> <label>
 package main
@@ -111,7 +116,7 @@ func main() {
 	// but the after-breakpoint holds parse.
 	raw, err := workflow.Await[string](ctx, wf, dag.ID(), download)
 	check(err)
-	waitBlocked(ctx, wf, dag.ID(), 1)
+	waitStopped(ctx, wf, dag.ID(), workflow.AfterStep("download"))
 	log.Printf("stopped after %q — its result is already persisted: %q", "download", raw)
 
 	// The independent line is not affected by the stopped one.
@@ -129,7 +134,9 @@ func main() {
 
 	rows, err := workflow.AwaitByID[int](ctx, wf, dag.ID(), "parse")
 	check(err)
-	waitBlocked(ctx, wf, dag.ID(), 2)
+	// WaitForBreakpoint returns on the first match, so wait for each step.
+	waitStopped(ctx, wf, dag.ID(), workflow.BeforeStep("upload-eu"))
+	waitStopped(ctx, wf, dag.ID(), workflow.BeforeStep("upload-us"))
 	log.Printf("stopped before both uploads; inspect parse's output first: %d rows", rows)
 
 	printBreakpoints(ctx, wf, dag.ID())
@@ -143,7 +150,7 @@ func main() {
 	eu, err := workflow.Await[string](ctx, wf, dag.ID(), uploadEU)
 	check(err)
 	log.Printf("upload-eu result: %q", eu)
-	waitBlocked(ctx, wf, dag.ID(), 1)
+	waitStopped(ctx, wf, dag.ID(), workflow.BeforeStep("upload-us")) // returns at once: still stopped
 	log.Printf("upload-us is still stopped:")
 	printBreakpoints(ctx, wf, dag.ID())
 
@@ -173,17 +180,15 @@ func waitForStatus(ctx context.Context, wf *workflow.Workflow, dagID string, wan
 	log.Fatalf("DAG did not reach status %s in time", want)
 }
 
-// waitBlocked polls until exactly n breakpoints report blocked state.
-func waitBlocked(ctx context.Context, wf *workflow.Workflow, dagID string, n int) {
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		infos, err := workflow.ListBreakpoints(ctx, wf, dagID)
-		if err == nil && workflow.CountBlocked(infos) == n {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+// waitStopped blocks until a step selected by m is stopped at m's position.
+func waitStopped(ctx context.Context, wf *workflow.Workflow, dagID string, m workflow.BPMatcher) {
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	info, err := workflow.WaitForBreakpoint(waitCtx, wf, dagID, m)
+	if err != nil {
+		log.Fatalf("waiting for %s: %v", m.Key(), err)
 	}
-	log.Fatalf("never reached %d blocked breakpoint(s)", n)
+	log.Printf("WaitForBreakpoint(%s): %s stopped %s", m.Key(), info.StepID, info.Position)
 }
 
 func printBreakpoints(ctx context.Context, wf *workflow.Workflow, dagID string) {

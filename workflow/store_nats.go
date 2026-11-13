@@ -475,3 +475,85 @@ func (s *NatsStore) WatchResult(ctx context.Context, dagID, stepID string) (<-ch
 	}()
 	return out, nil
 }
+
+// WatchDAG implements StateStore with a KV watch filtered to the DAG's meta
+// key and step keys. The watch is an ordered consumer reading the bucket's
+// stream in sequence, so unlike Get it is never answered by a lagging
+// replica: the snapshot plus updates is a consistent, ordered view.
+func (s *NatsStore) WatchDAG(ctx context.Context, dagID string) (<-chan DAGChange, error) {
+	stepPrefix := dagID + keyStepPrefix
+	w, err := s.kv.WatchFiltered(ctx, []string{metaKey(dagID), stepPrefix + ">"})
+	if err != nil {
+		return nil, fmt.Errorf("workflow: watch DAG %q: %w", dagID, err)
+	}
+	out := make(chan DAGChange, 64)
+	go func() {
+		defer close(out)
+		defer func() { _ = w.Stop() }()
+		send := func(c DAGChange) bool {
+			select {
+			case out <- c:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		for {
+			var entry jetstream.KeyValueEntry
+			var ok bool
+			select {
+			case <-ctx.Done():
+				return
+			case entry, ok = <-w.Updates():
+				if !ok {
+					return
+				}
+			}
+			if entry == nil {
+				if !send(DAGChange{Synced: true}) {
+					return
+				}
+				continue
+			}
+			c, ok := natsDAGChange(entry, dagID, stepPrefix)
+			if !ok {
+				continue
+			}
+			if !send(c) {
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
+// natsDAGChange converts one watched KV entry into a DAGChange. Entries that
+// do not belong to the DAG or do not decode are skipped (ok=false): a
+// malformed record is not something a watcher can act on, and every reader
+// of the same key already reports the decode error.
+func natsDAGChange(entry jetstream.KeyValueEntry, dagID, stepPrefix string) (DAGChange, bool) {
+	key := entry.Key()
+	deleted := entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge
+	switch {
+	case key == metaKey(dagID):
+		if deleted {
+			return DAGChange{Deleted: DeletedMeta}, true
+		}
+		var meta DAGMeta
+		if err := json.Unmarshal(entry.Value(), &meta); err != nil {
+			return DAGChange{}, false
+		}
+		return DAGChange{Meta: &meta}, true
+	case strings.HasPrefix(key, stepPrefix):
+		stepID := strings.TrimPrefix(key, stepPrefix)
+		if deleted {
+			return DAGChange{Deleted: stepID}, true
+		}
+		var rec StepRecord
+		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
+			return DAGChange{}, false
+		}
+		return DAGChange{Step: &rec}, true
+	}
+	return DAGChange{}, false
+}

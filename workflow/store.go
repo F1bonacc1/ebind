@@ -39,6 +39,15 @@ type StateStore interface {
 	// already exists (sending the existing value first).
 	WatchResult(ctx context.Context, dagID, stepID string) (<-chan []byte, error)
 
+	// WatchDAG streams one DAG's meta and step records: first the current
+	// value of each (deleted keys may appear as Deleted changes), then one
+	// change with Synced set, then every later put or delete in commit order.
+	// The channel closes when ctx ends, or when the watch fails or the
+	// consumer falls too far behind; a caller that still needs updates
+	// re-watches and gets a fresh snapshot. Results and signals are not
+	// included.
+	WatchDAG(ctx context.Context, dagID string) (<-chan DAGChange, error)
+
 	// GetSignal returns the delivered signal record, or ErrSignalNotFound.
 	GetSignal(ctx context.Context, dagID, name string) (SignalRecord, error)
 	// PutSignal creates the record — first-wins: signal records are immutable
@@ -49,3 +58,22 @@ type StateStore interface {
 	// DeleteSignal removes a record; missing keys are not errors.
 	DeleteSignal(ctx context.Context, dagID, name string) error
 }
+
+// DAGChange is one item of a WatchDAG stream. Exactly one of Meta, Step,
+// Deleted or Synced is set.
+type DAGChange struct {
+	// Meta is the DAG's meta record after a put.
+	Meta *DAGMeta
+	// Step is a step record after a put.
+	Step *StepRecord
+	// Deleted names a deleted key: DeletedMeta for the meta record,
+	// otherwise the step ID.
+	Deleted string
+	// Synced is set once, after the initial snapshot has been delivered.
+	Synced bool
+}
+
+// DeletedMeta is DAGChange.Deleted for a deleted meta record. It cannot
+// collide with a step ID on NatsStore: '<' and '>' are outside the KV key
+// charset, so no stored step can have this ID.
+const DeletedMeta = "<meta>"

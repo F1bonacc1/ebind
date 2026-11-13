@@ -1,7 +1,11 @@
 package dag
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -15,11 +19,12 @@ import (
 func newBPCmd(c *cli.Context) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bp",
-		Short: "Inspect, resume and release step breakpoints",
+		Short: "Inspect, wait for, resume and release step breakpoints",
 	}
 	cmd.AddCommand(newBPLsCmd(c))
 	cmd.AddCommand(newBPResumeCmd(c))
 	cmd.AddCommand(newBPReleaseCmd(c))
+	cmd.AddCommand(newBPWaitCmd(c))
 	return cmd
 }
 
@@ -181,4 +186,61 @@ func bpReleaseText(dagID, stepID string, pos workflow.BPPosition, released bool)
 		return fmt.Sprintf("released %s at its %s breakpoint in %s", stepID, pos, dagID)
 	}
 	return fmt.Sprintf("not stopped: %s is not stopped at its %s breakpoint in %s (nothing released)", stepID, pos, dagID)
+}
+
+func newBPWaitCmd(c *cli.Context) *cobra.Command {
+	var waitTimeout time.Duration
+	cmd := &cobra.Command{
+		Use:   "wait <dag-id> (--before|--after) (--step|--fn|--label) <pattern>",
+		Short: "Block until a matching step is stopped at a breakpoint, then print it",
+		Long: `Block until a step selected by the matcher is stopped at the given
+position, then print that breakpoint and exit 0. If one is already stopped it
+returns at once. Exits non-zero if the DAG is or becomes terminal, does not
+exist, or --wait-timeout passes first.
+
+Examples:
+  ebctl dag bp wait <dag-id> --before --step 'upload-*' --wait-timeout 1m
+  ebctl dag bp wait <dag-id> --after --fn main.Prepare
+
+Step and fn patterns are path.Match globs: '*' does not cross '/'. The global
+--timeout bounds each request, not the wait; the wait runs until a match,
+--wait-timeout (0 = no limit), or Ctrl-C.`,
+		Args: cobra.ExactArgs(1),
+	}
+	mf := cli.AddMatcherFlags(cmd)
+	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", 0, "give up after this long (0 = wait until a match or Ctrl-C)")
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		m, err := mf.Matcher()
+		if err != nil {
+			return err
+		}
+		openCtx, cancel := c.Ctx()
+		wf, err := c.Workflow(openCtx)
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, stop := signal.NotifyContext(c.Background(), os.Interrupt)
+		defer stop()
+		if waitTimeout > 0 {
+			var cancelWait context.CancelFunc
+			ctx, cancelWait = context.WithTimeout(ctx, waitTimeout)
+			defer cancelWait()
+		}
+		dagID := args[0]
+		info, err := workflow.WaitForBreakpoint(ctx, wf, dagID, m)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("no step matching %s stopped in %s within %s", m.Key(), dagID, waitTimeout)
+			}
+			return err
+		}
+		if c.Printer.Name() == "json" {
+			return c.Printer.Value(cmd.OutOrStdout(), info)
+		}
+		headers, rows := bpTable([]workflow.BreakpointInfo{info})
+		return c.Printer.Table(cmd.OutOrStdout(), headers, rows)
+	}
+	return cmd
 }

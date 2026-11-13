@@ -465,3 +465,66 @@ func TestDagBPRelease(t *testing.T) {
 		t.Errorf("bad position: err = %v", err)
 	}
 }
+
+func TestDagBPWait(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// a is done; upload-eu and upload-us are stopped before running at X.
+	const dagID = "dag-bp-wait"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+		ActiveBreakpoints: []string{"X"},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, rec := range []workflow.StepRecord{
+		{DAGID: dagID, StepID: "a", Status: workflow.StatusDone, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "upload-eu", Status: workflow.StatusPending, FnName: "test.noop",
+			Deps: []string{"a"}, BreakBefore: []string{"X"}, AddedAt: now},
+		{DAGID: dagID, StepID: "upload-us", Status: workflow.StatusPending, FnName: "test.noop",
+			Deps: []string{"a"}, BreakBefore: []string{"X"}, AddedAt: now},
+	} {
+		if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run := func(args ...string) (string, error) {
+		root := cmddag.NewCmd(c)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs(append([]string{"bp", "wait"}, args...))
+		err := root.Execute()
+		return out.String(), err
+	}
+
+	out, err := run(dagID, "--before", "--step", "upload-us")
+	if err != nil {
+		t.Fatalf("bp wait upload-us: %v", err)
+	}
+	var info workflow.BreakpointInfo
+	if err := json.Unmarshal([]byte(out), &info); err != nil {
+		t.Fatalf("bad json %q: %v", out, err)
+	}
+	if info.StepID != "upload-us" || info.Position != workflow.BPPositionBefore || info.State != workflow.BPStateBlocked {
+		t.Errorf("info = %+v, want upload-us stopped before", info)
+	}
+
+	if _, err := run(dagID, "--after", "--step", "upload-*", "--wait-timeout", "300ms"); err == nil || !strings.Contains(err.Error(), "within 300ms") {
+		t.Errorf("nothing stopped after: err = %v, want timeout", err)
+	}
+	if _, err := run(dagID, "--step", "upload-*"); err == nil || !strings.Contains(err.Error(), "--before or --after") {
+		t.Errorf("missing position: err = %v", err)
+	}
+	if _, err := run("ghost", "--before", "--step", "x"); !errors.Is(err, workflow.ErrDAGNotFound) {
+		t.Errorf("unknown DAG: err = %v, want ErrDAGNotFound", err)
+	}
+}

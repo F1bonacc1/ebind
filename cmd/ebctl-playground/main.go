@@ -53,6 +53,7 @@
 //	./bin/ebctl dag ls --label billing
 //	./bin/ebctl dag get <dag-id>
 //	./bin/ebctl dag bp ls <dag-id>
+//	./bin/ebctl dag bp wait <dag-id> --before --step 'transform-*' --wait-timeout 2m
 //	./bin/ebctl dag bp resume <dag-id> Checkpoint
 //	./bin/ebctl dag bp release <dag-id> transform-a --position before
 //	./bin/ebctl dag bp resume <dag-id> BeforeTransform

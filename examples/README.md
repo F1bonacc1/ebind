@@ -35,7 +35,7 @@ go run ./examples/07-workflow-fanout
 | 12 | [`12-workflow-placement`](./12-workflow-placement) | `OnTarget`, `ColocateWith`, `FollowTargetOf`, and dynamic `ColocateHere()` across two workers |
 | 13 | [`13-workflow-cancel`](./13-workflow-cancel) | Cancel a DAG durably: running work may finish, pending downstream work is canceled |
 | 14 | [`14-workflow-pause-resume`](./14-workflow-pause-resume) | Pause a DAG gracefully: in-flight steps drain, pending steps are fenced; `Resume` continues where it left off; `StartPaused` submits a DAG that runs nothing until `Resume` |
-| 15 | [`15-workflow-breakpoints`](./15-workflow-breakpoints) | Step breakpoints: `BreakBefore`/`BreakAfter` labels armed via `WithActiveBreakpoints`; inspect state, `ReleaseStep` to let one fan-out branch through, then `ResumeBreakpoint` to continue the rest |
+| 15 | [`15-workflow-breakpoints`](./15-workflow-breakpoints) | Step breakpoints: `BreakBefore`/`BreakAfter` labels armed via `WithActiveBreakpoints`; `WaitForBreakpoint` to block until a stop is reached, inspect state, `ReleaseStep` to let one fan-out branch through, then `ResumeBreakpoint` to continue the rest |
 | 16 | [`16-workflow-labels`](./16-workflow-labels) | Immutable `WithLabels` topic tags; query history by label with `ListDAGsByLabels` (AND semantics) — mirrors `ebctl dag ls --label` |
 | 17 | [`17-workflow-signals`](./17-workflow-signals) | External signals: `SignalRef`/`WaitForSignal` gate a step on a human approval; `workflow.Signal` delivers a payload the handler consumes (one-shot, buffered, first-wins) |
 
