@@ -1,6 +1,17 @@
 // HA cluster: start 3 NATS JetStream nodes in-process with replicated streams.
 // The same pattern (with one node per machine) gives you production HA — losing
 // one node leaves a majority, streams are replicated (R=3), tasks keep flowing.
+//
+// Two timing facts of a real cluster show up here, and the example handles
+// both the way a production client should:
+//   - Right after the cluster forms, a reply can be dropped while a new
+//     client's subscription interest spreads across the routes. Stream
+//     creation is idempotent, so EnsureStreams is simply retried; a dropped
+//     pull delivery heals when the consumer's 30s pull request expires, so
+//     the first round trip gets a budget longer than that.
+//   - Losing a node is not instant: if it led a stream, the survivors elect a
+//     new leader first, and a publish in that window times out. enqueueRetry
+//     retries through it.
 package main
 
 import (
@@ -45,7 +56,11 @@ func main() {
 
 	js, _ := jetstream.New(nc)
 	// Replicas: 3 — streams are replicated across all nodes for HA.
-	check(stream.EnsureStreams(ctx, js, stream.Config{Replicas: 3}))
+	check(retry(30*time.Second, "create streams", func() error {
+		attemptCtx, ac := context.WithTimeout(ctx, 5*time.Second)
+		defer ac()
+		return stream.EnsureStreams(attemptCtx, js, stream.Config{Replicas: 3})
+	}))
 
 	reg := task.NewRegistry()
 	task.MustRegister(reg, Echo)
@@ -63,14 +78,15 @@ func main() {
 	for i := 0; i < 3; i++ {
 		fut, err := client.Enqueue(c, Echo, fmt.Sprintf("msg-%d", i))
 		check(err)
-		waitCtx, wc := context.WithTimeout(ctx, 5*time.Second)
+		waitCtx, wc := context.WithTimeout(ctx, 40*time.Second)
 		result, err := client.Await[string](waitCtx, fut)
 		wc()
 		check(err)
 		log.Printf("task %d result: %s", i, result)
 	}
 
-	// Now kill a non-leader node and verify the cluster keeps serving.
+	// Now kill a node that is not the JetStream meta leader and verify the
+	// cluster keeps serving. It may still lead one of the streams.
 	for i, n := range cluster.Nodes {
 		if !n.Server().JetStreamIsLeader() {
 			log.Printf("killing non-leader node %d for failover demo", i)
@@ -79,13 +95,37 @@ func main() {
 		}
 	}
 
-	fut, err := client.Enqueue(c, Echo, "after-failover")
-	check(err)
-	waitCtx, wc := context.WithTimeout(ctx, 10*time.Second)
+	fut := enqueueRetry(c, "after-failover")
+	waitCtx, wc := context.WithTimeout(ctx, 30*time.Second)
 	result, err := client.Await[string](waitCtx, fut)
 	wc()
 	check(err)
 	log.Printf("post-failover: %s", result)
+}
+
+// enqueueRetry enqueues, retrying while the cluster re-elects the leader of
+// a stream the killed node led. Each Enqueue publish has its own 5s budget.
+func enqueueRetry(c *client.Client, msg string) *client.Future {
+	var fut *client.Future
+	check(retry(30*time.Second, "enqueue during failover", func() error {
+		var err error
+		fut, err = client.Enqueue(c, Echo, msg)
+		return err
+	}))
+	return fut
+}
+
+// retry calls fn until it succeeds or budget runs out.
+func retry(budget time.Duration, what string, fn func() error) error {
+	deadline := time.Now().Add(budget)
+	for {
+		err := fn()
+		if err == nil || time.Now().After(deadline) {
+			return err
+		}
+		log.Printf("%s: %v; retrying", what, err)
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func check(err error) {
