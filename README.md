@@ -141,6 +141,7 @@ Key behaviors:
 - `workflow.WithLabels("billing", "nightly")` - immutable topic tags for querying workflow history (see below).
 - From inside a handler, `workflow.FromContext(ctx).Step(...)` adds more steps dynamically.
 - `workflow.Pause` / `workflow.Resume` - graceful whole-DAG pause: in-flight steps drain, pending steps are fenced.
+- `dag.Submit(ctx, wf, workflow.StartPaused())` - submit a DAG paused, every step held, so nothing runs until `Resume` (or `ebctl dag resume`). Unlike `Pause` right after `Submit`, which races the already-enqueued roots, nothing can start in between.
 - `workflow.Cancel` - durable cancel (also `ebctl dag cancel`): pending steps flip to canceled immediately; running steps may finish but schedule no follow-on work.
 - `workflow.OnTarget("gpu")` and friends - pin steps to specific workers (see below).
 - `workflow.SignalRef("approval")` / `workflow.WaitForSignal(...)` - gate a step on an external event; `workflow.Signal` delivers it with a payload (see below).

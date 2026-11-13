@@ -40,6 +40,26 @@ type SubmitOption func(*submitOptions)
 
 type submitOptions struct {
 	activeBreakpoints []string
+	startPaused       bool
+}
+
+// StartPaused submits the DAG in the paused state: meta is written paused and
+// every step record is created held, so nothing runs until Resume. Use it to
+// arm, inspect or signal a DAG before any step executes. Calling Pause right
+// after Submit cannot do that: Submit enqueues the roots before Pause runs, so
+// they may already be executing.
+//
+// Steps are written held at create, never created and then held, so no
+// scheduler or sweep ever sees an unheld pending root. Resume (or
+// `ebctl dag resume`) releases the holds and the scheduler dispatches the
+// roots. A paused DAG can be canceled, and signals delivered while it is
+// paused are durable and gate as usual after Resume.
+//
+// Crash semantics are those of any Submit: meta is written first, then the
+// steps; a crash in between leaves a paused DAG with a partial step set, and
+// Resume runs what exists.
+func StartPaused() SubmitOption {
+	return func(o *submitOptions) { o.startPaused = true }
 }
 
 // WithActiveBreakpoints arms the given breakpoint labels for this execution.
@@ -337,7 +357,8 @@ func (d *DAG) detectCycles() error {
 // DAG ID returns ErrStaleRevision for the meta write.
 //
 // Run-time decisions are passed as SubmitOptions — e.g.
-// WithActiveBreakpoints arms step breakpoints for this execution.
+// WithActiveBreakpoints arms step breakpoints for this execution, and
+// StartPaused submits it paused so nothing runs until Resume.
 func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) error {
 	var so submitOptions
 	for _, opt := range opts {
@@ -392,13 +413,18 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 	}
 
 	// Persist meta.
+	now := time.Now().UTC()
 	meta := DAGMeta{
 		ID:                d.id,
 		Status:            DAGStatusRunning,
-		CreatedAt:         time.Now().UTC(),
+		CreatedAt:         now,
 		DefaultPolicy:     d.defaultPolicy,
 		ActiveBreakpoints: dedupeStrings(so.activeBreakpoints),
 		Labels:            dedupeStrings(d.labels),
+	}
+	if so.startPaused {
+		meta.Status = DAGStatusPaused
+		meta.PausedAt = now
 	}
 	if err := wf.Store.PutMeta(ctx, d.id, meta, 0); err != nil {
 		return fmt.Errorf("workflow: put meta: %w", err)
@@ -434,12 +460,25 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 			Placement:    placement,
 			AddedAt:      time.Now().UTC(),
 		}
+		if so.startPaused {
+			// Held at create: there is never an unheld pending root for a
+			// sweep to dispatch. Resume's releaseHeldSteps clears it.
+			rec.Held = true
+			rec.HeldAt = now
+		}
 		rev, err := wf.Store.PutStep(ctx, d.id, s.id, rec, 0)
 		if err != nil {
 			return fmt.Errorf("workflow: put step %q: %w", s.id, err)
 		}
 		recs[s.id] = rec
 		createdRev[s.id] = rev
+	}
+
+	if so.startPaused {
+		// Nothing to enqueue: every step is held. Resume publishes
+		// EventResumed, and the scheduler dispatches the roots and writes
+		// the advisory breakpoint marks then.
+		return nil
 	}
 
 	// Enqueue roots — steps with no required AND no optional deps. Dependent

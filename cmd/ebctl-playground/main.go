@@ -25,9 +25,17 @@
 //	ebctl dag signal ls <dag-id>
 //	ebctl dag signal <dag-id> approval '{"approver":"you","note":"lgtm"}'
 //
+// Start paused: with -paused-every N, every Nth DAG (starting with the first)
+// is submitted with StartPaused: written paused with every step held, so
+// nothing runs until the operator resumes it:
+//
+//	ebctl dag ls --status paused
+//	ebctl dag resume <dag-id>
+//
 // Labels: every DAG is tagged "pipeline" plus a rotating topic
 // (billing/reports/analytics); breakpoint-armed DAGs additionally carry
-// "breakpoints" and signal-gated ones "signals" — so `dag ls --label pipeline`
+// "breakpoints", signal-gated ones "signals", and start-paused ones
+// "start-paused" — so `dag ls --label pipeline`
 // returns all of them, `--label breakpoints` only the stopped ones,
 // `--label signals` only the ones awaiting approval, and `--label billing`
 // just that topic's subset (AND semantics across repeated --label).
@@ -50,6 +58,8 @@
 //	./bin/ebctl dag bp resume <dag-id> BeforeTransform
 //	./bin/ebctl dag bp resume <dag-id> BeforePublish
 //	./bin/ebctl dag bp resume <dag-id> BeforeNotify
+//	./bin/ebctl dag ls --status paused
+//	./bin/ebctl dag resume <dag-id>
 //	./bin/ebctl dag ls --sig-waiting
 //	./bin/ebctl dag ls --label signals
 //	./bin/ebctl dag signal ls <dag-id>
@@ -208,6 +218,7 @@ type config struct {
 	storeDir    string
 	bpEvery     int
 	signalEvery int
+	pausedEvery int
 }
 
 func main() {
@@ -218,6 +229,7 @@ func main() {
 	flag.StringVar(&cfg.storeDir, "store-dir", "", "persistent JetStream store (default: tempdir, wiped on exit)")
 	flag.IntVar(&cfg.bpEvery, "bp-every", 2, "arm breakpoints on every Nth DAG, starting with the first (0 = never)")
 	flag.IntVar(&cfg.signalEvery, "signal-every", 3, "add a signal-gated release step to every Nth DAG, starting with the first (0 = never)")
+	flag.IntVar(&cfg.pausedEvery, "paused-every", 0, "submit every Nth DAG with StartPaused, starting with the first (0 = never)")
 	flag.Parse()
 
 	if err := run(cfg); err != nil {
@@ -321,8 +333,9 @@ func run(cfg config) error {
 		n := submitted.Add(1)
 		armBPs := cfg.bpEvery > 0 && (n-1)%uint64(cfg.bpEvery) == 0
 		withSignal := cfg.signalEvery > 0 && (n-1)%uint64(cfg.signalEvery) == 0
-		labels := dagLabels(n, armBPs, withSignal)
-		id, err := submitDAG(ctx, wf, armBPs, withSignal, labels)
+		startPaused := cfg.pausedEvery > 0 && (n-1)%uint64(cfg.pausedEvery) == 0
+		labels := dagLabels(n, armBPs, withSignal, startPaused)
+		id, err := submitDAG(ctx, wf, armBPs, withSignal, startPaused, labels)
 		if err != nil {
 			log.Printf("submit: %v", err)
 			return
@@ -334,6 +347,10 @@ func run(cfg config) error {
 		} else {
 			log.Printf("submitted DAG #%d id=%s", n, id)
 			log.Printf("  try:  ebctl -s %s dag get %s", node.ClientURL(), id)
+		}
+		if startPaused {
+			log.Printf("  ⏸ submitted paused: nothing runs until resumed:")
+			log.Printf("  resume: ebctl -s %s dag resume %s", node.ClientURL(), id)
 		}
 		if withSignal {
 			log.Printf("  ⚑ release waits for the \"approval\" signal:")
@@ -377,15 +394,18 @@ var topicPool = []string{"billing", "reports", "analytics"}
 
 // dagLabels builds the immutable WithLabels set for the Nth DAG: a constant
 // "pipeline" tag (matches every playground DAG), a rotating topic,
-// "breakpoints" when this run is armed to stop, and "signals" when it carries
-// the approval-gated release step.
-func dagLabels(n uint64, armBPs, withSignal bool) []string {
+// "breakpoints" when this run is armed to stop, "signals" when it carries
+// the approval-gated release step, and "start-paused" when submitted paused.
+func dagLabels(n uint64, armBPs, withSignal, startPaused bool) []string {
 	labels := []string{"pipeline", topicPool[(n-1)%uint64(len(topicPool))]}
 	if armBPs {
 		labels = append(labels, "breakpoints")
 	}
 	if withSignal {
 		labels = append(labels, "signals")
+	}
+	if startPaused {
+		labels = append(labels, "start-paused")
 	}
 	return labels
 }
@@ -396,7 +416,8 @@ func dagLabels(n uint64, armBPs, withSignal bool) []string {
 // armBPs decides at submit time whether this execution stops at them.
 // withSignal appends the approval-gated release step (signals have no arming
 // concept — a declared wait always gates, so the step is added conditionally).
-func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal bool, labels []string) (string, error) {
+// startPaused submits it paused: nothing runs until `ebctl dag resume`.
+func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal, startPaused bool, labels []string) (string, error) {
 	// Fast-giving-up retry policy — transform-b goes to DLQ after 3 attempts
 	// so the user sees DLQ entries within ~10s rather than after a minute.
 	quickRetry := task.RetryPolicy{
@@ -467,6 +488,9 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal bo
 	var opts []workflow.SubmitOption
 	if armBPs {
 		opts = append(opts, workflow.WithActiveBreakpoints(armedBPLabels...))
+	}
+	if startPaused {
+		opts = append(opts, workflow.StartPaused())
 	}
 	if err := dag.Submit(ctx, wf, opts...); err != nil {
 		return "", err

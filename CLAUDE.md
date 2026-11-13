@@ -184,7 +184,10 @@ releases one step at one position and never pre-releases a step that has not
 reached its breakpoint (that would silently consume a stop). The pause `Held`
 fence and BP state are separate fields by design — DAG `Resume` and the
 orphan-hold sweep touch only `Held`/`HeldAt`, BP releases touch only BP
-state; the two fences compose. Never merge them.
+state; the two fences compose. Never merge them. `StartPaused` uses only the
+pause fence: meta is created paused and every step created `Held` (never
+create-then-hold, so no sweep sees an unheld root), and Submit skips the
+root-enqueue loop.
 
 Breakpoint transitions are announced as **informational** `bp_hit`/`bp_resumed`
 events (published best-effort by the advisory-mark CAS winner and by
