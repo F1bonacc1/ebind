@@ -2,7 +2,7 @@ module github.com/f1bonacc1/ebind
 
 go 1.26.1
 
-toolchain go1.26.9
+toolchain go1.26.11
 
 require (
 	github.com/google/uuid v1.6.0

@@ -54,12 +54,32 @@ func NewNatsStore(ctx context.Context, js jetstream.JetStream, replicas int) (*N
 	if err != nil {
 		return nil, fmt.Errorf("workflow: create/open KV: %w", err)
 	}
+	return newNatsStore(js, kv), nil
+}
+
+// OpenNatsStore opens the existing KV bucket without creating or reconfiguring
+// it. Use it from tools that do not own the deployment (ebctl): NewNatsStore's
+// create-or-update would rewrite the bucket config, e.g. scale an R=3 bucket
+// down to the replicas the tool happened to pass. A missing bucket returns an
+// error wrapping jetstream.ErrBucketNotFound.
+func OpenNatsStore(ctx context.Context, js jetstream.JetStream) (*NatsStore, error) {
+	kv, err := js.KeyValue(ctx, kvBucketName)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrBucketNotFound) {
+			return nil, fmt.Errorf("workflow: KV bucket %q not found (no worker has provisioned it): %w", kvBucketName, err)
+		}
+		return nil, fmt.Errorf("workflow: open KV: %w", err)
+	}
+	return newNatsStore(js, kv), nil
+}
+
+func newNatsStore(js jetstream.JetStream, kv jetstream.KeyValue) *NatsStore {
 	opts := js.Options()
 	timeout := opts.DefaultTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	return &NatsStore{kv: kv, nc: js.Conn(), apiPrefix: jsAPIPrefix(opts), timeout: timeout}, nil
+	return &NatsStore{kv: kv, nc: js.Conn(), apiPrefix: jsAPIPrefix(opts), timeout: timeout}
 }
 
 // jsAPIPrefix derives the JetStream API subject prefix the way jetstream does:
@@ -101,6 +121,23 @@ func (s *NatsStore) GetMeta(ctx context.Context, dagID string) (DAGMeta, uint64,
 		return DAGMeta{}, 0, err
 	}
 	return meta, entry.Revision(), nil
+}
+
+// GetMetaLatest reads meta through the stream leader (leaderMsg), never a
+// direct get, so it reflects every committed write.
+func (s *NatsStore) GetMetaLatest(ctx context.Context, dagID string) (DAGMeta, uint64, error) {
+	val, seq, live, err := s.leaderMsg(ctx, kvSubjectPrefix+metaKey(dagID))
+	if err != nil {
+		return DAGMeta{}, 0, err
+	}
+	if !live {
+		return DAGMeta{}, 0, ErrDAGNotFound
+	}
+	var meta DAGMeta
+	if err := json.Unmarshal(val, &meta); err != nil {
+		return DAGMeta{}, 0, err
+	}
+	return meta, seq, nil
 }
 
 func (s *NatsStore) PutMeta(ctx context.Context, dagID string, meta DAGMeta, expectedRev uint64) error {
@@ -277,41 +314,50 @@ func (s *NatsStore) leaderSubjects(ctx context.Context, filter string) ([]string
 	return out, nil
 }
 
-// leaderLastMsg reads the last message on subj through the non-direct
+// leaderLastMsg reads the last message on subj through the stream leader;
+// see leaderMsg.
+func (s *NatsStore) leaderLastMsg(ctx context.Context, subj string) ([]byte, bool, error) {
+	val, _, live, err := s.leaderMsg(ctx, subj)
+	return val, live, err
+}
+
+// leaderMsg reads the last message on subj through the non-direct
 // STREAM.MSG.GET API, which only the stream leader answers. jetstream's
 // Stream.GetLastMsgForSubject cannot stand in: it switches to a direct get
-// whenever the stream allows them, and KV buckets always do. The bool is false
-// for a delete/purge tombstone or a subject with no message left.
-func (s *NatsStore) leaderLastMsg(ctx context.Context, subj string) ([]byte, bool, error) {
+// whenever the stream allows them, and KV buckets always do. The sequence is
+// the KV revision. The bool is false for a delete/purge tombstone or a
+// subject with no message left.
+func (s *NatsStore) leaderMsg(ctx context.Context, subj string) ([]byte, uint64, bool, error) {
 	var resp struct {
 		Error   *jetstream.APIError `json:"error,omitempty"`
 		Message *struct {
+			Seq    uint64 `json:"seq"`
 			Header []byte `json:"hdrs,omitempty"`
 			Data   []byte `json:"data,omitempty"`
 		} `json:"message,omitempty"`
 	}
 	req := map[string]string{"last_by_subj": subj}
 	if err := s.apiRequest(ctx, "STREAM.MSG.GET."+kvStreamName, req, &resp); err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	switch {
 	case resp.Error != nil && resp.Error.ErrorCode == jetstream.JSErrCodeMessageNotFound:
-		return nil, false, nil
+		return nil, 0, false, nil
 	case resp.Error != nil:
-		return nil, false, resp.Error
+		return nil, 0, false, resp.Error
 	case resp.Message == nil:
-		return nil, false, jetstream.ErrInvalidJetStreamResponse
+		return nil, 0, false, jetstream.ErrInvalidJetStreamResponse
 	}
 	if len(resp.Message.Header) > 0 {
 		hdr, err := nats.DecodeHeadersMsg(resp.Message.Header)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, false, err
 		}
 		if op := hdr.Get("KV-Operation"); op == "DEL" || op == "PURGE" {
-			return nil, false, nil
+			return nil, 0, false, nil
 		}
 	}
-	return resp.Message.Data, true, nil
+	return resp.Message.Data, resp.Message.Seq, true, nil
 }
 
 // apiRequest sends a JetStream API request and decodes the JSON reply into
@@ -454,4 +500,86 @@ func (s *NatsStore) WatchResult(ctx context.Context, dagID, stepID string) (<-ch
 		}
 	}()
 	return out, nil
+}
+
+// WatchDAG implements StateStore with a KV watch filtered to the DAG's meta
+// key and step keys. The watch is an ordered consumer reading the bucket's
+// stream in sequence, so unlike Get it is never answered by a lagging
+// replica: the snapshot plus updates is a consistent, ordered view.
+func (s *NatsStore) WatchDAG(ctx context.Context, dagID string) (<-chan DAGChange, error) {
+	stepPrefix := dagID + keyStepPrefix
+	w, err := s.kv.WatchFiltered(ctx, []string{metaKey(dagID), stepPrefix + ">"})
+	if err != nil {
+		return nil, fmt.Errorf("workflow: watch DAG %q: %w", dagID, err)
+	}
+	out := make(chan DAGChange, 64)
+	go func() {
+		defer close(out)
+		defer func() { _ = w.Stop() }()
+		send := func(c DAGChange) bool {
+			select {
+			case out <- c:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		for {
+			var entry jetstream.KeyValueEntry
+			var ok bool
+			select {
+			case <-ctx.Done():
+				return
+			case entry, ok = <-w.Updates():
+				if !ok {
+					return
+				}
+			}
+			if entry == nil {
+				if !send(DAGChange{Synced: true}) {
+					return
+				}
+				continue
+			}
+			c, ok := natsDAGChange(entry, dagID, stepPrefix)
+			if !ok {
+				continue
+			}
+			if !send(c) {
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
+// natsDAGChange converts one watched KV entry into a DAGChange. Entries that
+// do not belong to the DAG or do not decode are skipped (ok=false): a
+// malformed record is not something a watcher can act on, and every reader
+// of the same key already reports the decode error.
+func natsDAGChange(entry jetstream.KeyValueEntry, dagID, stepPrefix string) (DAGChange, bool) {
+	key := entry.Key()
+	deleted := entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge
+	switch {
+	case key == metaKey(dagID):
+		if deleted {
+			return DAGChange{Deleted: DeletedMeta}, true
+		}
+		var meta DAGMeta
+		if err := json.Unmarshal(entry.Value(), &meta); err != nil {
+			return DAGChange{}, false
+		}
+		return DAGChange{Meta: &meta}, true
+	case strings.HasPrefix(key, stepPrefix):
+		stepID := strings.TrimPrefix(key, stepPrefix)
+		if deleted {
+			return DAGChange{Deleted: stepID}, true
+		}
+		var rec StepRecord
+		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
+			return DAGChange{}, false
+		}
+		return DAGChange{Step: &rec}, true
+	}
+	return DAGChange{}, false
 }

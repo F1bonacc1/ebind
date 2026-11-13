@@ -23,12 +23,18 @@ import (
 )
 
 // newTestCtx wires a cli.Context around a running NATS harness and a JSON printer,
-// so table-less invocations are easy to assert.
+// so table-less invocations are easy to assert. It provisions the workflow KV
+// bucket and events stream the way a worker would: ebctl only opens them.
 func newTestCtx(t *testing.T, h *testutil.Harness, fmtName string) *cli.Context {
 	t.Helper()
 	p, err := format.New(fmtName)
 	if err != nil {
 		t.Fatal(err)
+	}
+	provisionCtx, provisionCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer provisionCancel()
+	if _, err := workflow.NewFromNATS(provisionCtx, h.Conn, 1); err != nil {
+		t.Fatalf("provision workflow: %v", err)
 	}
 	c := cli.NewContext()
 	c.NC = h.Conn
@@ -379,3 +385,297 @@ func jsonRowsContain(t *testing.T, raw []byte, key, val string) bool {
 
 var _ jetstream.JetStream // keep import aligned with the harness
 var _ = jsonRowsContain
+
+func TestDagBPRelease(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// a is done; upload-eu and upload-us both stop before running at label X.
+	const dagID = "dag-bp-release"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+		ArmedMatchers: []workflow.BPMatcher{workflow.BeforeLabel("X")},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, rec := range []workflow.StepRecord{
+		{DAGID: dagID, StepID: "a", Status: workflow.StatusDone, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "upload-eu", Status: workflow.StatusPending, FnName: "test.noop",
+			Deps: []string{"a"}, BreakBefore: []string{"X"}, AddedAt: now},
+		{DAGID: dagID, StepID: "upload-us", Status: workflow.StatusPending, FnName: "test.noop",
+			Deps: []string{"a"}, BreakBefore: []string{"X"}, AddedAt: now},
+	} {
+		if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	release := func(args ...string) map[string]any {
+		t.Helper()
+		root := cmddag.NewCmd(c)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs(append([]string{"bp", "release"}, args...))
+		if err := root.Execute(); err != nil {
+			t.Fatalf("bp release %v: %v", args, err)
+		}
+		var res map[string]any
+		if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+			t.Fatalf("bp release %v: bad json %q: %v", args, out.String(), err)
+		}
+		return res
+	}
+
+	if res := release(dagID, "upload-eu"); res["released"] != true || res["position"] != "before" {
+		t.Errorf("first release = %v, want released before", res)
+	}
+	if res := release(dagID, "upload-eu"); res["released"] != false {
+		t.Errorf("repeat release = %v, want released=false", res)
+	}
+	if res := release(dagID, "upload-us", "--position", "after"); res["released"] != false {
+		t.Errorf("after position on a pending step = %v, want released=false", res)
+	}
+
+	eu, _, _ := wf.Store.GetStep(ctx, dagID, "upload-eu")
+	us, _, _ := wf.Store.GetStep(ctx, dagID, "upload-us")
+	if eu.BPBefore != workflow.BPStateReleased {
+		t.Errorf("upload-eu bp_before = %q, want released", eu.BPBefore)
+	}
+	if us.BPBefore == workflow.BPStateReleased {
+		t.Error("upload-us must stay stopped")
+	}
+
+	root := cmddag.NewCmd(c)
+	root.SetOut(&bytes.Buffer{})
+	root.SetArgs([]string{"bp", "release", dagID, "ghost"})
+	if err := root.Execute(); !errors.Is(err, workflow.ErrStepNotFound) {
+		t.Errorf("unknown step: err = %v, want ErrStepNotFound", err)
+	}
+	root = cmddag.NewCmd(c)
+	root.SetOut(&bytes.Buffer{})
+	root.SetArgs([]string{"bp", "release", dagID, "upload-us", "--position", "during"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "--position") {
+		t.Errorf("bad position: err = %v", err)
+	}
+}
+
+func TestDagBPWait(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// a is done; upload-eu and upload-us are stopped before running at X.
+	const dagID = "dag-bp-wait"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+		ArmedMatchers: []workflow.BPMatcher{workflow.BeforeLabel("X")},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, rec := range []workflow.StepRecord{
+		{DAGID: dagID, StepID: "a", Status: workflow.StatusDone, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "upload-eu", Status: workflow.StatusPending, FnName: "test.noop",
+			Deps: []string{"a"}, BreakBefore: []string{"X"}, AddedAt: now},
+		{DAGID: dagID, StepID: "upload-us", Status: workflow.StatusPending, FnName: "test.noop",
+			Deps: []string{"a"}, BreakBefore: []string{"X"}, AddedAt: now},
+	} {
+		if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run := func(args ...string) (string, error) {
+		root := cmddag.NewCmd(c)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs(append([]string{"bp", "wait"}, args...))
+		err := root.Execute()
+		return out.String(), err
+	}
+
+	out, err := run(dagID, "--before", "--step", "upload-us")
+	if err != nil {
+		t.Fatalf("bp wait upload-us: %v", err)
+	}
+	var info workflow.BreakpointInfo
+	if err := json.Unmarshal([]byte(out), &info); err != nil {
+		t.Fatalf("bad json %q: %v", out, err)
+	}
+	if info.StepID != "upload-us" || info.Position != workflow.BPPositionBefore || info.State != workflow.BPStateBlocked {
+		t.Errorf("info = %+v, want upload-us stopped before", info)
+	}
+
+	if _, err := run(dagID, "--after", "--step", "upload-*", "--wait-timeout", "300ms"); err == nil || !strings.Contains(err.Error(), "within 300ms") {
+		t.Errorf("nothing stopped after: err = %v, want timeout", err)
+	}
+	if _, err := run(dagID, "--step", "upload-*"); err == nil || !strings.Contains(err.Error(), "--before or --after") {
+		t.Errorf("missing position: err = %v", err)
+	}
+	if _, err := run("ghost", "--before", "--step", "x"); !errors.Is(err, workflow.ErrDAGNotFound) {
+		t.Errorf("unknown DAG: err = %v, want ErrDAGNotFound", err)
+	}
+}
+
+func TestDagBPContinueAndLsDefaults(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// node-1 and node-2 are stopped by a matcher; "decl" declares an unarmed label.
+	const dagID = "dag-bp-continue"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+		ArmedMatchers: []workflow.BPMatcher{workflow.BeforeStep("node-*")},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, rec := range []workflow.StepRecord{
+		{DAGID: dagID, StepID: "node-1", Status: workflow.StatusPending, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "node-2", Status: workflow.StatusPending, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "decl", Status: workflow.StatusPending, FnName: "test.noop", BreakBefore: []string{"Z"}, AddedAt: now},
+	} {
+		if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run := func(args ...string) []byte {
+		t.Helper()
+		root := cmddag.NewCmd(c)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs(append([]string{"bp"}, args...))
+		if err := root.Execute(); err != nil {
+			t.Fatalf("bp %v: %v", args, err)
+		}
+		return out.Bytes()
+	}
+	count := func(raw []byte) int {
+		t.Helper()
+		var infos []workflow.BreakpointInfo
+		if err := json.Unmarshal(raw, &infos); err != nil {
+			t.Fatalf("bad json %q: %v", raw, err)
+		}
+		return len(infos)
+	}
+	if n := count(run("ls", dagID)); n != 2 {
+		t.Errorf("bp ls (armed only) = %d entries, want 2", n)
+	}
+	if n := count(run("ls", dagID, "--all")); n != 3 {
+		t.Errorf("bp ls --all = %d entries, want 3", n)
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(run("continue", dagID, "--before", "--step", "node-*"), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res["released"] != float64(2) || res["matcher"] != "before:step:node-*" {
+		t.Errorf("continue = %v, want 2 released", res)
+	}
+	if n := count(run("ls", dagID, "--blocked")); n != 0 {
+		t.Errorf("bp ls --blocked after continue = %d, want 0", n)
+	}
+}
+
+func TestDagBPArmDisarm(t *testing.T) {
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1})
+	c := newTestCtx(t, h, "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	wf, err := c.Workflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// "build" is running; node-1 and node-2 are pending behind it. Nothing
+	// is armed at submit.
+	const dagID = "dag-bp-arm"
+	if err := wf.Store.PutMeta(ctx, dagID, workflow.DAGMeta{
+		ID: dagID, Status: workflow.DAGStatusRunning, CreatedAt: time.Now().UTC(),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, rec := range []workflow.StepRecord{
+		{DAGID: dagID, StepID: "build", Status: workflow.StatusRunning, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "node-1", Deps: []string{"build"}, Status: workflow.StatusPending, FnName: "test.noop", AddedAt: now},
+		{DAGID: dagID, StepID: "node-2", Deps: []string{"build"}, Status: workflow.StatusPending, FnName: "test.noop", AddedAt: now},
+	} {
+		if _, err := wf.Store.PutStep(ctx, dagID, rec.StepID, rec, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run := func(args ...string) map[string]any {
+		t.Helper()
+		root := cmddag.NewCmd(c)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs(append([]string{"bp"}, args...))
+		if err := root.Execute(); err != nil {
+			t.Fatalf("bp %v: %v", args, err)
+		}
+		var res map[string]any
+		if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+			t.Fatalf("bad json %q: %v", out.Bytes(), err)
+		}
+		return res
+	}
+	join := func(v any) string {
+		var parts []string
+		for _, x := range v.([]any) {
+			parts = append(parts, x.(string))
+		}
+		return strings.Join(parts, ",")
+	}
+
+	res := run("arm", dagID, "--before", "--step", "*")
+	if join(res["added"]) != "before:step:*" || join(res["stopped"]) != "node-1@before,node-2@before" ||
+		join(res["missed"]) != "build@before" {
+		t.Errorf("arm = %v", res)
+	}
+	res = run("arm", dagID, "--before", "--step", "*")
+	if join(res["added"]) != "" {
+		t.Errorf("repeat arm added = %v, want none", res["added"])
+	}
+	rec, _, err := wf.Store.GetStep(ctx, dagID, "node-1")
+	if err != nil || strings.Join(rec.BPFence, ",") != "b:before:step:*" {
+		t.Fatalf("node-1 fence = %v, %v", rec.BPFence, err)
+	}
+
+	res = run("disarm", dagID, "--before", "--step", "*")
+	if res["matcher"] != "before:step:*" || res["released"] != float64(0) {
+		t.Errorf("disarm = %v (nothing had arrived at the breakpoint yet)", res)
+	}
+	rec, _, _ = wf.Store.GetStep(ctx, dagID, "node-1")
+	meta, _, _ := wf.Store.GetMeta(ctx, dagID)
+	if len(rec.BPFence) != 0 || len(meta.ArmedMatchers) != 0 {
+		t.Errorf("after disarm: fence %v, armed %v", rec.BPFence, meta.ArmedMatchers)
+	}
+
+	root := cmddag.NewCmd(c)
+	root.SetOut(&bytes.Buffer{})
+	root.SetArgs([]string{"bp", "arm", dagID, "--step", "x"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "--before or --after") {
+		t.Errorf("missing position: err = %v", err)
+	}
+}

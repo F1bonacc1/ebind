@@ -30,3 +30,27 @@ func NewFromNATS(ctx context.Context, nc *nats.Conn, replicas int) (*Workflow, e
 	enq := NewNatsEnqueuer(js)
 	return NewWorkflow(store, bus, enq), nil
 }
+
+// OpenFromNATS is NewFromNATS for tools that do not own the deployment, such
+// as ebctl: it opens the existing KV bucket and events stream and never
+// creates or reconfigures them, so it cannot change their replica count or
+// any other setting. It fails if no worker has provisioned them yet.
+//
+// Subscribing on the returned Workflow's Bus (running a scheduler) still
+// creates or updates the shared durable consumer; operator tools must not do
+// that.
+func OpenFromNATS(ctx context.Context, nc *nats.Conn) (*Workflow, error) {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, fmt.Errorf("workflow: jetstream: %w", err)
+	}
+	store, err := OpenNatsStore(ctx, js)
+	if err != nil {
+		return nil, err
+	}
+	bus, err := OpenNatsBus(ctx, js)
+	if err != nil {
+		return nil, err
+	}
+	return NewWorkflow(store, bus, NewNatsEnqueuer(js)), nil
+}

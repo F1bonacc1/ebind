@@ -5,10 +5,14 @@
 // around.
 //
 // Breakpoints: every -bp-every'th DAG (default: every 2nd, starting with the
-// first) is submitted with three breakpoints armed:
+// first) is submitted with four breakpoints armed:
 //
 //	validate  BreakAfter("AfterValidate", "Checkpoint") — validate completes,
 //	          then holds all three transform branches; resumable via either label
+//	transform-a/b/c  matcher BeforeFn("main.Transform*"), armed at Submit with
+//	          no breakpoint declared on the steps — once validate is resumed,
+//	          each branch stops again before running; `dag bp release` lets one
+//	          branch through while the others stay stopped
 //	publish   BreakBefore("BeforePublish") — aggregate result inspectable
 //	          before the side-effecting publish step runs
 //	notify    BreakBefore("BeforeNotify") — blocks the independent metrics
@@ -22,12 +26,31 @@
 //	ebctl dag signal ls <dag-id>
 //	ebctl dag signal <dag-id> approval '{"approver":"you","note":"lgtm"}'
 //
+// Start paused: with -paused-every N, every Nth DAG (starting with the first)
+// is submitted with StartPaused: written paused with every step held, so
+// nothing runs until the operator resumes it:
+//
+//	ebctl dag ls --status paused
+//	ebctl dag resume <dag-id>
+//
+// Runtime breakpoints: with -arm-running D, every DAG submitted without
+// breakpoints or StartPaused gets BeforeFn("main.Publish") armed D after
+// Submit, while it runs (ArmBreakpoints). Its publish step stops when it
+// arrives; disarm it to let it run:
+//
+//	ebctl dag bp disarm <dag-id> --before --fn main.Publish
+//
 // Labels: every DAG is tagged "pipeline" plus a rotating topic
 // (billing/reports/analytics); breakpoint-armed DAGs additionally carry
-// "breakpoints" and signal-gated ones "signals" — so `dag ls --label pipeline`
+// "breakpoints", signal-gated ones "signals", and start-paused ones
+// "start-paused" — so `dag ls --label pipeline`
 // returns all of them, `--label breakpoints` only the stopped ones,
 // `--label signals` only the ones awaiting approval, and `--label billing`
 // just that topic's subset (AND semantics across repeated --label).
+//
+// Submit hook: submitDAG passes no submit options. One hook registered with
+// wf.UseSubmitHook reads these labels and arms the breakpoints
+// ("breakpoints") or starts the DAG paused ("start-paused").
 //
 // Typical session:
 //
@@ -42,9 +65,16 @@
 //	./bin/ebctl dag ls --label billing
 //	./bin/ebctl dag get <dag-id>
 //	./bin/ebctl dag bp ls <dag-id>
+//	./bin/ebctl dag bp wait <dag-id> --before --step 'transform-*' --wait-timeout 2m
 //	./bin/ebctl dag bp resume <dag-id> Checkpoint
+//	./bin/ebctl dag bp release <dag-id> transform-a --position before
+//	./bin/ebctl dag bp continue <dag-id> --before --fn 'main.Transform*'
 //	./bin/ebctl dag bp resume <dag-id> BeforePublish
 //	./bin/ebctl dag bp resume <dag-id> BeforeNotify
+//	./bin/ebctl dag ls --status paused
+//	./bin/ebctl dag resume <dag-id>
+//	./bin/ebctl dag bp arm <dag-id> --before --step aggregate
+//	./bin/ebctl dag bp disarm <dag-id> --before --fn main.Publish
 //	./bin/ebctl dag ls --sig-waiting
 //	./bin/ebctl dag ls --label signals
 //	./bin/ebctl dag signal ls <dag-id>
@@ -67,6 +97,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -203,6 +234,8 @@ type config struct {
 	storeDir    string
 	bpEvery     int
 	signalEvery int
+	pausedEvery int
+	armRunning  time.Duration
 }
 
 func main() {
@@ -213,6 +246,8 @@ func main() {
 	flag.StringVar(&cfg.storeDir, "store-dir", "", "persistent JetStream store (default: tempdir, wiped on exit)")
 	flag.IntVar(&cfg.bpEvery, "bp-every", 2, "arm breakpoints on every Nth DAG, starting with the first (0 = never)")
 	flag.IntVar(&cfg.signalEvery, "signal-every", 3, "add a signal-gated release step to every Nth DAG, starting with the first (0 = never)")
+	flag.IntVar(&cfg.pausedEvery, "paused-every", 0, "submit every Nth DAG with StartPaused, starting with the first (0 = never)")
+	flag.DurationVar(&cfg.armRunning, "arm-running", 0, "this long after submitting a DAG with no breakpoints, arm before:fn:main.Publish on it at runtime (0 = never)")
 	flag.Parse()
 
 	if err := run(cfg); err != nil {
@@ -278,6 +313,9 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	// Run-time submit decisions live in one hook, keyed on DAG labels;
+	// submitDAG passes no submit options at all.
+	wf.UseSubmitHook(playgroundSubmitHook)
 
 	reg := task.NewRegistry()
 	for _, fn := range []any{
@@ -316,19 +354,24 @@ func run(cfg config) error {
 		n := submitted.Add(1)
 		armBPs := cfg.bpEvery > 0 && (n-1)%uint64(cfg.bpEvery) == 0
 		withSignal := cfg.signalEvery > 0 && (n-1)%uint64(cfg.signalEvery) == 0
-		labels := dagLabels(n, armBPs, withSignal)
-		id, err := submitDAG(ctx, wf, armBPs, withSignal, labels)
+		startPaused := cfg.pausedEvery > 0 && (n-1)%uint64(cfg.pausedEvery) == 0
+		labels := dagLabels(n, armBPs, withSignal, startPaused)
+		id, err := submitDAG(ctx, wf, withSignal, labels)
 		if err != nil {
 			log.Printf("submit: %v", err)
 			return
 		}
 		if armBPs {
-			log.Printf("submitted DAG #%d id=%s  ⦿ breakpoints armed: %s", n, id, strings.Join(armedBPLabels, ", "))
+			log.Printf("submitted DAG #%d id=%s  ⦿ breakpoints armed: %s, %s", n, id, strings.Join(armedBPLabels, ", "), transformMatcher.Key())
 			log.Printf("  watch:  ebctl -s %s dag bp ls %s", node.ClientURL(), id)
 			log.Printf("  resume: ebctl -s %s dag bp resume %s Checkpoint", node.ClientURL(), id)
 		} else {
 			log.Printf("submitted DAG #%d id=%s", n, id)
 			log.Printf("  try:  ebctl -s %s dag get %s", node.ClientURL(), id)
+		}
+		if startPaused {
+			log.Printf("  ⏸ submitted paused: nothing runs until resumed:")
+			log.Printf("  resume: ebctl -s %s dag resume %s", node.ClientURL(), id)
 		}
 		if withSignal {
 			log.Printf("  ⚑ release waits for the \"approval\" signal:")
@@ -337,6 +380,9 @@ func run(cfg config) error {
 		}
 		log.Printf("  labels: [%s] — e.g. ebctl -s %s dag ls --label %s",
 			strings.Join(labels, ","), node.ClientURL(), labels[len(labels)-1])
+		if cfg.armRunning > 0 && !armBPs && !startPaused {
+			go armRunning(ctx, wf, id, cfg.armRunning, node.ClientURL())
+		}
 	}
 
 	submit()
@@ -366,15 +412,19 @@ shutdown:
 // SECOND label — resuming works through either one ("any label" semantics).
 var armedBPLabels = []string{"Checkpoint", "BeforePublish", "BeforeNotify"}
 
+// transformMatcher stops all three transform branches with one glob over
+// their function names; the transform steps declare no breakpoint at all.
+var transformMatcher = workflow.BeforeFn("main.Transform*")
+
 // topicPool rotates a topic tag across submissions so `dag ls --label <topic>`
 // returns a subset rather than everything.
 var topicPool = []string{"billing", "reports", "analytics"}
 
 // dagLabels builds the immutable WithLabels set for the Nth DAG: a constant
 // "pipeline" tag (matches every playground DAG), a rotating topic,
-// "breakpoints" when this run is armed to stop, and "signals" when it carries
-// the approval-gated release step.
-func dagLabels(n uint64, armBPs, withSignal bool) []string {
+// "breakpoints" when this run is armed to stop, "signals" when it carries
+// the approval-gated release step, and "start-paused" when submitted paused.
+func dagLabels(n uint64, armBPs, withSignal, startPaused bool) []string {
 	labels := []string{"pipeline", topicPool[(n-1)%uint64(len(topicPool))]}
 	if armBPs {
 		labels = append(labels, "breakpoints")
@@ -382,16 +432,56 @@ func dagLabels(n uint64, armBPs, withSignal bool) []string {
 	if withSignal {
 		labels = append(labels, "signals")
 	}
+	if startPaused {
+		labels = append(labels, "start-paused")
+	}
 	return labels
+}
+
+// playgroundSubmitHook makes the run-time submit decisions from the DAG's
+// labels: "breakpoints" arms the breakpoints described in the package doc,
+// "start-paused" submits the DAG paused (nothing runs until
+// `ebctl dag resume`).
+func playgroundSubmitHook(_ context.Context, meta workflow.DAGMeta) ([]workflow.SubmitOption, error) {
+	var opts []workflow.SubmitOption
+	if slices.Contains(meta.Labels, "breakpoints") {
+		opts = append(opts, workflow.WithActiveBreakpoints(armedBPLabels...),
+			workflow.WithArmedBreakpoints(transformMatcher))
+	}
+	if slices.Contains(meta.Labels, "start-paused") {
+		opts = append(opts, workflow.StartPaused())
+	}
+	return opts, nil
 }
 
 // submitDAG builds and submits the complex DAG described in the package doc.
 // Returns the DAG's generated ID so the caller can surface it in logs.
-// Breakpoint labels are always declared on the steps (inert by default);
-// armBPs decides at submit time whether this execution stops at them.
-// withSignal appends the approval-gated release step (signals have no arming
-// concept — a declared wait always gates, so the step is added conditionally).
-func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal bool, labels []string) (string, error) {
+// Breakpoint labels are always declared on the steps (inert by default); the
+// labels decide, through playgroundSubmitHook, whether this execution stops
+// at them or starts paused. withSignal appends the approval-gated release
+// step (signals have no arming concept — a declared wait always gates, so the
+// step is added conditionally).
+// armRunning arms publishMatcher on a running DAG after delay, the way an
+// operator would with `ebctl dag bp arm`.
+func armRunning(ctx context.Context, wf *workflow.Workflow, id string, delay time.Duration, url string) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(delay):
+	}
+	rep, err := workflow.ArmBreakpoints(ctx, wf, id, publishMatcher)
+	if err != nil {
+		log.Printf("arm %s on %s: %v", publishMatcher.Key(), id, err)
+		return
+	}
+	log.Printf("⦿ armed %s on running DAG %s: stopped %v, missed %v", publishMatcher.Key(), id, rep.Stopped, rep.Missed)
+	log.Printf("  disarm: ebctl -s %s dag bp disarm %s --before --fn main.Publish", url, id)
+}
+
+// publishMatcher is what -arm-running arms at runtime.
+var publishMatcher = workflow.BeforeFn("main.Publish")
+
+func submitDAG(ctx context.Context, wf *workflow.Workflow, withSignal bool, labels []string) (string, error) {
 	// Fast-giving-up retry policy — transform-b goes to DLQ after 3 attempts
 	// so the user sees DLQ entries within ~10s rather than after a minute.
 	quickRetry := task.RetryPolicy{
@@ -416,7 +506,10 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal bo
 		[]workflow.StepOption{workflow.BreakAfter("AfterValidate", "Checkpoint")},
 		ingest.Ref())
 
-	// Fan out: three parallel transforms.
+	// Fan out: three parallel transforms. No breakpoint is declared here; when
+	// armed, transformMatcher stops each branch before it runs.
+	// `dag bp release <id> transform-a` lets one branch through;
+	// `dag bp continue <id> --before --fn 'main.Transform*'` releases the rest.
 	tA := dag.Step("transform-a", TransformA, validate.Ref())
 	tB := dag.Step("transform-b", TransformB, validate.Ref())
 	tC := dag.Step("transform-c", TransformC, validate.Ref())
@@ -456,11 +549,7 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal bo
 	)
 	_ = dag.Step("dependent-skip", Dependent, flaky.Ref())
 
-	var opts []workflow.SubmitOption
-	if armBPs {
-		opts = append(opts, workflow.WithActiveBreakpoints(armedBPLabels...))
-	}
-	if err := dag.Submit(ctx, wf, opts...); err != nil {
+	if err := dag.Submit(ctx, wf); err != nil {
 		return "", err
 	}
 	return dag.ID(), nil

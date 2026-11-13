@@ -8,6 +8,8 @@ go run ./examples/07-workflow-fanout
 # ...
 ```
 
+`make examples` runs all of them and fails if any exits non-zero or runs past its timeout (`EXAMPLE_TIMEOUT`, default 60s). Every example must terminate on its own.
+
 ## Index
 
 ### Task queue basics
@@ -32,10 +34,13 @@ go run ./examples/07-workflow-fanout
 | 11 | [`11-workflow-resume`](./11-workflow-resume) | Resume `Await` from a different process using `AwaitByID[T]` with `(dagID, stepID)` |
 | 12 | [`12-workflow-placement`](./12-workflow-placement) | `OnTarget`, `ColocateWith`, `FollowTargetOf`, and dynamic `ColocateHere()` across two workers |
 | 13 | [`13-workflow-cancel`](./13-workflow-cancel) | Cancel a DAG durably: running work may finish, pending downstream work is canceled |
-| 14 | [`14-workflow-pause-resume`](./14-workflow-pause-resume) | Pause a DAG gracefully: in-flight steps drain, pending steps are fenced; `Resume` continues where it left off |
-| 15 | [`15-workflow-breakpoints`](./15-workflow-breakpoints) | Step breakpoints: `BreakBefore`/`BreakAfter` labels armed via `WithActiveBreakpoints`; inspect state, then `ResumeBreakpoint` to continue |
+| 14 | [`14-workflow-pause-resume`](./14-workflow-pause-resume) | Pause a DAG gracefully: in-flight steps drain, pending steps are fenced; `Resume` continues where it left off; `StartPaused` submits a DAG that runs nothing until `Resume` |
+| 15 | [`15-workflow-breakpoints`](./15-workflow-breakpoints) | Step breakpoints: `BreakBefore`/`BreakAfter` labels armed via `WithActiveBreakpoints`; `WaitForBreakpoint` to block until a stop is reached, inspect state, `ReleaseStep` to let one fan-out branch through, then `ResumeBreakpoint` to continue the rest |
 | 16 | [`16-workflow-labels`](./16-workflow-labels) | Immutable `WithLabels` topic tags; query history by label with `ListDAGsByLabels` (AND semantics) — mirrors `ebctl dag ls --label` |
 | 17 | [`17-workflow-signals`](./17-workflow-signals) | External signals: `SignalRef`/`WaitForSignal` gate a step on a human approval; `workflow.Signal` delivers a payload the handler consumes (one-shot, buffered, first-wins) |
+| 18 | [`18-workflow-breakpoint-matchers`](./18-workflow-breakpoint-matchers) | Breakpoints on steps that declare none: `WithArmedBreakpoints(BeforeStep("upgrade-node-*"), AfterFn("main.Prepare"))` at submit; canary rollout with `ReleaseStep`, then `ReleaseMatching` for the rest |
+| 19 | [`19-workflow-submit-hook`](./19-workflow-submit-hook) | `wf.UseSubmitHook`: one hook starts DAGs labeled `debug` paused with `BeforeFn("main.Charge")` armed, while call sites pass no options; a hook error stores nothing and the DAG can be resubmitted |
+| 20 | [`20-workflow-runtime-breakpoints`](./20-workflow-runtime-breakpoints) | `ArmBreakpoints` on a DAG that is already running: the `ArmReport` shows the running step missed, dynamic steps added later still stop; `DisarmBreakpoints` lets them run, and disarm then re-arm still stops a step that had not arrived |
 
 ## Reading order
 
@@ -44,7 +49,7 @@ If you're new to ebind, walk the examples in order — each adds one concept on 
 1. **01 → 03**: basic task queue mechanics
 2. **04**: HA deployment topology
 3. **05**: extending the worker pipeline
-4. **06 → 17**: workflow layer, from simple linear to dynamic placement, cancellation, pause/resume, step breakpoints, querying history by label, and human-in-the-loop signals
+4. **06 → 20**: workflow layer, from simple linear to dynamic placement, cancellation, pause/resume, step breakpoints, querying history by label, human-in-the-loop signals, breakpoint matchers chosen at submit, submit hooks that choose them for every DAG, and arming them on a DAG that is already running
 
 ## Common shape
 
