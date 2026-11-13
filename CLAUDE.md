@@ -102,6 +102,7 @@ workflow/
   dag.go                 DAG builder, Submit, cycle detection
   scheduler.go           handleEvent + watchLeadership + sweep
   breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint
+  matcher.go             BPMatcher (position × step|fn|label pattern, path.Match globs) + Key/Validate/Matches (pure)
   signal.go              external signals: Signal (deliver), ComputeSignals/ListSignalInfo (observability)
   hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
   context.go             FromContext — dynamic step addition
@@ -117,7 +118,8 @@ cmd/demo/
 cmd/ebctl/               operator CLI (cobra)
   main.go                entrypoint
   internal/cli/          shared Context (NATS conn, Workflow, Printer); opens the
-                         workflow via OpenFromNATS (open-only, never reconfigures)
+                         workflow via OpenFromNATS (open-only, never reconfigures);
+                         matcher.go: shared --before|--after + --step|--fn|--label flags
   internal/commands/dag    dag ls/get/tree/step (get|result)/watch/cancel/rm
   internal/commands/dlq    dlq ls/show/watch/requeue/purge
   internal/commands/stream stream ls/info/consumer/peek/purge/rmmsg
@@ -128,7 +130,7 @@ cmd/ebctl/               operator CLI (cobra)
 
 - **Pure unit tests** — no NATS, no goroutines beyond test runner:
   - `task/retry_test.go`
-  - `workflow/state_test.go`, `workflow/ref_test.go`, `workflow/dag_test.go`
+  - `workflow/state_test.go`, `workflow/ref_test.go`, `workflow/dag_test.go`, `workflow/matcher_test.go`
 - **Unit with fakes** — MemStore + MemBus + captureEnq:
   - `workflow/scheduler_test.go`, `workflow/store_test.go`
   - `workflow/breakpoint_test.go` (pure gate-predicate tests + fakes-driven scheduler/resume tests)
