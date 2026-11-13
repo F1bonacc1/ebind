@@ -96,7 +96,7 @@ workflow/
   events_nats.go         JetStream events impl
   enqueuer.go            Enqueuer + LeaderElector interfaces
   enqueuer_nats.go       JetStream task enqueuer
-  workflow.go            Workflow coordinator struct
+  workflow.go            Workflow coordinator struct; SubmitHook + UseSubmitHook
   nats.go                NewFromNATS convenience constructor
   step.go                Step + StepOption
   dag.go                 DAG builder, Submit, cycle detection
@@ -135,7 +135,7 @@ cmd/ebctl/               operator CLI (cobra)
 - **Unit with fakes** — MemStore + MemBus + captureEnq:
   - `workflow/scheduler_test.go`, `workflow/store_test.go`
   - `workflow/breakpoint_test.go` (pure gate-predicate tests + fakes-driven scheduler/resume tests)
-  - `workflow/release_step_test.go`, `workflow/start_paused_test.go`, `workflow/wait_breakpoint_test.go`
+  - `workflow/release_step_test.go`, `workflow/start_paused_test.go`, `workflow/wait_breakpoint_test.go`, `workflow/matcher_gate_test.go`, `workflow/submit_hook_test.go`
   - `workflow/signal_test.go` (pure gate/ResolveArgs tests + fakes-driven Signal/scheduler tests)
 - **Integration** — real in-process NATS via `embed.StartNode`:
   - `worker/worker_test.go`, `workflow/integration_test.go`, `workflow/breakpoint_integration_test.go`, `workflow/signal_integration_test.go`
@@ -220,6 +220,9 @@ another fence's state. Terminal DAGs: `Signal` no-ops without writing;
 `DeleteDAG` must delete signal records (a re-created pinned `WithDAGID` DAG
 would inherit them). Roots get a signals snapshot at Submit (`dag.go`) since
 they bypass the scheduler gate.
+
+### Submit order: validate, hooks, validate options, then claim
+`DAG.Submit` validates structure under `d.mu`, releases it, runs the `SubmitHook`s (they may do I/O; their options go after the caller's), validates the merged options, and only then re-takes the lock and sets `submitted` (re-checking it: two concurrent Submits of one `*DAG`, one wins). A hook or option error therefore persists nothing and leaves the DAG resubmittable. Hooks get a copy of the provisional meta (ID, Labels, DefaultPolicy, CreatedAt). Dynamic steps never pass through Submit; matchers armed by a hook still gate them.
 
 ### Operator tools open, never create-or-update
 `NewFromNATS`/`NewNatsStore`/`NewNatsBus` use `CreateOrUpdate*`, which rewrites the whole bucket/stream config (replicas included) to whatever the caller passes. Only the deployment that owns the infrastructure (workers) may call them. `ebctl` and any other tool that attaches to a running deployment must use `OpenFromNATS` (`OpenNatsStore`/`OpenNatsBus`), which opens existing resources and errors if they are missing. Before v0.9 ebctl defaulted `--replicas 1` through the create path and silently scaled R=3 deployments to R=1. Regression test: `cmd/ebctl/open_only_test.go`.

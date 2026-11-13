@@ -39,6 +39,7 @@ go run ./examples/07-workflow-fanout
 | 16 | [`16-workflow-labels`](./16-workflow-labels) | Immutable `WithLabels` topic tags; query history by label with `ListDAGsByLabels` (AND semantics) — mirrors `ebctl dag ls --label` |
 | 17 | [`17-workflow-signals`](./17-workflow-signals) | External signals: `SignalRef`/`WaitForSignal` gate a step on a human approval; `workflow.Signal` delivers a payload the handler consumes (one-shot, buffered, first-wins) |
 | 18 | [`18-workflow-breakpoint-matchers`](./18-workflow-breakpoint-matchers) | Breakpoints on steps that declare none: `WithArmedBreakpoints(BeforeStep("upgrade-node-*"), AfterFn("main.Prepare"))` at submit; canary rollout with `ReleaseStep`, then `ReleaseMatching` for the rest |
+| 19 | [`19-workflow-submit-hook`](./19-workflow-submit-hook) | `wf.UseSubmitHook`: one hook starts DAGs labeled `debug` paused with `BeforeFn("main.Charge")` armed, while call sites pass no options; a hook error stores nothing and the DAG can be resubmitted |
 
 ## Reading order
 
@@ -47,7 +48,7 @@ If you're new to ebind, walk the examples in order — each adds one concept on 
 1. **01 → 03**: basic task queue mechanics
 2. **04**: HA deployment topology
 3. **05**: extending the worker pipeline
-4. **06 → 18**: workflow layer, from simple linear to dynamic placement, cancellation, pause/resume, step breakpoints, querying history by label, human-in-the-loop signals, and breakpoint matchers chosen at submit
+4. **06 → 19**: workflow layer, from simple linear to dynamic placement, cancellation, pause/resume, step breakpoints, querying history by label, human-in-the-loop signals, breakpoint matchers chosen at submit, and submit hooks that choose them for every DAG
 
 ## Common shape
 

@@ -142,6 +142,7 @@ Key behaviors:
 - From inside a handler, `workflow.FromContext(ctx).Step(...)` adds more steps dynamically.
 - `workflow.Pause` / `workflow.Resume` - graceful whole-DAG pause: in-flight steps drain, pending steps are fenced.
 - `dag.Submit(ctx, wf, workflow.StartPaused())` - submit a DAG paused, every step held, so nothing runs until `Resume` (or `ebctl dag resume`). Unlike `Pause` right after `Submit`, which races the already-enqueued roots, nothing can start in between.
+- `wf.UseSubmitHook(func(ctx, meta workflow.DAGMeta) ([]workflow.SubmitOption, error))` - decide submit options for every DAG in one place, e.g. start DAGs labeled `debug` paused with breakpoints armed, without touching each `Submit` call site. The hook sees the DAG's ID and labels before anything is persisted; its options are added after the caller's; an error fails the `Submit` with nothing stored, and the same DAG can be submitted again.
 - `workflow.Cancel` - durable cancel (also `ebctl dag cancel`): pending steps flip to canceled immediately; running steps may finish but schedule no follow-on work.
 - `workflow.OnTarget("gpu")` and friends - pin steps to specific workers (see below).
 - `workflow.SignalRef("approval")` / `workflow.WaitForSignal(...)` - gate a step on an external event; `workflow.Signal` delivers it with a payload (see below).
@@ -369,7 +370,7 @@ cmd/ebctl/    operator CLI: inspect DAGs/steps/results, DLQ, streams
 
 ## Examples
 
-[`examples/`](./examples) holds 18 self-contained runnable programs, each starting its own embedded NATS - from basic enqueue/await through retries, middleware, and cluster HA to every workflow feature (fan-out, optional steps, dynamic steps, temporal deps, placement, cancel, pause/resume, breakpoints and breakpoint matchers, label queries, signals). Start with the [index](./examples/README.md).
+[`examples/`](./examples) holds 19 self-contained runnable programs, each starting its own embedded NATS - from basic enqueue/await through retries, middleware, and cluster HA to every workflow feature (fan-out, optional steps, dynamic steps, temporal deps, placement, cancel, pause/resume, breakpoints and breakpoint matchers, submit hooks, label queries, signals). Start with the [index](./examples/README.md).
 
 ## Development
 

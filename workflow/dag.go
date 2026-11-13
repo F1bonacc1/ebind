@@ -420,11 +420,13 @@ func (d *DAG) detectCycles() error {
 // Run-time decisions are passed as SubmitOptions — e.g.
 // WithActiveBreakpoints arms step breakpoints for this execution, and
 // StartPaused submits it paused so nothing runs until Resume.
+//
+// Submit hooks registered with Workflow.UseSubmitHook run after validation
+// and before anything is persisted; their options are applied after opts. If
+// a hook or the merged options fail, nothing is persisted and the DAG can be
+// submitted again.
 func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) error {
-	var so submitOptions
-	for _, opt := range opts {
-		opt(&so)
-	}
+	// 1. Structural validation under the lock.
 	d.mu.Lock()
 	if d.submitted {
 		d.mu.Unlock()
@@ -452,14 +454,45 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 			return err
 		}
 	}
-	armed, err := so.armedMatcherSet()
-	if err != nil {
-		d.mu.Unlock()
-		return err
-	}
 	if slices.Contains(d.labels, "") {
 		d.mu.Unlock()
 		return fmt.Errorf("workflow: WithLabels label must be non-empty")
+	}
+	labels := dedupeStrings(d.labels)
+	d.mu.Unlock()
+
+	// 2. Submit hooks, outside the lock (they may do I/O). Their options go
+	// after the caller's. A hook error leaves the DAG unsubmitted (and
+	// resubmittable) with nothing persisted.
+	now := time.Now().UTC()
+	provisional := DAGMeta{ID: d.id, CreatedAt: now, DefaultPolicy: d.defaultPolicy, Labels: labels}
+	all := slices.Clone(opts)
+	for _, h := range wf.submitHookList() {
+		more, err := h(ctx, cloneMetaForHook(provisional))
+		if err != nil {
+			return fmt.Errorf("workflow: submit hook: %w", err)
+		}
+		all = append(all, more...)
+	}
+
+	// 3. Validate the merged options.
+	var so submitOptions
+	for _, opt := range all {
+		if opt != nil {
+			opt(&so)
+		}
+	}
+	armed, err := so.armedMatcherSet()
+	if err != nil {
+		return err
+	}
+
+	// 4. Claim the DAG. Re-check: a concurrent Submit of the same *DAG may
+	// have claimed it while the hooks ran.
+	d.mu.Lock()
+	if d.submitted {
+		d.mu.Unlock()
+		return fmt.Errorf("workflow: DAG %s already submitted", d.id)
 	}
 	d.submitted = true
 	d.mu.Unlock()
@@ -475,14 +508,13 @@ func (d *DAG) Submit(ctx context.Context, wf *Workflow, opts ...SubmitOption) er
 	}
 
 	// Persist meta.
-	now := time.Now().UTC()
 	meta := DAGMeta{
 		ID:            d.id,
 		Status:        DAGStatusRunning,
 		CreatedAt:     now,
 		DefaultPolicy: d.defaultPolicy,
 		ArmedMatchers: armed,
-		Labels:        dedupeStrings(d.labels),
+		Labels:        labels,
 	}
 	if so.startPaused {
 		meta.Status = DAGStatusPaused
@@ -686,4 +718,16 @@ func enqueueStep(
 		Target:      target,
 	}
 	return enq.Enqueue(ctx, envelope)
+}
+
+// cloneMetaForHook copies the provisional meta's reference fields so a hook
+// cannot change what Submit persists.
+func cloneMetaForHook(m DAGMeta) DAGMeta {
+	m.Labels = slices.Clone(m.Labels)
+	if m.DefaultPolicy != nil {
+		p := *m.DefaultPolicy
+		p.NonRetryableErrorKinds = slices.Clone(p.NonRetryableErrorKinds)
+		m.DefaultPolicy = &p
+	}
+	return m
 }

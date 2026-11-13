@@ -41,6 +41,10 @@
 // `--label signals` only the ones awaiting approval, and `--label billing`
 // just that topic's subset (AND semantics across repeated --label).
 //
+// Submit hook: submitDAG passes no submit options. One hook registered with
+// wf.UseSubmitHook reads these labels and arms the breakpoints
+// ("breakpoints") or starts the DAG paused ("start-paused").
+//
 // Typical session:
 //
 //	# terminal 1
@@ -84,6 +88,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -297,6 +302,9 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	// Run-time submit decisions live in one hook, keyed on DAG labels;
+	// submitDAG passes no submit options at all.
+	wf.UseSubmitHook(playgroundSubmitHook)
 
 	reg := task.NewRegistry()
 	for _, fn := range []any{
@@ -337,7 +345,7 @@ func run(cfg config) error {
 		withSignal := cfg.signalEvery > 0 && (n-1)%uint64(cfg.signalEvery) == 0
 		startPaused := cfg.pausedEvery > 0 && (n-1)%uint64(cfg.pausedEvery) == 0
 		labels := dagLabels(n, armBPs, withSignal, startPaused)
-		id, err := submitDAG(ctx, wf, armBPs, withSignal, startPaused, labels)
+		id, err := submitDAG(ctx, wf, withSignal, labels)
 		if err != nil {
 			log.Printf("submit: %v", err)
 			return
@@ -416,14 +424,30 @@ func dagLabels(n uint64, armBPs, withSignal, startPaused bool) []string {
 	return labels
 }
 
+// playgroundSubmitHook makes the run-time submit decisions from the DAG's
+// labels: "breakpoints" arms the breakpoints described in the package doc,
+// "start-paused" submits the DAG paused (nothing runs until
+// `ebctl dag resume`).
+func playgroundSubmitHook(_ context.Context, meta workflow.DAGMeta) ([]workflow.SubmitOption, error) {
+	var opts []workflow.SubmitOption
+	if slices.Contains(meta.Labels, "breakpoints") {
+		opts = append(opts, workflow.WithActiveBreakpoints(armedBPLabels...),
+			workflow.WithArmedBreakpoints(transformMatcher))
+	}
+	if slices.Contains(meta.Labels, "start-paused") {
+		opts = append(opts, workflow.StartPaused())
+	}
+	return opts, nil
+}
+
 // submitDAG builds and submits the complex DAG described in the package doc.
 // Returns the DAG's generated ID so the caller can surface it in logs.
-// Breakpoint labels are always declared on the steps (inert by default);
-// armBPs decides at submit time whether this execution stops at them.
-// withSignal appends the approval-gated release step (signals have no arming
-// concept — a declared wait always gates, so the step is added conditionally).
-// startPaused submits it paused: nothing runs until `ebctl dag resume`.
-func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal, startPaused bool, labels []string) (string, error) {
+// Breakpoint labels are always declared on the steps (inert by default); the
+// labels decide, through playgroundSubmitHook, whether this execution stops
+// at them or starts paused. withSignal appends the approval-gated release
+// step (signals have no arming concept — a declared wait always gates, so the
+// step is added conditionally).
+func submitDAG(ctx context.Context, wf *workflow.Workflow, withSignal bool, labels []string) (string, error) {
 	// Fast-giving-up retry policy — transform-b goes to DLQ after 3 attempts
 	// so the user sees DLQ entries within ~10s rather than after a minute.
 	quickRetry := task.RetryPolicy{
@@ -491,15 +515,7 @@ func submitDAG(ctx context.Context, wf *workflow.Workflow, armBPs, withSignal, s
 	)
 	_ = dag.Step("dependent-skip", Dependent, flaky.Ref())
 
-	var opts []workflow.SubmitOption
-	if armBPs {
-		opts = append(opts, workflow.WithActiveBreakpoints(armedBPLabels...),
-			workflow.WithArmedBreakpoints(transformMatcher))
-	}
-	if startPaused {
-		opts = append(opts, workflow.StartPaused())
-	}
-	if err := dag.Submit(ctx, wf, opts...); err != nil {
+	if err := dag.Submit(ctx, wf); err != nil {
 		return "", err
 	}
 	return dag.ID(), nil
