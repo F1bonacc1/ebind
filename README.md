@@ -370,6 +370,7 @@ make help          # list all targets
 make build         # compile everything
 make test          # run all tests with -race
 make test-count    # 3× runs, catch flakes
+make examples      # run every example, fail on error or timeout
 make lint          # golangci-lint
 make cover         # HTML coverage report
 make demo          # run cmd/demo end-to-end

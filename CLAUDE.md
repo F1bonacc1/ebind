@@ -116,7 +116,8 @@ cmd/demo/
 
 cmd/ebctl/               operator CLI (cobra)
   main.go                entrypoint
-  internal/cli/          shared Context (NATS conn, Workflow, Printer)
+  internal/cli/          shared Context (NATS conn, Workflow, Printer); opens the
+                         workflow via OpenFromNATS (open-only, never reconfigures)
   internal/commands/dag    dag ls/get/tree/step (get|result)/watch/cancel/rm
   internal/commands/dlq    dlq ls/show/watch/requeue/purge
   internal/commands/stream stream ls/info/consumer/peek/purge/rmmsg
@@ -145,6 +146,7 @@ make test              # all tests with -race
 make test-short        # unit-only
 make test-count        # 3× runs (flake hunt)
 make test-e2e          # cluster chaos e2e (~2 min, tag-gated)
+make examples          # run every example (each must exit 0 within 60s)
 make cover             # HTML coverage
 ```
 
@@ -205,6 +207,9 @@ another fence's state. Terminal DAGs: `Signal` no-ops without writing;
 `DeleteDAG` must delete signal records (a re-created pinned `WithDAGID` DAG
 would inherit them). Roots get a signals snapshot at Submit (`dag.go`) since
 they bypass the scheduler gate.
+
+### Operator tools open, never create-or-update
+`NewFromNATS`/`NewNatsStore`/`NewNatsBus` use `CreateOrUpdate*`, which rewrites the whole bucket/stream config (replicas included) to whatever the caller passes. Only the deployment that owns the infrastructure (workers) may call them. `ebctl` and any other tool that attaches to a running deployment must use `OpenFromNATS` (`OpenNatsStore`/`OpenNatsBus`), which opens existing resources and errors if they are missing. Before v0.9 ebctl defaulted `--replicas 1` through the create path and silently scaled R=3 deployments to R=1. Regression test: `cmd/ebctl/open_only_test.go`.
 
 ### KV reads are direct-get — no read-your-writes
 NATS JetStream KV `Get` is a *direct get*: hardcoded `AllowDirect: true` on the bucket stream, served by any in-sync replica via a queue group, not just the leader. A `Create`/`Update` commits at quorum (leader + 1 of 2 followers); the third replica applies a beat later. So a `Get` issued immediately after a write can be answered by a lagging replica and return a stale value — including `ErrKeyNotFound`/`ErrStepNotFound` for a key that definitely exists. The window is widest right after a node restart (the rejoined replica is back in the direct-get pool but a hair behind). **Never read-back-after-write to recover a revision** — `StateStore.PutStep`/`PutMeta` should return the new revision (as `kv.Create`/`kv.Update` do) and callers CAS from it directly. Writes/CAS are strongly consistent (leader-served, quorum); only this relaxed read path needs care. See `workflow/dag.go::Submit` and the `Step_PutReturnsUsableRevision` store contract.

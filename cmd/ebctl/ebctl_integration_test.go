@@ -23,12 +23,18 @@ import (
 )
 
 // newTestCtx wires a cli.Context around a running NATS harness and a JSON printer,
-// so table-less invocations are easy to assert.
+// so table-less invocations are easy to assert. It provisions the workflow KV
+// bucket and events stream the way a worker would: ebctl only opens them.
 func newTestCtx(t *testing.T, h *testutil.Harness, fmtName string) *cli.Context {
 	t.Helper()
 	p, err := format.New(fmtName)
 	if err != nil {
 		t.Fatal(err)
+	}
+	provisionCtx, provisionCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer provisionCancel()
+	if _, err := workflow.NewFromNATS(provisionCtx, h.Conn, 1); err != nil {
+		t.Fatalf("provision workflow: %v", err)
 	}
 	c := cli.NewContext()
 	c.NC = h.Conn

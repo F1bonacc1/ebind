@@ -41,6 +41,10 @@ E2E_TIMEOUT ?= 600s
 test-e2e: ## Run the cluster chaos e2e test (3-node embedded NATS; E2E_COUNT=n to repeat)
 	$(GO) test -race -tags e2e -count=$(E2E_COUNT) -timeout $(E2E_TIMEOUT) -v ./e2e/
 
+.PHONY: examples
+examples: ## Run every example; each must exit 0 (EXAMPLE_TIMEOUT=60s each)
+	GO=$(GO) ./examples/run-all.sh
+
 .PHONY: bench
 bench: ## Run benchmarks
 	$(GO) test -run=- -bench=. -benchmem $(PKGS)

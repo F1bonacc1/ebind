@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -37,7 +38,25 @@ func NewNatsBus(ctx context.Context, js jetstream.JetStream, replicas int) (*Nat
 	if err != nil {
 		return nil, fmt.Errorf("workflow: create events stream: %w", err)
 	}
-	return &NatsBus{js: js, eventsStream: stream, consumerName: "ebind-scheduler"}, nil
+	return newNatsBus(js, stream), nil
+}
+
+// OpenNatsBus opens the existing DAG events stream without creating or
+// reconfiguring it (see OpenNatsStore). A missing stream returns an error
+// wrapping jetstream.ErrStreamNotFound.
+func OpenNatsBus(ctx context.Context, js jetstream.JetStream) (*NatsBus, error) {
+	stream, err := js.Stream(ctx, DAGEventsStream)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return nil, fmt.Errorf("workflow: events stream %q not found (no worker has provisioned it): %w", DAGEventsStream, err)
+		}
+		return nil, fmt.Errorf("workflow: open events stream: %w", err)
+	}
+	return newNatsBus(js, stream), nil
+}
+
+func newNatsBus(js jetstream.JetStream, stream jetstream.Stream) *NatsBus {
+	return &NatsBus{js: js, eventsStream: stream, consumerName: "ebind-scheduler"}
 }
 
 func (b *NatsBus) Publish(ctx context.Context, subject string, data []byte) error {

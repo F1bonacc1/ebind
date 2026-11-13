@@ -8,6 +8,8 @@ go run ./examples/07-workflow-fanout
 # ...
 ```
 
+`make examples` runs all of them and fails if any exits non-zero or runs past its timeout (`EXAMPLE_TIMEOUT`, default 60s). Every example must terminate on its own.
+
 ## Index
 
 ### Task queue basics

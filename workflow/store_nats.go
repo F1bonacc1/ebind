@@ -54,12 +54,32 @@ func NewNatsStore(ctx context.Context, js jetstream.JetStream, replicas int) (*N
 	if err != nil {
 		return nil, fmt.Errorf("workflow: create/open KV: %w", err)
 	}
+	return newNatsStore(js, kv), nil
+}
+
+// OpenNatsStore opens the existing KV bucket without creating or reconfiguring
+// it. Use it from tools that do not own the deployment (ebctl): NewNatsStore's
+// create-or-update would rewrite the bucket config, e.g. scale an R=3 bucket
+// down to the replicas the tool happened to pass. A missing bucket returns an
+// error wrapping jetstream.ErrBucketNotFound.
+func OpenNatsStore(ctx context.Context, js jetstream.JetStream) (*NatsStore, error) {
+	kv, err := js.KeyValue(ctx, kvBucketName)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrBucketNotFound) {
+			return nil, fmt.Errorf("workflow: KV bucket %q not found (no worker has provisioned it): %w", kvBucketName, err)
+		}
+		return nil, fmt.Errorf("workflow: open KV: %w", err)
+	}
+	return newNatsStore(js, kv), nil
+}
+
+func newNatsStore(js jetstream.JetStream, kv jetstream.KeyValue) *NatsStore {
 	opts := js.Options()
 	timeout := opts.DefaultTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	return &NatsStore{kv: kv, nc: js.Conn(), apiPrefix: jsAPIPrefix(opts), timeout: timeout}, nil
+	return &NatsStore{kv: kv, nc: js.Conn(), apiPrefix: jsAPIPrefix(opts), timeout: timeout}
 }
 
 // jsAPIPrefix derives the JetStream API subject prefix the way jetstream does:
