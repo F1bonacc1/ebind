@@ -25,7 +25,6 @@ type Context struct {
 	Timeout      time.Duration
 	Yes          bool
 	Verbose      bool
-	Replicas     int
 
 	NC *nats.Conn
 	JS jetstream.JetStream
@@ -41,7 +40,6 @@ func NewContext() *Context {
 		Server:       envOr("EBIND_NATS_URL", nats.DefaultURL),
 		OutputFormat: "pretty",
 		Timeout:      10 * time.Second,
-		Replicas:     1,
 	}
 }
 
@@ -55,13 +53,15 @@ func (c *Context) Background() context.Context {
 	return context.Background()
 }
 
-// Workflow returns a *workflow.Workflow, lazily constructing it on first use
-// so that non-DAG commands don't create the KV bucket.
+// Workflow returns a *workflow.Workflow, lazily opened on first use so that
+// non-DAG commands work without the workflow KV bucket. It only opens the
+// existing bucket and events stream: an operator tool must never create or
+// reconfigure them (create-or-update would rewrite e.g. their replica count).
 func (c *Context) Workflow(ctx context.Context) (*workflow.Workflow, error) {
 	if c.wf != nil {
 		return c.wf, nil
 	}
-	wf, err := workflow.NewFromNATS(ctx, c.NC, c.Replicas)
+	wf, err := workflow.OpenFromNATS(ctx, c.NC)
 	if err != nil {
 		return nil, fmt.Errorf("open workflow: %w", err)
 	}
@@ -112,7 +112,6 @@ func NewRootCommand(c *Context) *cobra.Command {
 	pf.DurationVar(&c.Timeout, "timeout", c.Timeout, "per-request timeout")
 	pf.BoolVar(&c.Yes, "yes", c.Yes, "skip confirmation on destructive ops")
 	pf.BoolVarP(&c.Verbose, "verbose", "v", c.Verbose, "verbose output")
-	pf.IntVar(&c.Replicas, "replicas", c.Replicas, "KV bucket replicas when opening the workflow (dev=1, HA=3)")
 
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 		p, err := format.New(c.OutputFormat)

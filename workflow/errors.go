@@ -47,3 +47,13 @@ var ErrDAGNotRunning = errors.New("workflow: DAG not running")
 
 // ErrDAGNotPaused is returned by Resume when the DAG is not in paused status.
 var ErrDAGNotPaused = errors.New("workflow: DAG not paused")
+
+// ErrInvalidMatcher is returned (wrapped) by BPMatcher.Validate and by every API
+// that accepts a breakpoint matcher, for an unknown position or kind, an empty
+// pattern, or a malformed glob.
+var ErrInvalidMatcher = errors.New("workflow: invalid breakpoint matcher")
+
+// ErrDAGTerminal is returned by WaitForBreakpoint when the DAG reaches (or is
+// already in) a terminal status (done, failed, canceled), so nothing can stop
+// at a breakpoint anymore.
+var ErrDAGTerminal = errors.New("workflow: DAG is terminal")

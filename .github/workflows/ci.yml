@@ -95,6 +95,9 @@ jobs:
       - name: Verify ebctl --help
         run: ./bin/ebctl --help
 
+      - name: Run examples
+        run: make examples
+
   vuln:
     name: govulncheck
     runs-on: ubuntu-latest

@@ -1,7 +1,11 @@
 package dag
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -15,18 +19,27 @@ import (
 func newBPCmd(c *cli.Context) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bp",
-		Short: "Inspect and resume step breakpoints",
+		Short: "Inspect, arm, disarm, wait for, resume and release step breakpoints",
 	}
 	cmd.AddCommand(newBPLsCmd(c))
 	cmd.AddCommand(newBPResumeCmd(c))
+	cmd.AddCommand(newBPReleaseCmd(c))
+	cmd.AddCommand(newBPWaitCmd(c))
+	cmd.AddCommand(newBPContinueCmd(c))
+	cmd.AddCommand(newBPArmCmd(c))
+	cmd.AddCommand(newBPDisarmCmd(c))
 	return cmd
 }
 
 func newBPLsCmd(c *cli.Context) *cobra.Command {
-	return &cobra.Command{
+	var all, blocked bool
+	cmd := &cobra.Command{
 		Use:   "ls <dag-id>",
-		Short: "List a DAG's breakpoints and their state",
-		Args:  cobra.ExactArgs(1),
+		Short: "List a DAG's armed breakpoints and their state",
+		Long: `List a DAG's armed breakpoints: those armed at submit by label or by
+matcher. --all adds breakpoints declared on steps (BreakBefore/BreakAfter)
+whose labels are not armed; --blocked shows only the ones stopping work now.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := c.Ctx()
 			defer cancel()
@@ -34,7 +47,7 @@ func newBPLsCmd(c *cli.Context) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			infos, err := workflow.ListBreakpoints(ctx, wf, args[0])
+			infos, err := workflow.ListBreakpoints(ctx, wf, args[0], bpLsOptions(all, blocked)...)
 			if err != nil {
 				return err
 			}
@@ -42,17 +55,42 @@ func newBPLsCmd(c *cli.Context) *cobra.Command {
 				return c.Printer.Value(cmd.OutOrStdout(), infos)
 			}
 			if len(infos) == 0 {
-				return c.Printer.Text(cmd.OutOrStdout(), "no breakpoints declared")
+				return c.Printer.Text(cmd.OutOrStdout(), bpLsEmptyText(all, blocked))
 			}
 			headers, rows := bpTable(infos)
 			return c.Printer.Table(cmd.OutOrStdout(), headers, rows)
 		},
 	}
+	cmd.Flags().BoolVar(&all, "all", false, "include declared breakpoints that are not armed")
+	cmd.Flags().BoolVar(&blocked, "blocked", false, "only breakpoints currently stopping work")
+	return cmd
+}
+
+// bpLsOptions maps `bp ls` flags to list filters: armed only unless --all.
+func bpLsOptions(all, blocked bool) []workflow.ListBPOption {
+	var opts []workflow.ListBPOption
+	if !all {
+		opts = append(opts, workflow.OnlyArmed())
+	}
+	if blocked {
+		opts = append(opts, workflow.OnlyBlocked())
+	}
+	return opts
+}
+
+func bpLsEmptyText(all, blocked bool) string {
+	switch {
+	case blocked:
+		return "no breakpoints stopped"
+	case all:
+		return "no breakpoints declared or armed"
+	}
+	return "no armed breakpoints (--all also lists declared, unarmed ones)"
 }
 
 // bpTable maps breakpoint infos to the `dag bp ls` pretty table.
 func bpTable(infos []workflow.BreakpointInfo) ([]string, [][]string) {
-	headers := []string{"STEP", "POS", "LABELS", "ARMED", "STATE", "SINCE", "HOLDING"}
+	headers := []string{"STEP", "POS", "LABELS", "MATCHERS", "ARMED", "STATE", "SINCE", "HOLDING"}
 	rows := make([][]string, 0, len(infos))
 	for _, bp := range infos {
 		armed := "no"
@@ -74,7 +112,8 @@ func bpTable(infos []workflow.BreakpointInfo) ([]string, [][]string) {
 		rows = append(rows, []string{
 			bp.StepID,
 			string(bp.Position),
-			strings.Join(bp.Labels, ","),
+			dashIfEmpty(strings.Join(bp.Labels, ",")),
+			dashIfEmpty(strings.Join(bp.Matchers, ",")),
 			armed,
 			state,
 			since,
@@ -124,4 +163,261 @@ func newBPResumeCmd(c *cli.Context) *cobra.Command {
 				fmt.Sprintf("released %d breakpoint(s) for label %q in %s", n, args[1], args[0]))
 		},
 	}
+}
+
+func newBPReleaseCmd(c *cli.Context) *cobra.Command {
+	var position string
+	cmd := &cobra.Command{
+		Use:   "release <dag-id> <step-id>",
+		Short: "Release one step stopped at a breakpoint; others with the same label stay stopped",
+		Long: `Release one step stopped at a breakpoint. Other steps stopped at the same
+label stay stopped (use "bp resume" to release all of them).
+
+--position before releases a step stopped before it runs; --position after
+releases a completed step holding its dependents. A step that has not reached
+its breakpoint yet is not pre-released: the command reports "not stopped" and
+the breakpoint still stops the step when it arrives.`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pos, err := parseBPPosition(position)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := c.Ctx()
+			defer cancel()
+			wf, err := c.Workflow(ctx)
+			if err != nil {
+				return err
+			}
+			dagID, stepID := args[0], args[1]
+			released, err := workflow.ReleaseStep(ctx, wf, dagID, stepID, pos)
+			if err != nil {
+				return err
+			}
+			if c.Printer.Name() == "json" {
+				return c.Printer.Value(cmd.OutOrStdout(), map[string]any{
+					"dag_id": dagID, "step_id": stepID, "position": pos, "released": released,
+				})
+			}
+			return c.Printer.Text(cmd.OutOrStdout(), bpReleaseText(dagID, stepID, pos, released))
+		},
+	}
+	cmd.Flags().StringVar(&position, "position", string(workflow.BPPositionBefore), "breakpoint position: before|after")
+	return cmd
+}
+
+func parseBPPosition(s string) (workflow.BPPosition, error) {
+	switch p := workflow.BPPosition(s); p {
+	case workflow.BPPositionBefore, workflow.BPPositionAfter:
+		return p, nil
+	}
+	return "", fmt.Errorf("invalid --position %q (want before|after)", s)
+}
+
+func bpReleaseText(dagID, stepID string, pos workflow.BPPosition, released bool) string {
+	if released {
+		return fmt.Sprintf("released %s at its %s breakpoint in %s", stepID, pos, dagID)
+	}
+	return fmt.Sprintf("not stopped: %s is not stopped at its %s breakpoint in %s (nothing released)", stepID, pos, dagID)
+}
+
+func newBPWaitCmd(c *cli.Context) *cobra.Command {
+	var waitTimeout time.Duration
+	cmd := &cobra.Command{
+		Use:   "wait <dag-id> (--before|--after) (--step|--fn|--label) <pattern>",
+		Short: "Block until a matching step is stopped at a breakpoint, then print it",
+		Long: `Block until a step selected by the matcher is stopped at the given
+position, then print that breakpoint and exit 0. If one is already stopped it
+returns at once. Exits non-zero if the DAG is or becomes terminal, does not
+exist, or --wait-timeout passes first.
+
+Examples:
+  ebctl dag bp wait <dag-id> --before --step 'upload-*' --wait-timeout 1m
+  ebctl dag bp wait <dag-id> --after --fn main.Prepare
+
+Step and fn patterns are path.Match globs: '*' does not cross '/'. The global
+--timeout bounds each request, not the wait; the wait runs until a match,
+--wait-timeout (0 = no limit), or Ctrl-C.`,
+		Args: cobra.ExactArgs(1),
+	}
+	mf := cli.AddMatcherFlags(cmd)
+	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", 0, "give up after this long (0 = wait until a match or Ctrl-C)")
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		m, err := mf.Matcher()
+		if err != nil {
+			return err
+		}
+		openCtx, cancel := c.Ctx()
+		wf, err := c.Workflow(openCtx)
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, stop := signal.NotifyContext(c.Background(), os.Interrupt)
+		defer stop()
+		if waitTimeout > 0 {
+			var cancelWait context.CancelFunc
+			ctx, cancelWait = context.WithTimeout(ctx, waitTimeout)
+			defer cancelWait()
+		}
+		dagID := args[0]
+		info, err := workflow.WaitForBreakpoint(ctx, wf, dagID, m)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("no step matching %s stopped in %s within %s", m.Key(), dagID, waitTimeout)
+			}
+			return err
+		}
+		if c.Printer.Name() == "json" {
+			return c.Printer.Value(cmd.OutOrStdout(), info)
+		}
+		headers, rows := bpTable([]workflow.BreakpointInfo{info})
+		return c.Printer.Table(cmd.OutOrStdout(), headers, rows)
+	}
+	return cmd
+}
+
+func dashIfEmpty(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func newBPContinueCmd(c *cli.Context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "continue <dag-id> (--before|--after) (--step|--fn|--label) <pattern>",
+		Short: "Release every step stopped at a breakpoint the matcher selects (it stays armed)",
+		Long: `Release every step that is stopped right now at a breakpoint the matcher
+selects. Like "bp resume" for a label, this is debugger "continue": what is
+armed stays armed, so a later matching step stops again.
+
+Examples:
+  ebctl dag bp continue <dag-id> --before --step 'upgrade-node-*'
+  ebctl dag bp continue <dag-id> --after --fn main.Prepare`,
+		Args: cobra.ExactArgs(1),
+	}
+	mf := cli.AddMatcherFlags(cmd)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		m, err := mf.Matcher()
+		if err != nil {
+			return err
+		}
+		ctx, cancel := c.Ctx()
+		defer cancel()
+		wf, err := c.Workflow(ctx)
+		if err != nil {
+			return err
+		}
+		n, err := workflow.ReleaseMatching(ctx, wf, args[0], m)
+		if err != nil {
+			return err
+		}
+		if c.Printer.Name() == "json" {
+			return c.Printer.Value(cmd.OutOrStdout(), map[string]any{
+				"dag_id": args[0], "matcher": m.Key(), "released": n,
+			})
+		}
+		return c.Printer.Text(cmd.OutOrStdout(),
+			fmt.Sprintf("released %d breakpoint(s) matching %s in %s", n, m.Key(), args[0]))
+	}
+	return cmd
+}
+
+func newBPArmCmd(c *cli.Context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "arm <dag-id> (--before|--after) (--step|--fn|--label) <pattern>",
+		Short: "Arm a breakpoint on a running or paused DAG",
+		Long: `Arm a breakpoint matcher on a DAG that is already running (or paused).
+Every step it selects stops at that position from now on, including steps
+added dynamically later. A step already past the point is not interrupted:
+it is reported as missed.
+
+Every worker must run ebind v0.10.0 or later before you arm at runtime: an
+older scheduler ignores runtime breakpoints and runs straight through them.
+
+Examples:
+  ebctl dag bp arm <dag-id> --before --step 'upgrade-node-*'
+  ebctl dag bp arm <dag-id> --after --fn main.Prepare`,
+		Args: cobra.ExactArgs(1),
+	}
+	mf := cli.AddMatcherFlags(cmd)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		m, err := mf.Matcher()
+		if err != nil {
+			return err
+		}
+		ctx, cancel := c.Ctx()
+		defer cancel()
+		wf, err := c.Workflow(ctx)
+		if err != nil {
+			return err
+		}
+		rep, err := workflow.ArmBreakpoints(ctx, wf, args[0], m)
+		if err != nil {
+			return err
+		}
+		if c.Printer.Name() == "json" {
+			return c.Printer.Value(cmd.OutOrStdout(), map[string]any{
+				"dag_id": args[0], "matcher": m.Key(),
+				"added": rep.Added, "stopped": rep.Stopped, "missed": rep.Missed,
+			})
+		}
+		return c.Printer.Text(cmd.OutOrStdout(), bpArmText(args[0], m, rep))
+	}
+	return cmd
+}
+
+// bpArmText renders an ArmReport for humans.
+func bpArmText(dagID string, m workflow.BPMatcher, rep workflow.ArmReport) string {
+	var b strings.Builder
+	if len(rep.Added) > 0 {
+		fmt.Fprintf(&b, "armed %s in %s\n", m.Key(), dagID)
+	} else {
+		fmt.Fprintf(&b, "%s was already armed in %s\n", m.Key(), dagID)
+	}
+	fmt.Fprintf(&b, "stopped: %s\n", dashIfEmpty(strings.Join(rep.Stopped, ", ")))
+	fmt.Fprintf(&b, "missed:  %s", dashIfEmpty(strings.Join(rep.Missed, ", ")))
+	return b.String()
+}
+
+func newBPDisarmCmd(c *cli.Context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "disarm <dag-id> (--before|--after) (--step|--fn|--label) <pattern>",
+		Short: "Disarm a breakpoint and let the steps it alone stopped continue",
+		Long: `Remove a breakpoint matcher from a DAG's armed set. Steps it was the only
+reason for stopping continue now, and later matching steps run straight
+through. Unlike "bp continue", this changes what is armed; unlike a release,
+re-arming the same matcher stops a step again.
+
+Examples:
+  ebctl dag bp disarm <dag-id> --before --step 'upgrade-node-*'`,
+		Args: cobra.ExactArgs(1),
+	}
+	mf := cli.AddMatcherFlags(cmd)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		m, err := mf.Matcher()
+		if err != nil {
+			return err
+		}
+		ctx, cancel := c.Ctx()
+		defer cancel()
+		wf, err := c.Workflow(ctx)
+		if err != nil {
+			return err
+		}
+		n, err := workflow.DisarmBreakpoints(ctx, wf, args[0], m)
+		if err != nil {
+			return err
+		}
+		if c.Printer.Name() == "json" {
+			return c.Printer.Value(cmd.OutOrStdout(), map[string]any{
+				"dag_id": args[0], "matcher": m.Key(), "released": n,
+			})
+		}
+		return c.Printer.Text(cmd.OutOrStdout(),
+			fmt.Sprintf("disarmed %s in %s; released %d breakpoint(s)", m.Key(), args[0], n))
+	}
+	return cmd
 }

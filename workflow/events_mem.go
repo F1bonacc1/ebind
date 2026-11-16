@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // MemBus is an in-memory EventBus for tests. It fans out each published event
@@ -16,11 +17,11 @@ type MemBus struct {
 type memSub struct {
 	filter  string
 	handler func(Event)
-	stopped bool
+	stopped atomic.Bool // Stop may race a Publish on another goroutine
 }
 
 func (ms *memSub) Stop() error {
-	ms.stopped = true
+	ms.stopped.Store(true)
 	return nil
 }
 
@@ -38,7 +39,7 @@ func (b *MemBus) Publish(_ context.Context, subject string, data []byte) error {
 	b.mu.Lock()
 	subs := make([]*memSub, 0, len(b.subs))
 	for _, s := range b.subs {
-		if !s.stopped && matchSubject(subject, s.filter) {
+		if !s.stopped.Load() && matchSubject(subject, s.filter) {
 			subs = append(subs, s)
 		}
 	}

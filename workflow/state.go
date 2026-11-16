@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"encoding/json"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/f1bonacc1/ebind/task"
@@ -47,9 +49,19 @@ type DAGMeta struct {
 	DefaultPolicy *task.RetryPolicy `json:"default_policy,omitempty"`
 	PausedAt      time.Time         `json:"paused_at,omitempty"`
 	TerminalSteps []string          `json:"terminal_steps,omitempty"`
-	// ActiveBreakpoints is the set of armed breakpoint labels, fixed at Submit
-	// (WithActiveBreakpoints). Immutable for the DAG's lifetime.
+	// ActiveBreakpoints is the set of armed breakpoint labels of a DAG
+	// submitted by a release before v0.9.0. The gate still reads it, so such
+	// DAGs keep stopping where they were armed.
+	//
+	// Deprecated: read-only. Since v0.9.0 Submit stores WithActiveBreakpoints
+	// labels as BeforeLabel/AfterLabel matchers in ArmedMatchers and never
+	// writes this field.
 	ActiveBreakpoints []string `json:"active_breakpoints,omitempty"`
+	// ArmedMatchers are the breakpoints armed for this execution: set at
+	// Submit (WithArmedBreakpoints, and WithActiveBreakpoints as label
+	// matchers) and changed at runtime only by ArmBreakpoints and
+	// DisarmBreakpoints, by CAS on meta. Deduplicated by Key.
+	ArmedMatchers []BPMatcher `json:"armed_matchers,omitempty"`
 	// Labels are immutable string tags attached at New (WithLabels) and persisted
 	// at Submit. Used to query workflow history by topic (ListDAGsByLabels /
 	// `ebctl dag ls --label`). Fixed for the DAG's lifetime.
@@ -84,6 +96,14 @@ type StepRecord struct {
 	BPBefore     BPState         `json:"bp_before,omitempty"`    // ""→blocked(advisory)→released(monotonic)
 	BPAfter      BPState         `json:"bp_after,omitempty"`
 	BPBlockedAt  time.Time       `json:"bp_blocked_at,omitempty"` // advisory; when the blocked mark was written
+	// BPFence is the dispatch guard for breakpoints armed at runtime
+	// (ArmBreakpoints): "b:<matcher key>" when that matcher arms this step's
+	// own before position, "a:<upstream step ID>" when the upstream's after
+	// position is armed. persistStatus refuses pending→running while a live
+	// token remains; the pure gate honors tokens too, so a scheduler reading
+	// an older meta agrees with the guard. Independent from Held: pause and
+	// resume never touch it, breakpoint paths never touch Held.
+	BPFence []string `json:"bp_fence,omitempty"`
 	// WaitSignals: names of external signals this step waits for, ALL of which
 	// must be delivered (workflow.Signal) before the step can start. Immutable
 	// config, fixed at Submit / dynamic StepOpts. Union of WaitForSignal()
@@ -152,23 +172,104 @@ func breakpointArmed(labels, active []string) bool {
 	return false
 }
 
+// armedMatcherKeys returns the keys of the armed matchers that select step at
+// pos, in ArmedMatchers order.
+func (s *DAGState) armedMatcherKeys(step StepRecord, pos BPPosition) []string {
+	var keys []string
+	for _, m := range s.Meta.ArmedMatchers {
+		if m.Position == pos && m.Matches(step) {
+			keys = append(keys, m.Key())
+		}
+	}
+	return keys
+}
+
+// bpArmed reports whether step's breakpoint at pos is armed: by a legacy
+// ActiveBreakpoints label (DAGs from before v0.9.0) or by any armed matcher.
+// A matcher can arm a step that declares no labels at all.
+func (s *DAGState) bpArmed(step StepRecord, pos BPPosition) bool {
+	labels := step.BreakBefore
+	if pos == BPPositionAfter {
+		labels = step.BreakAfter
+	}
+	if breakpointArmed(labels, s.Meta.ActiveBreakpoints) {
+		return true
+	}
+	for _, m := range s.Meta.ArmedMatchers {
+		if m.Position == pos && m.Matches(step) {
+			return true
+		}
+	}
+	return false
+}
+
 // beforeBPBlocks: this step must not be enqueued — its before-breakpoint is
 // armed and not yet released. Deliberately never consults the advisory
-// BPStateBlocked mark; the gate is computed from immutable config (labels ×
-// active set) plus the monotonic released flag, so racing schedulers can only
-// err toward "still blocked".
+// BPStateBlocked mark; the gate is computed from immutable config (labels and
+// step identity × the armed set) plus the monotonic released flag, so racing
+// schedulers can only err toward "still blocked". A "b:" fence token arms
+// the position even when this state's meta predates the runtime arm.
 func (s *DAGState) beforeBPBlocks(step StepRecord) bool {
-	return len(step.BreakBefore) > 0 && step.BPBefore != BPStateReleased &&
-		breakpointArmed(step.BreakBefore, s.Meta.ActiveBreakpoints)
+	return step.BPBefore != BPStateReleased &&
+		(s.bpArmed(step, BPPositionBefore) || len(beforeFenceKeys(step)) > 0)
+}
+
+// Fence token prefixes (StepRecord.BPFence).
+const (
+	fenceBeforePrefix = "b:"
+	fenceAfterPrefix  = "a:"
+)
+
+func beforeFenceToken(matcherKey string) string { return fenceBeforePrefix + matcherKey }
+func afterFenceToken(upstreamID string) string  { return fenceAfterPrefix + upstreamID }
+
+// beforeFenceKeys returns the matcher keys of step's "b:" tokens.
+func beforeFenceKeys(step StepRecord) []string {
+	var keys []string
+	for _, tok := range step.BPFence {
+		if k, ok := strings.CutPrefix(tok, fenceBeforePrefix); ok {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+// afterFenced reports whether dependent carries an "a:<upstreamID>" token.
+func afterFenced(dependent StepRecord, upstreamID string) bool {
+	return slices.Contains(dependent.BPFence, afterFenceToken(upstreamID))
+}
+
+// afterFenceUpstreams returns the set of upstream IDs named by "a:" tokens
+// across all steps: the steps whose after position a runtime arm fenced.
+func (s *DAGState) afterFenceUpstreams() map[string]bool {
+	var out map[string]bool
+	for _, step := range s.Steps {
+		for _, tok := range step.BPFence {
+			if up, ok := strings.CutPrefix(tok, fenceAfterPrefix); ok {
+				if out == nil {
+					out = map[string]bool{}
+				}
+				out[up] = true
+			}
+		}
+	}
+	return out
+}
+
+// afterGates: dep (a done step) keeps dependent from starting, either by its
+// own armed after-breakpoint or by an "a:" token on dependent. Both yield to
+// the monotonic released flag on dep.
+func (s *DAGState) afterGates(dep, dependent StepRecord) bool {
+	return s.afterBPHolds(dep) ||
+		(dep.Status == StatusDone && dep.BPAfter != BPStateReleased && afterFenced(dependent, dep.StepID))
 }
 
 // afterBPHolds: this done step's after-breakpoint is armed and not released,
 // so its direct dependents must not start. Gates only StatusDone — failed/
 // skipped/canceled parents propagate normally (cascade-skip or RefOrDefault).
 func (s *DAGState) afterBPHolds(step StepRecord) bool {
-	return step.Status == StatusDone && len(step.BreakAfter) > 0 &&
-		step.BPAfter != BPStateReleased &&
-		breakpointArmed(step.BreakAfter, s.Meta.ActiveBreakpoints)
+	return step.Status == StatusDone && step.BPAfter != BPStateReleased &&
+		s.bpArmed(step, BPPositionAfter)
 }
 
 // signalBlocks: this step must not be enqueued — it declares wait-signals and
@@ -220,11 +321,14 @@ func (s *DAGState) BlockedAtBefore() []string {
 }
 
 // HoldingAtAfter returns IDs of done steps whose after-breakpoint gate is
-// currently active (holding their direct dependents).
+// currently active (holding their direct dependents): armed in meta, or
+// fenced by an "a:" token on a dependent.
 func (s *DAGState) HoldingAtAfter() []string {
+	fenced := s.afterFenceUpstreams()
 	var out []string
 	for id, step := range s.Steps {
-		if s.afterBPHolds(step) {
+		if s.afterBPHolds(step) ||
+			(fenced[id] && step.Status == StatusDone && step.BPAfter != BPStateReleased) {
 			out = append(out, id)
 		}
 	}
@@ -288,13 +392,13 @@ func (s *DAGState) CanResume() bool {
 func (s *DAGState) depsSatisfied(step StepRecord) bool {
 	for _, dep := range step.Deps {
 		d, ok := s.Steps[dep]
-		if !ok || !d.IsTerminal() || s.afterBPHolds(d) {
+		if !ok || !d.IsTerminal() || s.afterGates(d, step) {
 			return false
 		}
 	}
 	for _, dep := range step.OptionalDeps {
 		d, ok := s.Steps[dep]
-		if !ok || !d.IsTerminal() || s.afterBPHolds(d) {
+		if !ok || !d.IsTerminal() || s.afterGates(d, step) {
 			return false
 		}
 	}

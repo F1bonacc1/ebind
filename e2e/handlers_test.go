@@ -51,14 +51,15 @@ var (
 	gate2      *gate // long DAG: pause/resume window
 	gate3      *gate // long DAG: meta-leader-kill window (held across the node restart)
 	gateCancel *gate // cancel DAG: keeps the root in-flight while Cancel lands
+	gateArm    *gate // runtime-breakpoint DAG: keeps the root running while it is armed
 )
 
 func resetGates() {
-	gate1, gate2, gate3, gateCancel = newGate(), newGate(), newGate(), newGate()
+	gate1, gate2, gate3, gateCancel, gateArm = newGate(), newGate(), newGate(), newGate(), newGate()
 }
 
 func releaseAllGates() {
-	for _, g := range []*gate{gate1, gate2, gate3, gateCancel} {
+	for _, g := range []*gate{gate1, gate2, gate3, gateCancel, gateArm} {
 		if g != nil {
 			g.Release()
 		}
@@ -69,6 +70,7 @@ func eGate1(ctx context.Context, x int) (int, error)      { return gate1.pass(ct
 func eGate2(ctx context.Context, x int) (int, error)      { return gate2.pass(ctx, x) }
 func eGate3(ctx context.Context, x int) (int, error)      { return gate3.pass(ctx, x) }
 func eGateCancel(ctx context.Context, x int) (int, error) { return gateCancel.pass(ctx, x) }
+func eGateArm(ctx context.Context, x int) (int, error)    { return gateArm.pass(ctx, x) }
 
 // Pure arithmetic handlers — every value flowing through Refs is exactly
 // verifiable at the fan-in.
@@ -150,7 +152,7 @@ func registerAll(reg *task.Registry, workerID string) error {
 	}
 	for _, fn := range []any{
 		eAdd3, eDouble, eInc, eSideEffect,
-		eGate1, eGate2, eGate3, eGateCancel,
+		eGate1, eGate2, eGate3, eGateCancel, eGateArm,
 		eFlakyOnce, eRetryExhaust, eNonRetryable, ePanics, eFailOptional,
 		eWhere, eDynamicParent,
 	} {

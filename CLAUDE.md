@@ -88,7 +88,7 @@ workflow/
   errors.go              ErrStepFailed, ErrStepSkipped sentinels
   ref.go                 Ref type + ResolveArgs (pure substitution)
   state.go               DAGState + MarkDone/MarkFailed/MarkSkipped (pure)
-  store.go               StateStore interface
+  store.go               StateStore interface (GetMetaLatest: leader read) + DAGChange (WatchDAG stream item)
   store_mem.go           In-memory impl (tests + exported for external use)
   store_nats.go          JetStream KV impl
   events.go              EventBus interface + Event types
@@ -96,12 +96,15 @@ workflow/
   events_nats.go         JetStream events impl
   enqueuer.go            Enqueuer + LeaderElector interfaces
   enqueuer_nats.go       JetStream task enqueuer
-  workflow.go            Workflow coordinator struct
+  workflow.go            Workflow coordinator struct; SubmitHook + UseSubmitHook
   nats.go                NewFromNATS convenience constructor
   step.go                Step + StepOption
   dag.go                 DAG builder, Submit, cycle detection
   scheduler.go           handleEvent + watchLeadership + sweep
-  breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint
+  breakpoint.go          per-step breakpoints: ComputeBreakpoints, ListBreakpoints, ResumeBreakpoint, ReleaseStep
+  breakpoint_runtime.go  ArmBreakpoints/DisarmBreakpoints (runtime arming) + BPFence token helpers + sweep repair
+  wait_breakpoint.go     WaitForBreakpoint: fold a WatchDAG stream, return the first matching stop
+  matcher.go             BPMatcher (position × step|fn|label pattern, path.Match globs) + Key/Validate/Matches (pure); gate use in state.go bpArmed
   signal.go              external signals: Signal (deliver), ComputeSignals/ListSignalInfo (observability)
   hook.go                workflow.StepHook (implements worker.StepHook); persists error_kind+message on failure
   context.go             FromContext — dynamic step addition
@@ -116,7 +119,10 @@ cmd/demo/
 
 cmd/ebctl/               operator CLI (cobra)
   main.go                entrypoint
-  internal/cli/          shared Context (NATS conn, Workflow, Printer)
+  internal/cli/          shared Context (NATS conn, Workflow, Printer); opens the
+                         workflow via OpenFromNATS (open-only, never reconfigures);
+                         matcher.go: shared --before|--after + --step|--fn|--label flags
+                         (dag bp ls/wait/continue/release/resume/arm/disarm)
   internal/commands/dag    dag ls/get/tree/step (get|result)/watch/cancel/rm
   internal/commands/dlq    dlq ls/show/watch/requeue/purge
   internal/commands/stream stream ls/info/consumer/peek/purge/rmmsg
@@ -127,10 +133,12 @@ cmd/ebctl/               operator CLI (cobra)
 
 - **Pure unit tests** — no NATS, no goroutines beyond test runner:
   - `task/retry_test.go`
-  - `workflow/state_test.go`, `workflow/ref_test.go`, `workflow/dag_test.go`
+  - `workflow/state_test.go`, `workflow/ref_test.go`, `workflow/dag_test.go`, `workflow/matcher_test.go`
 - **Unit with fakes** — MemStore + MemBus + captureEnq:
   - `workflow/scheduler_test.go`, `workflow/store_test.go`
   - `workflow/breakpoint_test.go` (pure gate-predicate tests + fakes-driven scheduler/resume tests)
+  - `workflow/release_step_test.go`, `workflow/start_paused_test.go`, `workflow/wait_breakpoint_test.go`, `workflow/matcher_gate_test.go`, `workflow/submit_hook_test.go`
+  - `workflow/breakpoint_runtime_test.go` (arm/disarm, fence tokens, stale-meta stores, sweep repair), `workflow/breakpoint_race_test.go` (arm vs. completion, 500 interleavings)
   - `workflow/signal_test.go` (pure gate/ResolveArgs tests + fakes-driven Signal/scheduler tests)
 - **Integration** — real in-process NATS via `embed.StartNode`:
   - `worker/worker_test.go`, `workflow/integration_test.go`, `workflow/breakpoint_integration_test.go`, `workflow/signal_integration_test.go`
@@ -145,6 +153,7 @@ make test              # all tests with -race
 make test-short        # unit-only
 make test-count        # 3× runs (flake hunt)
 make test-e2e          # cluster chaos e2e (~2 min, tag-gated)
+make examples          # run every example (each must exit 0 within 60s)
 make cover             # HTML coverage
 ```
 
@@ -165,23 +174,53 @@ Within one scheduler instance, `mu` serializes event handling. Across instances,
 ### Sweep on leader acquisition
 When `IsLeader()` flips false→true, the scheduler sweeps all running DAGs and re-enqueues any stranded ready steps. Edge-triggered, not level-triggered. Defaults: 5s poll, 60s sweep timeout. Overlap-guarded.
 
-### Breakpoints are computed gates; `Held` and BP fences are independent
-Per-step breakpoints (`BreakBefore`/`BreakAfter` StepOptions, armed via
-`WithActiveBreakpoints` at submit) gate scheduling inside the pure layer:
-`ReadyToRun` refuses a pending step whose before-BP is armed, `depsSatisfied`
-refuses dependents of a done step whose after-BP is armed. The gate is computed
-from immutable config (labels × `DAGMeta.ActiveBreakpoints`) plus the monotonic
-`BPBefore`/`BPAfter = released` flag written only by `ResumeBreakpoint` — the
-persisted `blocked` marks (`bp_before`/`bp_after`/`bp_blocked_at`) are advisory
-observability only, never load-bearing. Resume is debugger "continue": the label
-stays armed; each call releases only what is currently stopped. The pause `Held`
-fence and BP state are separate fields by design — DAG `Resume` and the
-orphan-hold sweep touch only `Held`/`HeldAt`, `ResumeBreakpoint` touches only BP
-state; the two fences compose. Never merge them.
+### Breakpoints are computed gates; `Held`, BP gates and `BPFence` are independent
+Per-step breakpoints are armed by matcher, at submit (`WithArmedBreakpoints`;
+`WithActiveBreakpoints` labels are stored as `BeforeLabel`/`AfterLabel`
+matchers in `DAGMeta.ArmedMatchers`) or at runtime (`ArmBreakpoints` /
+`DisarmBreakpoints` CAS `ArmedMatchers` on meta), and gate scheduling inside the
+pure layer: `ReadyToRun` refuses a pending step whose before-BP is armed,
+`depsSatisfied` refuses dependents of a done step whose after-BP is armed. The
+gate is computed from step identity (step ID, fn name, declared labels) ×
+`ArmedMatchers` (plus the deprecated read-only `ActiveBreakpoints` of pre-v0.9.0
+DAGs) × `BPFence` tokens, plus the monotonic `BPBefore`/`BPAfter = released`
+flag written only by `ResumeBreakpoint`, `ReleaseMatching` and `ReleaseStep`
+(all through `releaseInstance`, the one release path) — the persisted `blocked`
+marks (`bp_before`/`bp_after`/`bp_blocked_at`) are advisory observability only,
+never load-bearing. Resume is debugger "continue": the label stays armed; each
+call releases only what is currently stopped. `ReleaseStep` releases one step
+at one position and never pre-releases a step that has not reached its
+breakpoint (that would silently consume a stop). Disarm never writes
+`released` either, so disarm + re-arm stops a step again.
+
+**Runtime arming: meta is the truth, `BPFence` is the dispatch guard.** Meta is
+read through a direct get that may be stale, so a scheduler could miss a fresh
+arm. Two rules close that, and the argument is on `ArmBreakpoints`:
+(1) every dispatcher lists steps first and then reads meta from the stream
+leader (`StateStore.GetMetaLatest`) before dispatching: `enqueueReady` (only
+when something is ready), always in `onResumed` (disarm/release liveness) and
+the sweep, and in `Submit` before the root loop; (2) arm commits meta, then
+CAS-adds `b:<matcherKey>` to each matched pending step and `a:<upstream>` to the
+pending dependents of a matched done step. `persistStatus` refuses
+pending→running while a live token remains (a `b:` token yields to `BPBefore
+released`, an `a:X` token to X's `BPAfter released`). Tokens are removed by
+release (`b:` in the release CAS, `a:X` after X's release), by disarm, and by
+the sweep repair `releaseOrphanedBPFences`; all three judge staleness by
+reading the step first and meta from the leader second, and arm always rewrites
+a token it finds (revision bump) so a concurrent prune loses its CAS. Dynamic
+steps get no tokens: the leader meta read covers them.
+
+The pause `Held` fence, the BP gates and `BPFence` are separate by design — DAG
+`Resume` and the orphan-hold sweep touch only `Held`/`HeldAt`; BP releases,
+arm and disarm touch only BP state and `BPFence`; they compose. Never merge
+`Held` and `BPFence`. `StartPaused` uses only the pause fence: meta is created
+paused and every step created `Held` (never create-then-hold, so no sweep sees
+an unheld root), and Submit skips the root-enqueue loop. Workers older than
+v0.10.0 ignore runtime arming: upgrade all of them first.
 
 Breakpoint transitions are announced as **informational** `bp_hit`/`bp_resumed`
 events (published best-effort by the advisory-mark CAS winner and by
-`ResumeBreakpoint`; rendered live by `ebctl dag watch`). Schedulers Ack-drop
+`releaseInstance`; rendered live by `ebctl dag watch`). Schedulers Ack-drop
 them — nothing load-bearing may ever depend on their delivery; the durable
 truth is the step record (`dag bp ls`).
 
@@ -199,15 +238,25 @@ immutability is load-bearing**: duplicate step enqueues are collapsed by
 msg-id dedupe, which requires every enqueue attempt to resolve the identical
 payload — never add signal-overwrite semantics without redesigning that. A
 `SigRef` arg is NOT a step dependency (distinct `__ebind_signal__` marker;
-excluded from deps/cycles/cascade). The signal gate, the `Held` fence, and the
-BP gates are three independent fences that compose — no release path touches
-another fence's state. Terminal DAGs: `Signal` no-ops without writing;
+excluded from deps/cycles/cascade). The signal gate, the `Held` fence, the
+BP gates and the `BPFence` tokens are four independent fences that compose — no
+release path touches another fence's state. Terminal DAGs: `Signal` no-ops without writing;
 `DeleteDAG` must delete signal records (a re-created pinned `WithDAGID` DAG
 would inherit them). Roots get a signals snapshot at Submit (`dag.go`) since
 they bypass the scheduler gate.
 
+### Submit order: validate, hooks, validate options, then claim
+`DAG.Submit` validates structure under `d.mu`, releases it, runs the `SubmitHook`s (they may do I/O; their options go after the caller's), validates the merged options, and only then re-takes the lock and sets `submitted` (re-checking it: two concurrent Submits of one `*DAG`, one wins). A hook or option error therefore persists nothing and leaves the DAG resubmittable. Hooks get a copy of the provisional meta (ID, Labels, DefaultPolicy, CreatedAt). Dynamic steps never pass through Submit; matchers armed by a hook still gate them.
+
+### Operator tools open, never create-or-update
+`NewFromNATS`/`NewNatsStore`/`NewNatsBus` use `CreateOrUpdate*`, which rewrites the whole bucket/stream config (replicas included) to whatever the caller passes. Only the deployment that owns the infrastructure (workers) may call them. `ebctl` and any other tool that attaches to a running deployment must use `OpenFromNATS` (`OpenNatsStore`/`OpenNatsBus`), which opens existing resources and errors if they are missing. Before v0.9 ebctl defaulted `--replicas 1` through the create path and silently scaled R=3 deployments to R=1. Regression test: `cmd/ebctl/open_only_test.go`.
+
+### Waiting on DAG state: watch, never poll Get
+`StateStore.WatchDAG` streams a DAG's meta + step records (snapshot, `Synced`, then every change). On NatsStore it is a KV `WatchFiltered` (ordered consumer), so it never sees the direct-get staleness below; a closed channel means "re-watch", and the fresh snapshot makes that restart-safe. `WaitForBreakpoint` is built on it and evaluates the computed gate (`ComputeBreakpoints`), never the advisory marks. MemStore's watch never blocks writers: a subscriber whose buffer fills is closed. `WatchDAG` is part of the `StateStore` interface and of `runStoreContract` (`runWatchDAGContract`, also run against NatsStore).
+
 ### KV reads are direct-get — no read-your-writes
-NATS JetStream KV `Get` is a *direct get*: hardcoded `AllowDirect: true` on the bucket stream, served by any in-sync replica via a queue group, not just the leader. A `Create`/`Update` commits at quorum (leader + 1 of 2 followers); the third replica applies a beat later. So a `Get` issued immediately after a write can be answered by a lagging replica and return a stale value — including `ErrKeyNotFound`/`ErrStepNotFound` for a key that definitely exists. The window is widest right after a node restart (the rejoined replica is back in the direct-get pool but a hair behind). **Never read-back-after-write to recover a revision** — `StateStore.PutStep`/`PutMeta` should return the new revision (as `kv.Create`/`kv.Update` do) and callers CAS from it directly. Writes/CAS are strongly consistent (leader-served, quorum); only this relaxed read path needs care. See `workflow/dag.go::Submit` and the `Step_PutReturnsUsableRevision` store contract.
+NATS JetStream KV `Get` is a *direct get*: hardcoded `AllowDirect: true` on the bucket stream, served by any in-sync replica via a queue group, not just the leader. A `Create`/`Update` commits at quorum (leader + 1 of 2 followers); the third replica applies a beat later. So a `Get` issued immediately after a write can be answered by a lagging replica and return a stale value — including `ErrKeyNotFound`/`ErrStepNotFound` for a key that definitely exists. The window is widest right after a node restart (the rejoined replica is back in the direct-get pool but a hair behind). **Never read-back-after-write to recover a revision** — `StateStore.PutStep`/`PutMeta` should return the new revision (as `kv.Create`/`kv.Update` do) and callers CAS from it directly. When a decision needs the latest meta (runtime
+breakpoints), use `GetMetaLatest`, a leader read. Writes/CAS are strongly consistent (leader-served, quorum); only this relaxed read path needs care. See `workflow/dag.go::Submit` and the `Step_PutReturnsUsableRevision` store contract.
 
 ### Failed-step error message persistence
 On terminal failure the worker's `StepHook.OnStepFailed` writes both `error_kind` and `error_message` (the handler's `err.Error()`) into the step record, and carries them on the completion event so the scheduler's in-memory `MarkFailed` stays consistent. The message is truncated to `Workflow.MaxStepErrorBytes` (default `DefaultMaxStepErrorBytes` = 4096; **negative ⇒ store kind only**, the compliance opt-out). The step record is the durable, DAG-lifetime source for *why* a step failed (`ebctl dag step get`); the full untruncated `TaskError` also lives in `EBIND_DLQ` (7d) and `EBIND_RESP` (short). The hook persists the record *before* the DLQ publish, so a step showing `failed` always has its error available. Only terminal failures are recorded — mid-retry attempts write nothing (use `worker.Log` middleware to capture interim errors).

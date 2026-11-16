@@ -6,10 +6,18 @@
 // completes. The paused state lives in NATS KV, so it survives process
 // restarts and costs no scheduler CPU. Resume releases the fence and the
 // scheduler picks up exactly where the DAG left off.
+//
+// Part 2 starts a DAG paused. Calling Pause right after Submit cannot
+// guarantee that nothing ran: Submit has already enqueued the roots, so they
+// may be executing by the time Pause fences. Submit with StartPaused() instead:
+// the DAG is written paused with every step held, nothing runs until Resume,
+// and in between you can inspect it, deliver signals, or hand it to an
+// operator (`ebctl dag resume <dag-id>`).
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -126,6 +134,41 @@ func main() {
 
 	waitForStatus(ctx, wf, dag.ID(), workflow.DAGStatusDone)
 	log.Printf("DAG status: done")
+
+	startPaused(ctx, wf)
+}
+
+// startPaused is part 2: submit a DAG that runs nothing until Resume.
+func startPaused(ctx context.Context, wf *workflow.Workflow) {
+	// extract → load
+	dag := workflow.New()
+	extract := dag.Step("extract", Extract)
+	load := dag.Step("load", Load, extract.Ref())
+
+	check(dag.Submit(ctx, wf, workflow.StartPaused()))
+	meta, _, err := workflow.DAGInfo(ctx, wf, dag.ID())
+	check(err)
+	log.Printf("part 2: submitted with StartPaused: status=%s", meta.Status)
+
+	// Nothing ran: even the root's result does not appear.
+	shortCtx, sc := context.WithTimeout(ctx, 500*time.Millisecond)
+	_, err = workflow.Await[int](shortCtx, wf, dag.ID(), extract)
+	sc()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		log.Fatalf("root step ran while start-paused (err=%v)", err)
+	}
+	log.Printf("root %q has not run after 500ms: every step is held", "extract")
+
+	check(workflow.Resume(ctx, wf, dag.ID()))
+	log.Printf("resumed: the roots are dispatched now")
+
+	waitCtx, wc := context.WithTimeout(ctx, 20*time.Second)
+	defer wc()
+	result, err := workflow.Await[string](waitCtx, wf, dag.ID(), load)
+	check(err)
+	log.Printf("load result: %s", result)
+	waitForStatus(ctx, wf, dag.ID(), workflow.DAGStatusDone)
+	log.Printf("part 2 DAG status: done")
 }
 
 func waitForStatus(ctx context.Context, wf *workflow.Workflow, dagID string, want workflow.DAGStatus) {

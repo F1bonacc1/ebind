@@ -162,18 +162,26 @@ func signalNotes(infos []SignalInfo) map[string]string {
 }
 
 // breakpointNotes builds the per-step BPNote annotations from computed
-// breakpoint infos (e.g. "bp:blocked[X]", "bp:holding[X]→{b,c}", "bp:released").
+// breakpoint infos (e.g. "bp:blocked[X]", "bp:holding[X]→{b,c}", "bp:released";
+// a matcher-armed step without labels shows the matcher key, e.g.
+// "bp:blocked[before:step:node-*]").
 func breakpointNotes(infos []BreakpointInfo) map[string]string {
 	notes := map[string]string{}
 	for _, bp := range infos {
+		// Name the stop by its declared labels; a step armed only by a
+		// matcher has none, so name it by the matcher keys instead.
+		names := bp.Labels
+		if len(names) == 0 {
+			names = bp.Matchers
+		}
 		var note string
 		switch {
 		case bp.State == BPStateReleased:
 			note = "bp:released"
 		case bp.State == BPStateBlocked && bp.Position == BPPositionBefore:
-			note = "bp:blocked[" + strings.Join(bp.Labels, ",") + "]"
+			note = "bp:blocked[" + strings.Join(names, ",") + "]"
 		case bp.State == BPStateBlocked && bp.Position == BPPositionAfter:
-			note = "bp:holding[" + strings.Join(bp.Labels, ",") + "]→{" + strings.Join(bp.Holding, ",") + "}"
+			note = "bp:holding[" + strings.Join(names, ",") + "]→{" + strings.Join(bp.Holding, ",") + "}"
 		default:
 			continue // declared but not hit — keep step rows quiet
 		}
@@ -295,8 +303,12 @@ func WriteDebug(w io.Writer, dbg DAGDebug) error {
 			case BPStateReleased:
 				stateStr = "  released"
 			}
+			names := bp.Labels
+			if len(names) == 0 {
+				names = bp.Matchers // armed only by a matcher: name it by key
+			}
 			if _, err := fmt.Fprintf(w, "    %s %s [%s]  %s%s\n",
-				bp.StepID, bp.Position, strings.Join(bp.Labels, ","), armed, stateStr); err != nil {
+				bp.StepID, bp.Position, strings.Join(names, ","), armed, stateStr); err != nil {
 				return err
 			}
 		}

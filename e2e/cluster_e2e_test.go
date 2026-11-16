@@ -198,9 +198,9 @@ func TestClusterE2E(t *testing.T) {
 		}
 		dag := workflow.New(workflow.WithDAGID(longDAG), workflow.WithRetry(retry))
 
-		s1 := dag.Step("s1", eAdd, 2, 3)                                                       // = 5
+		s1 := dag.Step("s1", eAdd, 2, 3)                                                           // = 5
 		s2 := dag.StepOpts("s2", eDouble, []workflow.StepOption{workflow.OnTarget("primary")}, 10) // = 20 on w1
-		g1 := dag.Step("g1", eGate1, s1.Ref())                                                 // = 5, kill-follower window
+		g1 := dag.Step("g1", eGate1, s1.Ref())                                                     // = 5, kill-follower window
 		prev := g1
 		for i := 0; i < 20; i++ { // c00..c19: continuous traffic through the degraded window
 			prev = dag.Step(fmt.Sprintf("c%02d", i), eInc, prev.Ref())
@@ -628,6 +628,89 @@ func TestClusterE2E(t *testing.T) {
 		if err := h.cluster.WaitNodeHealthy(victim, 60*time.Second); err != nil {
 			t.Fatal(err)
 		}
+	})
+
+	phase("07b_RuntimeBreakpointsDegraded", func(t *testing.T) {
+		pctx, pcancel := context.WithTimeout(ctx, 150*time.Second)
+		defer pcancel()
+		h.waitStreamLeadersSettled(t, 30*time.Second)
+
+		// Submitted with nothing armed; g stays running until released, so the
+		// arm deterministically lands on a running DAG.
+		const id = "e2e-rt-bp"
+		rdag := workflow.New(workflow.WithDAGID(id))
+		g := rdag.Step("g", eGateArm, 5)          // = 5
+		mid := rdag.Step("mid", eDouble, g.Ref()) // = 10, stopped at runtime
+		_ = rdag.Step("tail", eInc, mid.Ref())    // = 11 after disarm
+		if err := rdag.Submit(pctx, h.wf); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-gateArm.Reached():
+		case <-pctx.Done():
+			t.Fatal("g never started")
+		}
+
+		rep, err := workflow.ArmBreakpoints(pctx, h.wf, id, workflow.BeforeStep("mid"), workflow.BeforeStep("g"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(rep.Stopped, ",") != "mid@before" || strings.Join(rep.Missed, ",") != "g@before" {
+			t.Fatalf("arm report = %+v", rep)
+		}
+		gateArm.Release()
+
+		waitStopped := func(what string) {
+			t.Helper()
+			wctx, wcancel := context.WithTimeout(pctx, 30*time.Second)
+			defer wcancel()
+			for {
+				info, err := workflow.WaitForBreakpoint(wctx, h.wf, id, workflow.BeforeStep("mid"))
+				if err == nil && info.StepID == "mid" {
+					return
+				}
+				if wctx.Err() != nil {
+					t.Fatalf("%s: mid not stopped: %v", what, err)
+				}
+				time.Sleep(200 * time.Millisecond) // transient error in a degraded window
+			}
+		}
+		waitStopped("after arm")
+
+		// Chaos: kill a follower while mid is stopped by a runtime matcher. The
+		// matcher (meta) and the fence token (step) are both replicated at R=3.
+		victim := h.followerIndex()
+		if victim < 0 {
+			t.Fatal("no follower to kill")
+		}
+		t.Logf("killing follower node %d while a runtime breakpoint holds", victim)
+		h.cluster.ShutdownNode(victim)
+		h.waitStreamLeadersSettled(t, 30*time.Second)
+		waitStopped("degraded")
+		if err := h.cluster.RestartNode(victim); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.cluster.WaitReady(30 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.cluster.WaitNodeHealthy(victim, 60*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		h.waitStreamLeadersSettled(t, 30*time.Second)
+		waitStopped("after restart")
+		if st := h.stepStatus(pctx, id, "mid"); st != workflow.StatusPending {
+			t.Fatalf("mid status = %s, want pending", st)
+		}
+
+		if n, err := workflow.DisarmBreakpoints(pctx, h.wf, id, workflow.BeforeStep("mid")); err != nil || n != 1 {
+			t.Fatalf("disarm: n=%d err=%v", n, err)
+		}
+		if got, err := workflow.AwaitByID[int](pctx, h.wf, id, "tail"); err != nil || got != 11 {
+			t.Fatalf("tail: got %d, %v; want 11", got, err)
+		}
+		waitFor(t, 30*time.Second, "runtime-bp DAG done", func() bool {
+			return h.dagStatus(ctx, id) == workflow.DAGStatusDone
+		})
 	})
 
 	phase("08_FinalVerification", func(t *testing.T) {

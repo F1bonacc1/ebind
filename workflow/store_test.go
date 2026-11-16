@@ -12,6 +12,9 @@ import (
 // runStoreContract runs the contract tests against any StateStore implementation.
 // Both store_mem and store_nats must pass these.
 func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
+	runWatchDAGContract(t, newStore)
+	runGetMetaLatestContract(t, newStore)
+
 	t.Run("PutMeta_CreateOnce", func(t *testing.T) {
 		s := newStore(t)
 		ctx := context.Background()
@@ -360,4 +363,44 @@ func runStoreContract(t *testing.T, newStore func(t *testing.T) StateStore) {
 
 func TestMemStore_Contract(t *testing.T) {
 	runStoreContract(t, func(t *testing.T) StateStore { return NewMemStore() })
+}
+
+// runGetMetaLatestContract is part of runStoreContract; NatsStore runs it on
+// its own (TestNatsStore_GetMetaLatestContract) like the watch contract.
+func runGetMetaLatestContract(t *testing.T, newStore func(t *testing.T) StateStore) {
+	t.Run("GetMetaLatest_CASUsableRevision", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		if _, _, err := s.GetMetaLatest(ctx, "nope"); !errors.Is(err, ErrDAGNotFound) {
+			t.Fatalf("missing: got %v, want ErrDAGNotFound", err)
+		}
+		m := DAGMeta{ID: "d", Status: DAGStatusRunning}
+		if err := s.PutMeta(ctx, "d", m, 0); err != nil {
+			t.Fatal(err)
+		}
+		_, rev, _ := s.GetMeta(ctx, "d")
+		m.ArmedMatchers = []BPMatcher{BeforeStep("x")}
+		if err := s.PutMeta(ctx, "d", m, rev); err != nil {
+			t.Fatal(err)
+		}
+		got, latestRev, err := s.GetMetaLatest(ctx, "d")
+		if err != nil || len(got.ArmedMatchers) != 1 || latestRev == rev {
+			t.Fatalf("latest = %+v rev %d (old %d), %v", got, latestRev, rev, err)
+		}
+		// The revision must CAS like GetMeta's.
+		if err := s.PutMeta(ctx, "d", got, latestRev); err != nil {
+			t.Fatalf("CAS from GetMetaLatest revision: %v", err)
+		}
+		if err := s.DeleteMeta(ctx, "d"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.GetMetaLatest(ctx, "d"); !errors.Is(err, ErrDAGNotFound) {
+			t.Fatalf("deleted: got %v, want ErrDAGNotFound", err)
+		}
+	})
+
+}
+
+func TestNatsStore_GetMetaLatestContract(t *testing.T) {
+	runGetMetaLatestContract(t, func(t *testing.T) StateStore { return newTestNatsStore(t) })
 }
