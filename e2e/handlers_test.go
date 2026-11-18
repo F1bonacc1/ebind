@@ -56,10 +56,11 @@ var (
 
 func resetGates() {
 	gate1, gate2, gate3, gateCancel, gateArm = newGate(), newGate(), newGate(), newGate(), newGate()
+	resetLease()
 }
 
 func releaseAllGates() {
-	for _, g := range []*gate{gate1, gate2, gate3, gateCancel, gateArm} {
+	for _, g := range []*gate{gate1, gate2, gate3, gateCancel, gateArm, leaseGate} {
 		if g != nil {
 			g.Release()
 		}
@@ -135,6 +136,73 @@ func eDynamicParent(ctx context.Context, x int) (int, error) {
 // name via task.WithName — so the result identifies the executing worker.
 func WhoAmI(_ context.Context) (string, error) { return "", errors.New("stub: never executed") }
 
+// eLeaseHold is a client-side stub like WhoAmI: each worker registers its own
+// closure under "e2e.eLeaseHold", so every run records which worker ran it.
+// Runs block on leaseGate.
+func eLeaseHold(_ context.Context, x int) (int, error) {
+	return 0, errors.New("stub: never executed")
+}
+
+// leaseGate holds eLeaseHold runs open; leaseLog records each run.
+var (
+	leaseGate *gate
+	leaseLog  leaseRunLog
+)
+
+type leaseRun struct {
+	worker string
+	cause  error // context.Cause when the run ended by cancellation
+}
+
+type leaseRunLog struct {
+	mu   sync.Mutex
+	runs []*leaseRun
+}
+
+func (l *leaseRunLog) start(worker string) *leaseRun {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r := &leaseRun{worker: worker}
+	l.runs = append(l.runs, r)
+	return r
+}
+
+func (l *leaseRunLog) snapshot() []leaseRun {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]leaseRun, len(l.runs))
+	for i, r := range l.runs {
+		out[i] = *r
+	}
+	return out
+}
+
+func (l *leaseRunLog) workers() []string {
+	var ws []string
+	for _, r := range l.snapshot() {
+		ws = append(ws, r.worker)
+	}
+	return ws
+}
+
+func resetLease() {
+	leaseGate = newGate()
+	leaseLog.mu.Lock()
+	leaseLog.runs = nil
+	leaseLog.mu.Unlock()
+}
+
+func leaseHold(ctx context.Context, worker string, x int) (int, error) {
+	r := leaseLog.start(worker)
+	got, err := leaseGate.pass(ctx, x)
+	if err != nil {
+		leaseLog.mu.Lock()
+		r.cause = context.Cause(ctx)
+		leaseLog.mu.Unlock()
+	}
+	return got, err
+}
+
 // LegacyAdd is a client-side stub whose canonical name "e2e.LegacyAdd" resolves
 // through the alias registered for eAdd — the handler-rename compatibility path.
 func LegacyAdd(_ context.Context, a, b int) (int, error) {
@@ -160,5 +228,7 @@ func registerAll(reg *task.Registry, workerID string) error {
 	}
 	me := workerID
 	task.MustRegister(reg, func(_ context.Context) (string, error) { return me, nil }, task.WithName("e2e.WhoAmI"))
+	task.MustRegister(reg, func(ctx context.Context, x int) (int, error) { return leaseHold(ctx, me, x) },
+		task.WithName("e2e.eLeaseHold"))
 	return nil
 }

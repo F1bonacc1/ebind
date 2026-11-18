@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -25,12 +26,33 @@ import (
 type Options struct {
 	Durable     string // consumer durable name; default "ebind-worker"
 	Concurrency int    // max in-flight handlers; default 16
-	// AckWait is how long JetStream waits for a delivered task to be settled
+	// AckWait is how long JetStream waits to hear about a delivered task
 	// before redelivering it. Default 30s. The worker pulls a task only when
-	// it has a free slot to run it, so the clock covers the handler's run
-	// time, not time spent queued in this worker; AckWait must still exceed
-	// the slowest handler.
+	// it has a free slot to run it, so the clock never covers time spent
+	// queued in this worker. With heartbeats on (the default), AckWait only
+	// has to cover a few missed heartbeats, not the slowest handler: a live
+	// worker keeps its task for as long as the handler runs, and a dead
+	// worker's task is redelivered within about AckWait.
+	//
+	// AckWait is a consumer setting shared by every worker on the durable.
+	// Shorten it only once every worker heartbeats; a worker that doesn't
+	// still needs AckWait to exceed its slowest handler.
 	AckWait time.Duration
+	// HeartbeatInterval is how often the worker tells JetStream that a task
+	// it holds is still in progress, which restarts the task's AckWait
+	// clock. Zero selects AckWait/3; negative disables heartbeats (a task
+	// must then settle within AckWait). Must be less than AckWait.
+	//
+	// If no heartbeat reaches JetStream within AckWait (the worker is cut off
+	// from NATS), JetStream may redeliver the task elsewhere, so the worker
+	// cancels the handler's context with cause ErrLeaseLost and leaves the
+	// task to its redelivery: no StepHook, no response, no ack. A heartbeat
+	// proves the process is alive, not that the handler makes progress; bound
+	// hung handlers with a task Deadline.
+	HeartbeatInterval time.Duration
+	// Logger receives heartbeat failures and lost leases. Default
+	// slog.Default().
+	Logger *slog.Logger
 	// MaxDeliver bounds how many times NATS will redeliver a message before
 	// giving up. Default is -1 (unlimited at the NATS layer) so that the
 	// worker's RetryPolicy is authoritative: the handler decides when to
@@ -60,6 +82,12 @@ func (o *Options) setDefaults() {
 	}
 	if o.AckWait == 0 {
 		o.AckWait = 30 * time.Second
+	}
+	if o.HeartbeatInterval == 0 {
+		o.HeartbeatInterval = o.AckWait / 3
+	}
+	if o.Logger == nil {
+		o.Logger = slog.Default()
 	}
 	if o.MaxDeliver == 0 {
 		o.MaxDeliver = -1
@@ -103,6 +131,10 @@ type Worker struct {
 
 func New(nc *nats.Conn, reg *task.Registry, opts Options) (*Worker, error) {
 	opts.setDefaults()
+	if opts.HeartbeatInterval >= opts.AckWait {
+		return nil, fmt.Errorf("worker: HeartbeatInterval (%s) must be less than AckWait (%s)",
+			opts.HeartbeatInterval, opts.AckWait)
+	}
 	js, err := jetstream.New(nc)
 	if err != nil {
 		return nil, fmt.Errorf("worker: jetstream: %w", err)
@@ -136,8 +168,12 @@ func (w *Worker) Run(ctx context.Context) error {
 		return fmt.Errorf("worker: initial claims: %w", err)
 	}
 
-	s := newSlots(w.opts.Concurrency)
-	var wg sync.WaitGroup
+	// Leases outlive ctx: handlers still draining after shutdown starts keep
+	// their tasks until they settle. They end when Run returns, which marks
+	// any lease still held (a handler outliving ShutdownGrace) as lost.
+	leaseCtx, endLeases := context.WithCancel(context.WithoutCancel(ctx))
+	defer endLeases()
+	rs := &runState{slots: newSlots(w.opts.Concurrency), leaseCtx: leaseCtx}
 
 	w.claimLoopsMu.Lock()
 	w.claimLoops = map[string]*pullLoop{}
@@ -161,23 +197,31 @@ func (w *Worker) Run(ctx context.Context) error {
 	// normal shutdown it ends together with ctx.
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
-	general := w.startPullLoop(runCtx, generalCons, s, &wg)
+	general := w.startPullLoop(runCtx, generalCons, rs)
 
 	// Seed per-claim loops from the initial claim set.
-	if err := w.reconcileClaimSubs(runCtx, tasksStream, s, &wg); err != nil {
+	if err := w.reconcileClaimSubs(runCtx, tasksStream, rs); err != nil {
 		cancelRun()
-		_ = w.drain(general, nil, s, &wg)
+		_ = w.drain(general, nil, rs)
 		return fmt.Errorf("worker: claim subs: %w", err)
 	}
 
 	refresherDone := make(chan struct{})
 	go func() {
 		defer close(refresherDone)
-		w.runClaimRefresher(runCtx, tasksStream, s, &wg)
+		w.runClaimRefresher(runCtx, tasksStream, rs)
 	}()
 
 	<-ctx.Done()
-	return w.drain(general, refresherDone, s, &wg)
+	return w.drain(general, refresherDone, rs)
+}
+
+// runState is what one Run shares with its pull loops and handlers.
+type runState struct {
+	slots *slots
+	wg    sync.WaitGroup // in-flight handlers
+	// leaseCtx bounds every heartbeat; see Run.
+	leaseCtx context.Context
 }
 
 // drain runs the shutdown sequence once the loops' context has ended. Order
@@ -188,7 +232,7 @@ func (w *Worker) Run(ctx context.Context) error {
 //     its context ends, so from here on wg only counts down and wg.Wait
 //     cannot race a late wg.Add.
 //  3. Wait for in-flight handlers, up to ShutdownGrace.
-func (w *Worker) drain(general *pullLoop, refresherDone <-chan struct{}, s *slots, wg *sync.WaitGroup) error {
+func (w *Worker) drain(general *pullLoop, refresherDone <-chan struct{}, rs *runState) error {
 	if refresherDone != nil {
 		<-refresherDone
 	}
@@ -196,12 +240,12 @@ func (w *Worker) drain(general *pullLoop, refresherDone <-chan struct{}, s *slot
 	w.waitClaimLoops()
 
 	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
+	go func() { rs.wg.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(w.opts.ShutdownGrace):
 		return fmt.Errorf("worker: shutdown timeout after %s, %d handlers still in flight",
-			w.opts.ShutdownGrace, s.inUse())
+			w.opts.ShutdownGrace, rs.slots.inUse())
 	}
 	return nil
 }
@@ -217,7 +261,7 @@ func claimDurable(claim string) string {
 // currently-held claim. Loops for dropped claims are NOT stopped: they keep
 // running until worker shutdown, and the ownsTarget check in handle() NAKs
 // any stray delivery so the current owner can pick it up.
-func (w *Worker) reconcileClaimSubs(ctx context.Context, ts jetstream.Stream, s *slots, wg *sync.WaitGroup) error {
+func (w *Worker) reconcileClaimSubs(ctx context.Context, ts jetstream.Stream, rs *runState) error {
 	desired := map[string]struct{}{}
 	for _, c := range w.cachedClaims() {
 		desired[c] = struct{}{}
@@ -229,7 +273,7 @@ func (w *Worker) reconcileClaimSubs(ctx context.Context, ts jetstream.Stream, s 
 		if _, ok := w.claimLoops[claim]; ok {
 			continue
 		}
-		l, err := w.subscribeClaim(ctx, ts, claim, s, wg)
+		l, err := w.subscribeClaim(ctx, ts, claim, rs)
 		if err != nil {
 			return fmt.Errorf("subscribe %q: %w", claim, err)
 		}
@@ -238,26 +282,38 @@ func (w *Worker) reconcileClaimSubs(ctx context.Context, ts jetstream.Stream, s 
 	return nil
 }
 
-func (w *Worker) subscribeClaim(ctx context.Context, ts jetstream.Stream, claim string, s *slots, wg *sync.WaitGroup) (*pullLoop, error) {
+func (w *Worker) subscribeClaim(ctx context.Context, ts jetstream.Stream, claim string, rs *runState) (*pullLoop, error) {
+	cfg := jetstream.ConsumerConfig{
+		Durable:       claimDurable(claim),
+		FilterSubject: stream.TargetedTaskFilter(claim),
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       w.opts.AckWait,
+		MaxDeliver:    w.opts.MaxDeliver,
+		// BackOff intentionally omitted — see comment on generalCons.
+	}
 	// Prefer fetching an existing durable: calling CreateOrUpdate with identical
 	// config on a durable that already has in-flight deliveries can reset the
 	// consumer's pending state in some NATS server versions, which surfaces as
-	// spurious redeliveries during claim churn. Fetch first, create if absent.
-	cons, err := ts.Consumer(ctx, claimDurable(claim))
-	if err != nil {
-		cons, err = ts.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-			Durable:       claimDurable(claim),
-			FilterSubject: stream.TargetedTaskFilter(claim),
-			AckPolicy:     jetstream.AckExplicitPolicy,
-			AckWait:       w.opts.AckWait,
-			MaxDeliver:    w.opts.MaxDeliver,
-			// BackOff intentionally omitted — see comment on generalCons.
-		})
-		if err != nil {
-			return nil, err
-		}
+	// spurious redeliveries during claim churn. Fetch first, create if absent,
+	// and update only when the settings Options controls have changed, so a
+	// new AckWait reaches targeted tasks too.
+	cons, err := ts.Consumer(ctx, cfg.Durable)
+	switch {
+	case err != nil:
+		cons, err = ts.CreateOrUpdateConsumer(ctx, cfg)
+	case configDrifted(cons.CachedInfo().Config, cfg):
+		cons, err = ts.UpdateConsumer(ctx, cfg)
 	}
-	return w.startPullLoop(ctx, cons, s, wg), nil
+	if err != nil {
+		return nil, err
+	}
+	return w.startPullLoop(ctx, cons, rs), nil
+}
+
+// configDrifted reports whether an existing durable's settings differ from
+// the ones Options controls.
+func configDrifted(have, want jetstream.ConsumerConfig) bool {
+	return have.AckWait != want.AckWait || have.MaxDeliver != want.MaxDeliver
 }
 
 // waitClaimLoops waits for every claim loop to exit. The loops watch the run
@@ -309,7 +365,7 @@ func (w *Worker) refreshClaims(ctx context.Context) error {
 // and reconciles the per-claim subscription set. Transient Claims() errors
 // are ignored — the last good cache stays in place so one flaky lookup
 // doesn't blackhole targeted tasks.
-func (w *Worker) runClaimRefresher(ctx context.Context, ts jetstream.Stream, s *slots, wg *sync.WaitGroup) {
+func (w *Worker) runClaimRefresher(ctx context.Context, ts jetstream.Stream, rs *runState) {
 	if w.opts.Claims == nil {
 		return // claims are static; nothing to reconcile
 	}
@@ -323,7 +379,7 @@ func (w *Worker) runClaimRefresher(ctx context.Context, ts jetstream.Stream, s *
 			if err := w.refreshClaims(ctx); err != nil {
 				continue
 			}
-			_ = w.reconcileClaimSubs(ctx, ts, s, wg)
+			_ = w.reconcileClaimSubs(ctx, ts, rs)
 		}
 	}
 }
@@ -361,7 +417,10 @@ func (w *Worker) baseHandler() Handler {
 	}
 }
 
-func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
+// handle runs one delivery. ctx is the run context, which shutdown cancels;
+// leaseCtx bounds the delivery's heartbeats (see Run).
+func (w *Worker) handle(ctx, leaseCtx context.Context, msg jetstream.Msg) {
+	received := time.Now()
 	var t task.Task
 	if err := json.Unmarshal(msg.Data(), &t); err != nil {
 		_ = msg.Term()
@@ -383,7 +442,15 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 
 	resp := task.Response{TaskID: t.ID, Attempts: t.Attempt}
 
-	handlerCtx := ctx
+	// From here on the delivery is held under a lease: heartbeats keep it
+	// from being redelivered while the handler and the StepHook run, and
+	// every settlement goes through the lease. If the lease is lost, the
+	// handler's context is canceled with cause ErrLeaseLost.
+	handlerCtx, cancelHandler := context.WithCancelCause(ctx)
+	defer cancelHandler(nil)
+	ls := w.startLease(leaseCtx, msg, &t, received, func() { cancelHandler(ErrLeaseLost) })
+	defer ls.stop()
+
 	if !t.Deadline.IsZero() {
 		if time.Now().After(t.Deadline) {
 			te := &task.TaskError{Kind: task.ErrKindDeadline, Message: "deadline exceeded before dispatch", Retryable: false}
@@ -394,16 +461,24 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 			if w.opts.StepHook != nil {
 				_ = w.opts.StepHook.OnStepFailed(ctx, &t, te)
 			}
-			_ = msg.Term()
+			_ = ls.Term()
 			return
 		}
 		var cancel context.CancelFunc
-		handlerCtx, cancel = context.WithDeadline(ctx, t.Deadline)
+		handlerCtx, cancel = context.WithDeadline(handlerCtx, t.Deadline)
 		defer cancel()
 	}
 
 	result, callErr := w.invoke(handlerCtx, &t)
 	resp.CompletedAt = time.Now().UTC()
+
+	if ls.Lost() {
+		// JetStream may already have redelivered the task, and the
+		// redelivery owns it now: no StepHook, no response, no settlement.
+		// Settling here could also turn the handler's ErrLeaseLost
+		// cancellation into a retry or a terminal failure.
+		return
+	}
 
 	if callErr != nil {
 		var te *task.TaskError
@@ -411,7 +486,7 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 			te = &task.TaskError{Kind: task.ErrKindHandler, Message: callErr.Error(), Retryable: true}
 		}
 		if w.shouldRetry(&t, te) {
-			_ = msg.NakWithDelay(w.delayFor(&t))
+			_ = ls.NakWithDelay(w.delayFor(&t))
 			return
 		}
 		resp.Error = te
@@ -422,13 +497,13 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 		// "running" forever. Redeliver instead so the failure is retried.
 		if w.opts.StepHook != nil {
 			if hookErr := w.opts.StepHook.OnStepFailed(ctx, &t, te); hookErr != nil {
-				_ = msg.NakWithDelay(w.delayFor(&t))
+				_ = ls.NakWithDelay(w.delayFor(&t))
 				return
 			}
 		}
 		w.publishResponse(ctx, &t, &resp)
 		w.publishDLQ(ctx, &t, te)
-		_ = msg.Term()
+		_ = ls.Term()
 		return
 	}
 
@@ -440,12 +515,12 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 	// the (idempotent) handler re-runs and the completion is retried.
 	if w.opts.StepHook != nil {
 		if hookErr := w.opts.StepHook.OnStepDone(ctx, &t, result); hookErr != nil {
-			_ = msg.NakWithDelay(w.delayFor(&t))
+			_ = ls.NakWithDelay(w.delayFor(&t))
 			return
 		}
 	}
 	w.publishResponse(ctx, &t, &resp)
-	_ = msg.Ack()
+	_ = ls.Ack()
 }
 
 // shouldRetry asks the effective policy (task-level > DefaultRetryPolicy Option >

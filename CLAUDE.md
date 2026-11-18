@@ -72,6 +72,7 @@ client/
 worker/
   worker.go              Run loop, handle(), policy-aware retry
   pull.go                pull loops: fetch only into free slots (no prefetch), slot pool
+  lease.go               heartbeat lease per delivery: confirmed +WPI, stop-before-settle, ErrLeaseLost
   middleware.go          Middleware chain builder, Recover, Log
   hook.go                StepHook interface (workflow decoupling seam)
 
@@ -114,6 +115,7 @@ workflow/
 
 internal/testutil/
   harness.go             SingleNode helper
+  proxy.go               TCP proxy that can freeze a connection (silent partition)
 
 cmd/demo/
   main.go                Single-process e2e demo
@@ -143,10 +145,12 @@ cmd/ebctl/               operator CLI (cobra)
   - `workflow/signal_test.go` (pure gate/ResolveArgs tests + fakes-driven Signal/scheduler tests)
 - **Integration** — real in-process NATS via `embed.StartNode`:
   - `worker/worker_test.go`, `workflow/integration_test.go`, `workflow/breakpoint_integration_test.go`, `workflow/signal_integration_test.go`
+  - `worker/heartbeat_test.go` (lease: long handler, dead worker, frozen connection via `testutil.Proxy`, Nak delay, drain, claim-durable AckWait)
 - **Cluster integration** — 3-node in-process cluster:
   - `embed/cluster_test.go`
 - **Cluster chaos e2e** (build tag `e2e`, excluded from `make test`) — every supported operation on a 3-node cluster at R=3, with node kill + restart injected mid-workflow:
   - `e2e/cluster_e2e_test.go`
+  - `e2e/lease_e2e_test.go` (heartbeat lease across a kill of the worker's node and of its consumer leader; dead-worker takeover)
 
 Run patterns:
 ```sh
@@ -182,6 +186,39 @@ otherwise it does a no-wait pull and backs off, so an empty long-poll can't
 park the only slot at low Concurrency. Shutdown waits for the claim
 refresher, then every loop, then handlers, so a late `wg.Add` can never race
 `wg.Wait`.
+
+### Every delivery is held under a heartbeat lease
+From just after the target check until settlement, `handle()` holds each
+delivery under a lease (`worker/lease.go`) that heartbeats it every
+`Options.HeartbeatInterval` (default AckWait/3), so AckWait only has to
+cover a few missed heartbeats, not the slowest handler. Invariants:
+- **Heartbeats are confirmed requests**, a `+WPI` sent with
+  `nc.RequestWithContext` on `msg.Reply()`. Never switch to
+  `msg.InProgress()`: it is a plain publish that nats.go buffers and reports
+  as successful while disconnected, so a partitioned worker could never tell
+  it had lost the task (`TestWorker_Heartbeat_FrozenConnectionLosesLease`).
+- **Stop before settle.** Every `Ack`/`Nak`/`NakWithDelay`/`Term` goes
+  through the lease, which stops the heartbeat goroutine and waits for it to
+  exit first. A `+WPI` processed after `NakWithDelay` restarts the full
+  AckWait and overrides the retry delay. Never settle via `msg` directly once
+  the lease exists.
+- **Loss is conservative and permanent.** The lease runs out at (send time of
+  the last acknowledged heartbeat, or receipt) + AckWait, a lower bound for
+  JetStream's redelivery. Once lost, a later reply never revives it. On loss
+  the handler's context is canceled with cause `ErrLeaseLost`, and `handle()`
+  skips the StepHook, the response and settlement: the redelivery owns the
+  task.
+- **Lease lifetime is not the run context.** Heartbeats continue while
+  handlers drain after shutdown starts and end only when `Run` returns; a
+  handler that outlives `ShutdownGrace` loses its lease and never settles.
+- **Hung handlers keep their task forever.** A heartbeat proves the process
+  is alive, not progress; bound handlers with a task `Deadline`.
+- `subscribeClaim` reuses an existing per-claim durable but updates it when
+  its AckWait or MaxDeliver differ from `Options`, so a new AckWait reaches
+  targeted tasks too.
+
+AckWait is a consumer setting shared by every worker on a durable: in a
+rolling upgrade, shorten it only after every worker heartbeats.
 
 ### Dedupe window
 JetStream dedupe uses `Nats-Msg-Id`. For ad-hoc `client.Enqueue`, the ID is the task's uuid. For DAG steps enqueued by the scheduler, the ID is `<dag_id>:<step_id>` — this protects against duplicate-enqueues during scheduler races. The default dedupe window is **5 minutes**; long-polling tests should keep that in mind.

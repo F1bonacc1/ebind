@@ -352,9 +352,18 @@ See [CLAUDE.md](./CLAUDE.md) for the full architectural walk-through.
 | Non-retryable errors | `RetryPolicy.NonRetryableErrorKinds` OR `TaskError{Retryable: false}` |
 | Dead-lettering | `dlq.Publish` auto-called on final failure → `EBIND_DLQ` stream |
 | Failure visibility | Failed step record carries `error_kind` + `error_msg` (durable in KV, via `ebctl dag step get`); full `TaskError` in `EBIND_DLQ`; cap with `Workflow.MaxStepErrorBytes` |
+| Long-running handlers | The worker heartbeats every task it holds (`worker.Options.HeartbeatInterval`, default `AckWait/3`), so `AckWait` only has to cover a few missed heartbeats, not the slowest handler |
+| Crashed or partitioned workers | A task whose worker stops heartbeating is redelivered within about `AckWait`; a worker cut off from NATS cancels the handler (`context.Cause` = `worker.ErrLeaseLost`) and leaves the task to the redelivery |
+| Hung handlers | Not covered by heartbeats (the process is alive); bound them with a task `Deadline` |
 | Graceful shutdown | `worker.Run(ctx)` drains in-flight on ctx-cancel (configurable grace) |
 | HA | 3-node embedded cluster with `Replicas: 3` streams & KV |
 | Stranded DAG recovery | `Scheduler` sweep on `LeaderElector` false→true edge |
+
+**Shortening `AckWait`.** `AckWait` is a setting of the shared consumer, so a
+worker that starts with a new value changes it for every worker on that
+consumer. During a rolling upgrade, shorten it only after every worker runs a
+version that heartbeats; until then an older worker's long task is redelivered
+while it still runs.
 
 ## Package layout
 
