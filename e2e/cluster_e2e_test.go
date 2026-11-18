@@ -411,8 +411,9 @@ func TestClusterE2E(t *testing.T) {
 		h.waitStreamLeadersSettled(t, 60*time.Second)
 
 		// Finish the DAG across the failover. gate3 was held through the node
-		// restart (deliberately past AckWait), so redelivered executions of g3
-		// exercise the idempotent re-execution path here too.
+		// restart and this kill; its worker heartbeats the task, so g3 is
+		// re-executed only if a failover outlasted AckWait. Either way the
+		// result must be the same.
 		gate3.Release()
 
 		if got, err := workflow.AwaitByID[int](pctx, h.wf, longDAG, "final"); err != nil || got != 59 {

@@ -31,9 +31,10 @@ const (
 	numNodes = 3
 	replicas = 3
 	// ackWait bounds the redelivery stall after a lost ack during a node kill.
-	// Gate holds that must stay short (gate1, gate2) are released well inside
-	// this window; gate3 is deliberately held across a node restart so its
-	// redeliveries exercise the idempotent re-execution path.
+	// Workers heartbeat held tasks, so a gated handler keeps its task across a
+	// node kill as long as its worker fails over and reaches the consumer
+	// leader again within ackWait; TestClusterLeaseE2E covers that and the
+	// redelivery after a worker dies.
 	ackWait = 15 * time.Second
 )
 
@@ -142,6 +143,12 @@ func startClusterWithRetry(t *testing.T) *embed.Cluster {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessAckWait(t, ackWait)
+}
+
+// newHarnessAckWait is newHarness with the workers' AckWait set to wait.
+func newHarnessAckWait(t *testing.T, wait time.Duration) *harness {
+	t.Helper()
 	resetGates()
 
 	c := startClusterWithRetry(t)
@@ -234,7 +241,7 @@ func newHarness(t *testing.T) *harness {
 		m := &countingMetrics{}
 		w, err := worker.New(nc, reg, worker.Options{
 			Concurrency:   8,
-			AckWait:       ackWait,
+			AckWait:       wait,
 			ShutdownGrace: 20 * time.Second,
 			StepHook:      wf.Hook(),
 			Middleware: []worker.Middleware{

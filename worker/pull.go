@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -102,11 +101,11 @@ func (s *slots) inUse() int { return len(s.sem) }
 // pullLoop is one running consumer loop; done closes when it has exited.
 type pullLoop struct{ done chan struct{} }
 
-func (w *Worker) startPullLoop(ctx context.Context, cons jetstream.Consumer, s *slots, wg *sync.WaitGroup) *pullLoop {
+func (w *Worker) startPullLoop(ctx context.Context, cons jetstream.Consumer, rs *runState) *pullLoop {
 	l := &pullLoop{done: make(chan struct{})}
 	go func() {
 		defer close(l.done)
-		w.runPullLoop(ctx, cons, s, wg)
+		w.runPullLoop(ctx, cons, rs)
 	}()
 	return l
 }
@@ -137,7 +136,8 @@ func (w *Worker) startPullLoop(ctx context.Context, cons jetstream.Consumer, s *
 //
 // The loop exits once ctx ends and never starts a handler after that, so
 // after every loop has exited the handler WaitGroup only counts down.
-func (w *Worker) runPullLoop(ctx context.Context, cons jetstream.Consumer, s *slots, wg *sync.WaitGroup) {
+func (w *Worker) runPullLoop(ctx context.Context, cons jetstream.Consumer, rs *runState) {
+	s := rs.slots
 	var idleBackoff, errBackoff time.Duration
 	hot := false // the previous round received work
 	for {
@@ -150,14 +150,14 @@ func (w *Worker) runPullLoop(ctx context.Context, cons jetstream.Consumer, s *sl
 		}
 		contended := s.contended()
 		noWait := contended || held > 1
-		started, err := w.pullInto(ctx, cons, s, wg, held, noWait)
+		started, err := w.pullInto(ctx, cons, rs, held, noWait)
 		held -= started
 		if started == 0 && err == nil && noWait && !contended && ctx.Err() == nil {
 			// The backlog drained since the last round: wait for new work
 			// on a single slot.
 			s.releaseN(held - 1)
 			held = 1
-			started, err = w.pullInto(ctx, cons, s, wg, 1, false)
+			started, err = w.pullInto(ctx, cons, rs, 1, false)
 			held -= started
 		}
 		s.releaseN(held)
@@ -193,7 +193,7 @@ func (w *Worker) runPullLoop(ctx context.Context, cons jetstream.Consumer, s *sl
 // slots. With noWait the server answers at once with whatever is available;
 // otherwise it long-polls for up to idlePollWait. Ending empty is not an
 // error.
-func (w *Worker) pullInto(ctx context.Context, cons jetstream.Consumer, s *slots, wg *sync.WaitGroup, n int, noWait bool) (int, error) {
+func (w *Worker) pullInto(ctx context.Context, cons jetstream.Consumer, rs *runState, n int, noWait bool) (int, error) {
 	var (
 		batch jetstream.MessageBatch
 		err   error
@@ -221,13 +221,13 @@ func (w *Worker) pullInto(ctx context.Context, cons jetstream.Consumer, s *slots
 			continue
 		}
 		started++
-		wg.Add(1)
+		rs.wg.Add(1)
 		go func() {
 			defer func() {
-				s.release()
-				wg.Done()
+				rs.slots.release()
+				rs.wg.Done()
 			}()
-			w.handle(ctx, msg)
+			w.handle(ctx, rs.leaseCtx, msg)
 		}()
 	}
 	err = batch.Error()
