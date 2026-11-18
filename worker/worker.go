@@ -456,11 +456,17 @@ func (w *Worker) handle(ctx, leaseCtx context.Context, msg jetstream.Msg) {
 			te := &task.TaskError{Kind: task.ErrKindDeadline, Message: "deadline exceeded before dispatch", Retryable: false}
 			resp.Error = te
 			resp.CompletedAt = time.Now().UTC()
+			// Same order as the terminal-failure path below: persist the
+			// failure first, and redeliver if that fails. Terminating after a
+			// failed hook would strand the step in "running" forever.
+			if w.opts.StepHook != nil {
+				if hookErr := w.opts.StepHook.OnStepFailed(ctx, &t, te); hookErr != nil {
+					_ = ls.NakWithDelay(w.delayFor(&t))
+					return
+				}
+			}
 			w.publishResponse(ctx, &t, &resp)
 			w.publishDLQ(ctx, &t, te)
-			if w.opts.StepHook != nil {
-				_ = w.opts.StepHook.OnStepFailed(ctx, &t, te)
-			}
 			_ = ls.Term()
 			return
 		}

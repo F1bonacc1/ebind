@@ -288,6 +288,104 @@ func TestWorker_StepHook_OnDoneError_Redelivers(t *testing.T) {
 	}
 }
 
+// flakyFailedHook fails OnStepFailed a fixed number of times before
+// succeeding: the failure-persist counterpart of flakyDoneHook.
+type flakyFailedHook struct {
+	failsLeft atomic.Int32
+	calls     atomic.Int32
+	succeeded atomic.Int32
+}
+
+func (h *flakyFailedHook) OnStepDone(_ context.Context, _ *task.Task, _ []byte) error {
+	return nil
+}
+func (h *flakyFailedHook) OnStepFailed(_ context.Context, _ *task.Task, _ *task.TaskError) error {
+	h.calls.Add(1)
+	if h.failsLeft.Add(-1) >= 0 {
+		return errors.New("transient failure-persist failure")
+	}
+	h.succeeded.Add(1)
+	return nil
+}
+
+var deadlineProbeRuns atomic.Int32
+
+func deadlineProbe(ctx context.Context) error {
+	deadlineProbeRuns.Add(1)
+	return nil
+}
+
+// TestWorker_StepHook_DeadlineExpired_OnFailedError_Redelivers covers the
+// deadline-expired-before-dispatch path: when OnStepFailed fails, the worker
+// must redeliver rather than Term, and must publish neither the response nor
+// the DLQ entry until the failure is persisted. Terminating after a failed
+// hook left the DAG step "running" forever.
+func TestWorker_StepHook_DeadlineExpired_OnFailedError_Redelivers(t *testing.T) {
+	deadlineProbeRuns.Store(0)
+	hook := &flakyFailedHook{}
+	hook.failsLeft.Store(1) // fail the failure-persist once, then succeed
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1, StepHook: hook})
+	task.MustRegister(h.Reg, deadlineProbe)
+
+	fut, err := client.EnqueueOpts(h.Client, deadlineProbe, client.EnqueueOptions{
+		Deadline: time.Now().Add(-time.Second), // already expired on pickup
+		RetryPolicy: &task.RetryPolicy{
+			InitialInterval:    50 * time.Millisecond,
+			BackoffCoefficient: 1,
+			MaximumAttempts:    5,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = fut.Get(ctx, nil)
+	var te *task.TaskError
+	if !errors.As(err, &te) || te.Kind != task.ErrKindDeadline {
+		t.Fatalf("want deadline TaskError, got %v", err)
+	}
+	// The response goes out only after OnStepFailed succeeds, so by the time
+	// the future resolves the hook has failed once, been redelivered, and
+	// succeeded. No polling: anything else means the order is wrong.
+	if got := hook.succeeded.Load(); got != 1 {
+		t.Errorf("OnStepFailed succeeded=%d when the response arrived, want 1", got)
+	}
+	if got := hook.calls.Load(); got != 2 {
+		t.Errorf("OnStepFailed calls=%d when the response arrived, want 2 (redelivered after first failure)", got)
+	}
+
+	// The DLQ entry is written once, on the attempt whose hook succeeded.
+	dlqStream, err := h.JS.Stream(ctx, stream.DLQStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		info, err := dlqStream.Info(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.State.Msgs > 0 {
+			break
+		}
+	}
+	// Give a stray extra delivery time to surface before the final counts.
+	time.Sleep(500 * time.Millisecond)
+	info, err := dlqStream.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State.Msgs != 1 {
+		t.Errorf("DLQ msgs=%d, want 1", info.State.Msgs)
+	}
+	if got := hook.succeeded.Load(); got != 1 {
+		t.Errorf("OnStepFailed succeeded=%d after settling, want exactly 1", got)
+	}
+	if got := deadlineProbeRuns.Load(); got != 0 {
+		t.Errorf("handler ran %d times, want 0 (deadline expired before dispatch)", got)
+	}
+}
+
 func TestWorker_StepHook_OnSuccess(t *testing.T) {
 	hook := &captureHook{}
 	h := testutil.SingleNode(t, worker.Options{Concurrency: 1, StepHook: hook})
