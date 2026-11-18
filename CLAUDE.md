@@ -71,6 +71,7 @@ client/
 
 worker/
   worker.go              Run loop, handle(), policy-aware retry
+  pull.go                pull loops: fetch only into free slots (no prefetch), slot pool
   middleware.go          Middleware chain builder, Recover, Log
   hook.go                StepHook interface (workflow decoupling seam)
 
@@ -155,6 +156,23 @@ make cover             # HTML coverage
 
 ### Consumer MaxDeliver vs task-level MaximumAttempts
 `worker.Options.MaxDeliver` defaults to -1 (unlimited at the NATS layer), so the worker's RetryPolicy is authoritative: per-task `RetryPolicy.MaximumAttempts` (or `Options.DefaultRetryPolicy`, default 5 attempts) decides when a task terminates (Term + DLQ). Setting a positive `MaxDeliver` adds an infrastructure-level cap that overrides an over-generous RetryPolicy — the consumer stops redelivering regardless of what the policy wants.
+
+### Workers pull only into a free slot
+JetStream starts a message's AckWait clock the moment it delivers it, so the
+worker never pulls a task it has no free slot for: each consumer loop
+(`worker/pull.go`) acquires slots first, then fetches at most that many
+messages (a no-wait batch over the free slots while a backlog drains, else a
+long-poll on one slot). Never reintroduce a prefetching `Consume`, or a
+`Fetch` larger than the slots held. A buffered message runs its AckWait clock through the queue wait as
+well as the handler, so any backlog longer than AckWait makes JetStream
+redeliver tasks that are still queued or running in the same worker
+(`TestWorker_Backlog_NoDuplicateRuns`). Every worker runs at least two loops
+on the shared slots (the general durable and its `worker:<id>` claim
+durable). A loop long-polls only when no other loop is waiting for a slot;
+otherwise it does a no-wait pull and backs off, so an empty long-poll can't
+park the only slot at low Concurrency. Shutdown waits for the claim
+refresher, then every loop, then handlers, so a late `wg.Add` can never race
+`wg.Wait`.
 
 ### Dedupe window
 JetStream dedupe uses `Nats-Msg-Id`. For ad-hoc `client.Enqueue`, the ID is the task's uuid. For DAG steps enqueued by the scheduler, the ID is `<dag_id>:<step_id>` — this protects against duplicate-enqueues during scheduler races. The default dedupe window is **5 minutes**; long-polling tests should keep that in mind.

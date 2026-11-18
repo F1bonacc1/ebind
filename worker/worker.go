@@ -23,9 +23,14 @@ import (
 )
 
 type Options struct {
-	Durable     string        // consumer durable name; default "ebind-worker"
-	Concurrency int           // max in-flight handlers; default 16
-	AckWait     time.Duration // default 30s
+	Durable     string // consumer durable name; default "ebind-worker"
+	Concurrency int    // max in-flight handlers; default 16
+	// AckWait is how long JetStream waits for a delivered task to be settled
+	// before redelivering it. Default 30s. The worker pulls a task only when
+	// it has a free slot to run it, so the clock covers the handler's run
+	// time, not time spent queued in this worker; AckWait must still exceed
+	// the slowest handler.
+	AckWait time.Duration
 	// MaxDeliver bounds how many times NATS will redeliver a message before
 	// giving up. Default is -1 (unlimited at the NATS layer) so that the
 	// worker's RetryPolicy is authoritative: the handler decides when to
@@ -87,19 +92,13 @@ type Worker struct {
 	opts   Options
 	invoke Handler
 
-	// stopping is set true at the start of Run's shutdown sequence. The
-	// consume callback checks it (fast-path before sem, recheck after sem)
-	// to bail out with a Nak instead of incrementing wg, eliminating the
-	// race where a callback's wg.Add(1) lands after wg.Wait() observed 0.
-	stopping atomic.Bool
-
 	claimCache atomic.Pointer[[]string]
 
-	// activeClaimSubs tracks subscriptions to per-claim targeted durables so
-	// the worker only receives targeted messages it actually owns — eliminating
-	// the wrong-target NAK loop entirely. Keyed by claim string.
-	claimSubsMu     sync.Mutex
-	activeClaimSubs map[string]jetstream.ConsumeContext
+	// claimLoops tracks the pull loops on per-claim targeted durables so the
+	// worker only receives targeted messages it actually owns, eliminating
+	// the wrong-target NAK loop. Keyed by claim string.
+	claimLoopsMu sync.Mutex
+	claimLoops   map[string]*pullLoop
 }
 
 func New(nc *nats.Conn, reg *task.Registry, opts Options) (*Worker, error) {
@@ -137,10 +136,12 @@ func (w *Worker) Run(ctx context.Context) error {
 		return fmt.Errorf("worker: initial claims: %w", err)
 	}
 
-	sem := make(chan struct{}, w.opts.Concurrency)
+	s := newSlots(w.opts.Concurrency)
 	var wg sync.WaitGroup
 
-	w.activeClaimSubs = map[string]jetstream.ConsumeContext{}
+	w.claimLoopsMu.Lock()
+	w.claimLoops = map[string]*pullLoop{}
+	w.claimLoopsMu.Unlock()
 
 	generalCons, err := tasksStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Durable:       w.opts.Durable,
@@ -156,32 +157,43 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("worker: consumer: %w", err)
 	}
-	generalCC, err := w.startConsumer(ctx, generalCons, sem, &wg)
-	if err != nil {
-		return fmt.Errorf("worker: consume: %w", err)
-	}
+	// runCtx lets a failed startup stop the loops it already started; on a
+	// normal shutdown it ends together with ctx.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	general := w.startPullLoop(runCtx, generalCons, s, &wg)
 
-	// Seed per-claim subscriptions from the initial claim set.
-	if err := w.reconcileClaimSubs(ctx, tasksStream, sem, &wg); err != nil {
-		generalCC.Stop()
+	// Seed per-claim loops from the initial claim set.
+	if err := w.reconcileClaimSubs(runCtx, tasksStream, s, &wg); err != nil {
+		cancelRun()
+		_ = w.drain(general, nil, s, &wg)
 		return fmt.Errorf("worker: claim subs: %w", err)
 	}
 
-	go w.runClaimRefresher(ctx, tasksStream, sem, &wg)
+	refresherDone := make(chan struct{})
+	go func() {
+		defer close(refresherDone)
+		w.runClaimRefresher(runCtx, tasksStream, s, &wg)
+	}()
 
 	<-ctx.Done()
-	// Order matters:
-	//   1. Set stopping so consume callbacks fast-path Nak instead of
-	//      racing wg.Add(1) against wg.Wait().
-	//   2. Stop() on every consumer (non-blocking).
-	//   3. <-Closed() on every consumer — guarantees the dispatch
-	//      goroutine has fully exited, so every callback has already
-	//      executed wg.Add(1) (or bailed without it).
-	//   4. wg.Wait() drains spawned handler goroutines.
-	w.stopping.Store(true)
-	generalCC.Stop()
-	w.stopAllClaimSubs()
-	<-generalCC.Closed()
+	return w.drain(general, refresherDone, s, &wg)
+}
+
+// drain runs the shutdown sequence once the loops' context has ended. Order
+// matters:
+//  1. Wait for the claim refresher (if started), so it cannot start another
+//     loop.
+//  2. Wait for every pull loop to exit. A loop never starts a handler after
+//     its context ends, so from here on wg only counts down and wg.Wait
+//     cannot race a late wg.Add.
+//  3. Wait for in-flight handlers, up to ShutdownGrace.
+func (w *Worker) drain(general *pullLoop, refresherDone <-chan struct{}, s *slots, wg *sync.WaitGroup) error {
+	if refresherDone != nil {
+		<-refresherDone
+	}
+	<-general.done
+	w.waitClaimLoops()
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
@@ -189,34 +201,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	case <-done:
 	case <-time.After(w.opts.ShutdownGrace):
 		return fmt.Errorf("worker: shutdown timeout after %s, %d handlers still in flight",
-			w.opts.ShutdownGrace, len(sem))
+			w.opts.ShutdownGrace, s.inUse())
 	}
 	return nil
-}
-
-func (w *Worker) startConsumer(ctx context.Context, cons jetstream.Consumer, sem chan struct{}, wg *sync.WaitGroup) (jetstream.ConsumeContext, error) {
-	return cons.Consume(func(msg jetstream.Msg) {
-		// Fast-path: shutdown already begun, don't bother with sem or wg.
-		if w.stopping.Load() {
-			_ = msg.Nak()
-			return
-		}
-		sem <- struct{}{}
-		// Re-check after acquiring sem: stopping may have flipped while we
-		// were blocked. Without this check, a piled-up callback could still
-		// reach wg.Add(1) and race wg.Wait(). The <-Closed() barrier in Run
-		// guarantees the dispatch loop sees this Nak before wg.Wait runs.
-		if w.stopping.Load() {
-			<-sem
-			_ = msg.Nak()
-			return
-		}
-		wg.Add(1)
-		go func() {
-			defer func() { <-sem; wg.Done() }()
-			w.handle(ctx, msg)
-		}()
-	})
 }
 
 // claimDurable returns the durable consumer name for a given claim. Workers
@@ -226,35 +213,32 @@ func claimDurable(claim string) string {
 	return "ebind-targets-" + stream.TargetToken(claim)
 }
 
-// reconcileClaimSubs ensures the worker subscribes to every currently-held
-// claim. Subscriptions for dropped claims are intentionally NOT stopped:
-// in-flight handlers for a claim-sub we're about to Stop() can get their
-// messages redelivered before they Ack, which breaks at-least-once semantics
-// during claim churn. Instead, subs remain open and the ownsTarget check in
-// handle() NAKs any stray delivery so it can be picked up by the current
-// owner. Subs only go away on worker shutdown.
-func (w *Worker) reconcileClaimSubs(ctx context.Context, ts jetstream.Stream, sem chan struct{}, wg *sync.WaitGroup) error {
+// reconcileClaimSubs ensures the worker runs a pull loop for every
+// currently-held claim. Loops for dropped claims are NOT stopped: they keep
+// running until worker shutdown, and the ownsTarget check in handle() NAKs
+// any stray delivery so the current owner can pick it up.
+func (w *Worker) reconcileClaimSubs(ctx context.Context, ts jetstream.Stream, s *slots, wg *sync.WaitGroup) error {
 	desired := map[string]struct{}{}
 	for _, c := range w.cachedClaims() {
 		desired[c] = struct{}{}
 	}
 
-	w.claimSubsMu.Lock()
-	defer w.claimSubsMu.Unlock()
+	w.claimLoopsMu.Lock()
+	defer w.claimLoopsMu.Unlock()
 	for claim := range desired {
-		if _, ok := w.activeClaimSubs[claim]; ok {
+		if _, ok := w.claimLoops[claim]; ok {
 			continue
 		}
-		cc, err := w.subscribeClaim(ctx, ts, claim, sem, wg)
+		l, err := w.subscribeClaim(ctx, ts, claim, s, wg)
 		if err != nil {
 			return fmt.Errorf("subscribe %q: %w", claim, err)
 		}
-		w.activeClaimSubs[claim] = cc
+		w.claimLoops[claim] = l
 	}
 	return nil
 }
 
-func (w *Worker) subscribeClaim(ctx context.Context, ts jetstream.Stream, claim string, sem chan struct{}, wg *sync.WaitGroup) (jetstream.ConsumeContext, error) {
+func (w *Worker) subscribeClaim(ctx context.Context, ts jetstream.Stream, claim string, s *slots, wg *sync.WaitGroup) (*pullLoop, error) {
 	// Prefer fetching an existing durable: calling CreateOrUpdate with identical
 	// config on a durable that already has in-flight deliveries can reset the
 	// consumer's pending state in some NATS server versions, which surfaces as
@@ -273,23 +257,21 @@ func (w *Worker) subscribeClaim(ctx context.Context, ts jetstream.Stream, claim 
 			return nil, err
 		}
 	}
-	return w.startConsumer(ctx, cons, sem, wg)
+	return w.startPullLoop(ctx, cons, s, wg), nil
 }
 
-func (w *Worker) stopAllClaimSubs() {
-	w.claimSubsMu.Lock()
-	defer w.claimSubsMu.Unlock()
-	// Two passes: Stop() is non-blocking, then drain each Closed() in
-	// turn. With both passes, all claim-sub dispatch loops exit in
-	// parallel rather than serially per-sub.
-	ccs := make([]jetstream.ConsumeContext, 0, len(w.activeClaimSubs))
-	for claim, cc := range w.activeClaimSubs {
-		cc.Stop()
-		ccs = append(ccs, cc)
-		delete(w.activeClaimSubs, claim)
+// waitClaimLoops waits for every claim loop to exit. The loops watch the run
+// context, which has already ended when this is called.
+func (w *Worker) waitClaimLoops() {
+	w.claimLoopsMu.Lock()
+	loops := make([]*pullLoop, 0, len(w.claimLoops))
+	for claim, l := range w.claimLoops {
+		loops = append(loops, l)
+		delete(w.claimLoops, claim)
 	}
-	for _, cc := range ccs {
-		<-cc.Closed()
+	w.claimLoopsMu.Unlock()
+	for _, l := range loops {
+		<-l.done
 	}
 }
 
@@ -327,7 +309,7 @@ func (w *Worker) refreshClaims(ctx context.Context) error {
 // and reconciles the per-claim subscription set. Transient Claims() errors
 // are ignored — the last good cache stays in place so one flaky lookup
 // doesn't blackhole targeted tasks.
-func (w *Worker) runClaimRefresher(ctx context.Context, ts jetstream.Stream, sem chan struct{}, wg *sync.WaitGroup) {
+func (w *Worker) runClaimRefresher(ctx context.Context, ts jetstream.Stream, s *slots, wg *sync.WaitGroup) {
 	if w.opts.Claims == nil {
 		return // claims are static; nothing to reconcile
 	}
@@ -341,7 +323,7 @@ func (w *Worker) runClaimRefresher(ctx context.Context, ts jetstream.Stream, sem
 			if err := w.refreshClaims(ctx); err != nil {
 				continue
 			}
-			_ = w.reconcileClaimSubs(ctx, ts, sem, wg)
+			_ = w.reconcileClaimSubs(ctx, ts, s, wg)
 		}
 	}
 }
