@@ -153,6 +153,67 @@ func TestWorker_NonRetryableError(t *testing.T) {
 	_ = jetstream.ConsumerConfig{}
 }
 
+// backlogTask counts its runs per id. backlogRuns is reset per test.
+var (
+	backlogMu   sync.Mutex
+	backlogRuns map[string]int
+)
+
+func backlogTask(ctx context.Context, id string) error {
+	backlogMu.Lock()
+	backlogRuns[id]++
+	backlogMu.Unlock()
+	time.Sleep(600 * time.Millisecond)
+	return nil
+}
+
+// TestWorker_Backlog_NoDuplicateRuns guards the pull-on-free-slot invariant:
+// the worker must never hold a message it has no free slot for. JetStream
+// counts a message as delivered from the moment it sends it, so a message
+// parked in a client-side buffer runs its AckWait clock through the wait AND
+// the handler. With a backlog, that sum exceeds AckWait and JetStream
+// redelivers tasks that are still queued or running here.
+//
+// Each task runs 600ms, well under the 1s AckWait, but five of them queued
+// behind Concurrency=1 wait up to 2.4s. Prefetching consumers ran later tasks
+// two or three times.
+func TestWorker_Backlog_NoDuplicateRuns(t *testing.T) {
+	backlogMu.Lock()
+	backlogRuns = map[string]int{}
+	backlogMu.Unlock()
+
+	h := testutil.SingleNode(t, worker.Options{Concurrency: 1, AckWait: time.Second})
+	task.MustRegister(h.Reg, backlogTask)
+
+	ids := []string{"a", "b", "c", "d", "e"}
+	futs := make([]*client.Future, 0, len(ids))
+	for _, id := range ids {
+		fut, err := client.Enqueue(h.Client, backlogTask, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		futs = append(futs, fut)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for i, fut := range futs {
+		if err := fut.Get(ctx, nil); err != nil {
+			t.Fatalf("task %s: %v", ids[i], err)
+		}
+	}
+	// A duplicate surfaces at most one AckWait after its original delivery;
+	// wait that out before counting.
+	time.Sleep(1500 * time.Millisecond)
+
+	backlogMu.Lock()
+	defer backlogMu.Unlock()
+	for _, id := range ids {
+		if n := backlogRuns[id]; n != 1 {
+			t.Errorf("task %s ran %d times, want 1 (runs: %v)", id, n, backlogRuns)
+		}
+	}
+}
+
 // Hook is a minimal StepHook capturing calls for assertions.
 type captureHook struct {
 	done       atomic.Int32
@@ -486,19 +547,18 @@ func shutdownLeakHandler(ctx context.Context) error {
 }
 
 // TestWorker_Shutdown_NoHandlerLeakAfterRunReturns guards against a
-// WaitGroup race in the consumer callback in worker.go's startConsumer:
-// between `sem <- struct{}{}` and `wg.Add(1)`, shutdown can observe wg=0,
-// return from Run(), and then the racing callback either panics with
-// "WaitGroup is reused before previous Wait has returned" or leaks a
-// goroutine that processes a message after Run() said it was done.
+// WaitGroup race between a pull loop and shutdown: between acquiring a slot
+// and `wg.Add(1)`, shutdown can observe wg=0, return from Run(), and then the
+// racing loop either panics with "WaitGroup is reused before previous Wait
+// has returned" or leaks a goroutine that processes a message after Run()
+// said it was done. Run must wait for every pull loop to exit before it
+// waits on handlers.
 //
-// The setup forces the race window to be reachable on every run:
-// Concurrency=1 plus a burst of enqueues so callbacks pile up blocked on
-// `sem <-`, then we cancel ctx while exactly one handler is in flight.
-// When the in-flight handler's `defer { <-sem; wg.Done() }` runs, Go's
-// channel direct-handoff hands `sem` to a piled-up callback's send, then
-// `wg.Done()` drops wg to 0 and Wait returns — before the unblocked
-// callback ever reaches its `wg.Add(1)`.
+// The setup makes the race window reachable on every run: Concurrency=1 plus
+// a burst of enqueues so the loops are blocked on the slot, then we cancel
+// ctx while exactly one handler is in flight. When the in-flight handler
+// releases its slot, Go's channel direct-handoff gives it to a blocked loop,
+// then `wg.Done()` drops wg to 0, before that loop could reach `wg.Add(1)`.
 func TestWorker_Shutdown_NoHandlerLeakAfterRunReturns(t *testing.T) {
 	shutdownLeakReset()
 
